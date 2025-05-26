@@ -1,5 +1,5 @@
 Package: keycloak-ssh-auth
-Version: 0.2.4
+Version: 0.2.5
 Section: admin
 Priority: optional
 Architecture: amd64
