@@ -21,27 +21,27 @@
 void log_message(int priority, const char *format, ...) {
     va_list args;
     va_start(args, format);
-    
+
     // Prepare message
     char full_message[1024];
     vsnprintf(full_message, sizeof(full_message), format, args);
-    
+
     // Get current time
     time_t now;
     time(&now);
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), "%Y/%m/%d %H:%M:%S", localtime(&now));
-    
+
     // Write to file with consistent format
     FILE *f = fopen(LOG_FILE, "a");
     if (f != NULL) {
         fprintf(f, "%s%s %s\n", PAM_LOG_PREFIX, timestamp, full_message);
         fclose(f);
     }
-    
+
     // Also write to syslog for system logging
     syslog(priority, "%s", full_message);
-    
+
     va_end(args);
 }
 
@@ -85,23 +85,28 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     FILE *fp;
     char buffer[BUFFER_SIZE];
     int result = PAM_AUTH_ERR;
-    
+
+    // Suppress unused parameter warnings
+    (void)flags;
+    (void)argc;
+    (void)argv;
+
     // Get username for logging
     if (pam_get_user(pamh, &username, NULL) != PAM_SUCCESS) {
         log_message(LOG_ERR, "Could not get username");
         return PAM_USER_UNKNOWN;
     }
-    
+
     // Get client IP address
     client_ip = get_client_ip(pamh);
-    
-    log_message(LOG_INFO, "Authentication attempt for user %s from IP %s", 
+
+    log_message(LOG_INFO, "Authentication attempt for user %s from IP %s",
            username, client_ip);
-    
+
     // Set environment variables for the Go program
     setenv("PAM_USER", username, 1);
     setenv("PAM_RHOST", client_ip, 1);
-    
+
     // Execute the Go helper program
     fp = popen(KEYCLOAK_AUTH_BIN, "r");
     if (fp == NULL) {
@@ -110,7 +115,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         unsetenv("PAM_RHOST");
         return PAM_SYSTEM_ERR;
     }
-    
+
     // Read and display output to user
     while (fgets(buffer, sizeof(buffer)-1, fp) != NULL) {
         buffer[strcspn(buffer, "\n")] = 0;  // Remove newline
@@ -118,17 +123,17 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             pam_info(pamh, "%s", buffer);
         }
     }
-    
+
     // Get exit status
     int status = pclose(fp);
     if (WIFEXITED(status)) {
         int exit_status = WEXITSTATUS(status);
         if (exit_status == 0) {
-            log_message(LOG_INFO, "Authentication successful for user %s from IP %s", 
+            log_message(LOG_INFO, "Authentication successful for user %s from IP %s",
                    username, client_ip);
             result = PAM_SUCCESS;
         } else {
-            log_message(LOG_WARNING, "Authentication failed for user %s from IP %s (exit code: %d)", 
+            log_message(LOG_WARNING, "Authentication failed for user %s from IP %s (exit code: %d)",
                    username, client_ip, exit_status);
             result = PAM_AUTH_ERR;
         }
@@ -136,19 +141,31 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         log_message(LOG_ERR, "Helper program terminated abnormally");
         result = PAM_SYSTEM_ERR;
     }
-    
+
     // Clean up environment variables
     unsetenv("PAM_USER");
     unsetenv("PAM_RHOST");
-    
+
     return result;
 }
 
 PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    // Suppress unused parameter warnings
+    (void)pamh;
+    (void)flags;
+    (void)argc;
+    (void)argv;
+
     return PAM_SUCCESS;
 }
 
 PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+    // Suppress unused parameter warnings
+    (void)pamh;
+    (void)flags;
+    (void)argc;
+    (void)argv;
+
     return PAM_SUCCESS;
 }
 
