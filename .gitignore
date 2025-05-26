@@ -11,29 +11,30 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Build directory
+# Build directories
 build/
 !build/.gitkeep
-
-# Debian build directory
 debian_build/
 
-# Generated packages
+# Generated packages and releases
 *.deb
+*.tar.gz
+*.zip
 
 # Log files
 *.log
+coverage.out
 
 # Temporary files
 *.tmp
 *.temp
+*~
 
 # IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
 # OS generated files
 .DS_Store
@@ -44,5 +45,15 @@ debian_build/
 ehthumbs.db
 Thumbs.db
 
-# Test files
+# Test artifacts
 test_version.sh
+test_results/
+
+# Configuration files with secrets (keep templates)
+**/keycloak-pam.json
+!configs/keycloak-pam.json
+
+# Compiled binaries
+*.exe
+*.exe~
+pam_keycloak.o
