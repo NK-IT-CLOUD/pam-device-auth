@@ -30,6 +30,7 @@ type KeycloakAuth struct {
 	listener     net.Listener
 	token        map[string]interface{}
 	logger       *logger.Logger
+	authURL      string // Cache the auth URL to prevent regeneration
 }
 
 // AuthResult represents the result of an authentication attempt
@@ -54,10 +55,12 @@ func NewKeycloakAuth(cfg *config.Config, log *logger.Logger) *KeycloakAuth {
 func (ka *KeycloakAuth) Authenticate(ctx context.Context, sshUser string) (*AuthResult, error) {
 	ka.logger.Info("Starting authentication for user: %s", sshUser)
 
-	// Start the OAuth2 flow
-	_, err := ka.startAuthFlow()
-	if err != nil {
-		return nil, fmt.Errorf("failed to start auth flow: %v", err)
+	// Start the OAuth2 flow only if not already started
+	if ka.state == "" {
+		_, err := ka.startAuthFlow()
+		if err != nil {
+			return nil, fmt.Errorf("failed to start auth flow: %v", err)
+		}
 	}
 
 	ka.logger.Info("Authentication URL generated, waiting for user interaction")
@@ -115,7 +118,19 @@ func (ka *KeycloakAuth) Authenticate(ctx context.Context, sshUser string) (*Auth
 
 // GetAuthURL returns the authentication URL for the user to visit
 func (ka *KeycloakAuth) GetAuthURL() (string, error) {
-	return ka.startAuthFlow()
+	// Return cached URL if already generated
+	if ka.authURL != "" {
+		return ka.authURL, nil
+	}
+
+	// Generate new auth URL and cache it
+	authURL, err := ka.startAuthFlow()
+	if err != nil {
+		return "", err
+	}
+
+	ka.authURL = authURL
+	return authURL, nil
 }
 
 // startAuthFlow generates the authentication URL for Keycloak
@@ -126,6 +141,7 @@ func (ka *KeycloakAuth) startAuthFlow() (string, error) {
 	codeChallenge := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 
 	ka.state = generateRandomString(32)
+	ka.logger.Debug("Generated OAuth2 state parameter: %s", ka.state)
 
 	params := url.Values{}
 	params.Add("client_id", ka.config.ClientID)
@@ -224,8 +240,11 @@ func (ka *KeycloakAuth) createCallbackHandler(callbackProcessed *atomic.Bool, do
 			return
 		}
 
+		ka.logger.Debug("Received state parameter: %s", state)
+		ka.logger.Debug("Expected state parameter: %s", ka.state)
+
 		if state != ka.state {
-			ka.logger.Error("Invalid state parameter")
+			ka.logger.Error("Invalid state parameter: received '%s', expected '%s'", state, ka.state)
 			ka.renderTemplate(w, "error.html", http.StatusBadRequest)
 			doneChan <- fmt.Errorf("invalid state parameter")
 			return
@@ -394,6 +413,10 @@ func newReusePortListener(network, address string) (net.Listener, error) {
 // generateRandomString creates a random string of specified length
 func generateRandomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+	// Seed the random number generator with current time
+	rand.Seed(time.Now().UnixNano())
+
 	b := make([]byte, length)
 	for i := range b {
 		b[i] = charset[rand.Intn(len(charset))]

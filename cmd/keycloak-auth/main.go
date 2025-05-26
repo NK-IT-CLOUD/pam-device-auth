@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	VERSION  = "0.2.4"
+	VERSION  = "0.2.6"
 	LOG_FILE = "/var/log/keycloak-ssh-auth.log"
 )
 
@@ -65,17 +65,17 @@ Troubleshooting:
   - Ensure correct role assignments
   - Test configuration with --debug flag
 `, VERSION, LOG_FILE)
-	
+
 	fmt.Println(help)
 }
 
 // getClientIP retrieves the client IP from environment variables
 func getClientIP() string {
 	envVars := []string{
-		"SSH_CONNECTION",  // Contains "client-ip client-port server-ip server-port"
-		"SSH_CLIENT",      // Contains "client-ip client-port server-port"
-		"PAM_RHOST",       // Should contain the remote host
-		"REMOTE_ADDR",     // Fallback
+		"SSH_CONNECTION", // Contains "client-ip client-port server-ip server-port"
+		"SSH_CLIENT",     // Contains "client-ip client-port server-port"
+		"PAM_RHOST",      // Should contain the remote host
+		"REMOTE_ADDR",    // Fallback
 	}
 
 	for _, env := range envVars {
@@ -193,7 +193,7 @@ func authenticate(log *logger.Logger, cfg *config.Config, sshUser string) error 
 	// Setup user account if needed
 	if cfg.CreateUsers || cfg.AddToSudo {
 		log.LogPhase("SYSTEM SETUP")
-		
+
 		userManager := user.NewManager(log)
 		if err := userManager.SetupUser(result.Username, cfg.CreateUsers, cfg.AddToSudo); err != nil {
 			return fmt.Errorf("user setup failed: %v", err)

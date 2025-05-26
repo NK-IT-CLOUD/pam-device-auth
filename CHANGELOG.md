@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2024-05-26
+
+### Fixed
+- **Critical OAuth2 State Parameter Bug**: Fixed race condition causing "invalid state parameter" errors
+  - State parameter was being regenerated between `GetAuthURL()` and `Authenticate()` calls
+  - Added URL caching to prevent duplicate state generation
+  - Enhanced debug logging for state parameter tracking
+- **Random Number Generator**: Added proper seeding for better randomness
+- **Authentication Flow**: Improved consistency in OAuth2 flow execution
+
+### Added
+- **Enhanced Debug Logging**: Added detailed state parameter tracking for troubleshooting
+- **State Consistency Test**: Added unit test to verify state parameter consistency
+- **URL Caching**: Authentication URLs are now cached to prevent regeneration
+
+### Changed
+- **KeycloakAuth Structure**: Added `authURL` field for caching authentication URLs
+- **Authentication Logic**: Modified to reuse existing state when already generated
+
 ## [0.2.4] - 2024-05-26
 
 ### Added

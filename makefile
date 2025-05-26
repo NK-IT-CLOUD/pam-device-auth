@@ -3,7 +3,7 @@
 
 # Project information
 BINARY_NAME=keycloak-auth
-VERSION=0.2.5
+VERSION=0.2.6
 PROJECT_NAME=keycloak-ssh-auth
 
 # Build directories
