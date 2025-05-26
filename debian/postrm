@@ -1,0 +1,70 @@
+#!/bin/sh
+set -e
+
+# Logging function
+log() {
+    echo "[keycloak-ssh-auth] $*" | tee -a /var/log/keycloak-ssh-auth-uninstall.log
+}
+
+# Cleanup function
+cleanup_logrotate() {
+    if [ -f /etc/logrotate.d/keycloak-ssh-auth ]; then
+        rm -f /etc/logrotate.d/keycloak-ssh-auth
+        log "Removed logrotate configuration"
+    fi
+}
+
+# Validate SSH service
+validate_ssh_service() {
+    if [ -x "$(command -v systemctl)" ]; then
+        if ! systemctl list-unit-files | grep -q 'sshd\|ssh.service'; then
+            log "WARNING: No SSH service found"
+            return 1
+        fi
+    elif ! command -v service >/dev/null 2>&1; then
+        log "ERROR: Cannot restart SSH service"
+        return 1
+    fi
+    return 0
+}
+
+case "$1" in
+    purge|remove)
+        log "Removing Keycloak SSH Authentication configuration"
+        
+        # Remove logrotate configuration
+        cleanup_logrotate
+        
+        # Remove configuration files with error handling
+        if [ -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf ]; then
+            rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf || log "Failed to remove sshd config"
+        fi
+        
+        # Restore original PAM configuration
+        if [ -f /etc/pam.d/sshd.original ]; then
+            mv /etc/pam.d/sshd.original /etc/pam.d/sshd || log "Failed to restore original PAM configuration"
+        fi
+        
+        # Restart SSH service with comprehensive checks
+        if validate_ssh_service; then
+            if [ -x "$(command -v systemctl)" ]; then
+                systemctl restart sshd || systemctl restart ssh || log "Failed to restart SSH service"
+            else
+                service ssh restart || service sshd restart || log "Failed to restart SSH service"
+            fi
+        fi
+        
+        log "Keycloak SSH Authentication removal complete"
+        ;;
+    
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # No specific actions needed
+        ;;
+    
+    *)
+        log "ERROR: postrm called with unknown argument '$1'"
+        exit 1
+        ;;
+esac
+
+exit 0

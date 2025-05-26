@@ -1,0 +1,12 @@
+Package: keycloak-ssh-auth
+Version: 0.2.4
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: libc6, openssh-server
+Maintainer: Norbert Krucky <norbert.krucky@pm.me>
+Description: Keycloak SSH Authentication
+ Provides SSH authentication via Keycloak SSO.
+ Includes PAM module integration and web-based authentication flow.
+ Version 0.2.4 includes improved error handling, modular architecture,
+ environment variable support, and comprehensive testing.
