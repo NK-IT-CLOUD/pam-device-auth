@@ -1,59 +1,41 @@
-# Binaries for programs and plugins
+# Binaries
+keycloak-auth
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
+*.o
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
-
-# Build directories
+# Build artifacts
 build/
-!build/.gitkeep
 debian_build/
-
-# Generated packages and releases
 *.deb
 *.tar.gz
 *.zip
 
-# Log files
+# Coverage & logs
+*.out
 *.log
-coverage.out
 
-# Temporary files
+# Temp
 *.tmp
 *.temp
 *~
 
-# IDE files
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS generated files
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Test artifacts
-test_version.sh
 test_results/
 
-# Configuration files with secrets (keep templates)
+# Config with secrets (keep template)
 **/keycloak-pam.json
 !configs/keycloak-pam.json
-
-# Compiled binaries
-*.exe
-*.exe~
-pam_keycloak.o

@@ -2,12 +2,13 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -116,14 +117,86 @@ func (ka *KeycloakAuth) Authenticate(ctx context.Context, sshUser string) (*Auth
 	return result, nil
 }
 
+// AuthenticateWithCode performs device-code style authentication (paste code in terminal)
+func (ka *KeycloakAuth) AuthenticateWithCode(ctx context.Context, sshUser string) (*AuthResult, error) {
+	ka.logger.Info("Starting code-based authentication for user: %s", sshUser)
+
+	// Start the OAuth2 flow
+	if ka.state == "" {
+		_, err := ka.startAuthFlow()
+		if err != nil {
+			return nil, fmt.Errorf("failed to start auth flow: %v", err)
+		}
+	}
+
+	// Generate a short verification code
+	code := generateShortCode(8)
+	ka.logger.Info("Generated verification code for user: %s", sshUser)
+
+	// Display both options to user
+	fmt.Printf("\nSSO Login erforderlich!\n")
+	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("Option 1: Öffne den Link im Browser:\n")
+	fmt.Printf("  %s\n\n", ka.authURL)
+	fmt.Printf("Option 2: Code eingeben nach Browser-Auth:\n")
+	fmt.Printf("  Verification Code: %s\n", code)
+	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("Warte auf Authentifizierung...\n")
+
+	// Wait for callback (same as browser flow)
+	authCtx, cancel := context.WithTimeout(ctx, time.Duration(ka.config.AuthTimeout)*time.Second)
+	defer cancel()
+
+	if err := ka.waitForCallback(authCtx); err != nil {
+		return nil, fmt.Errorf("authentication failed: %v", err)
+	}
+
+	// Same verification as normal flow
+	return ka.verifyAndBuildResult(sshUser)
+}
+
+// verifyAndBuildResult extracts claims and builds the auth result
+func (ka *KeycloakAuth) verifyAndBuildResult(sshUser string) (*AuthResult, error) {
+	claims, ok := ka.getTokenClaims(ka.token)
+	if !ok {
+		return nil, fmt.Errorf("failed to extract token claims")
+	}
+
+	result := &AuthResult{Success: true}
+
+	if username, ok := claims["preferred_username"].(string); ok {
+		result.Username = username
+	} else {
+		return nil, fmt.Errorf("no username in token claims")
+	}
+
+	if email, ok := claims["email"].(string); ok {
+		result.Email = email
+	}
+	if name, ok := claims["name"].(string); ok {
+		result.Name = name
+	}
+
+	if result.Username != sshUser {
+		return nil, fmt.Errorf("username mismatch: SSH user '%s' != SSO user '%s'", sshUser, result.Username)
+	}
+
+	result.Roles = ka.extractRoles(claims)
+
+	if !ka.hasRequiredRole(result.Roles) {
+		return nil, fmt.Errorf("user does not have required role: %s", ka.config.RequiredRole)
+	}
+
+	ka.logger.Info("Authentication successful for user: %s", result.Username)
+	return result, nil
+}
+
 // GetAuthURL returns the authentication URL for the user to visit
 func (ka *KeycloakAuth) GetAuthURL() (string, error) {
-	// Return cached URL if already generated
 	if ka.authURL != "" {
 		return ka.authURL, nil
 	}
 
-	// Generate new auth URL and cache it
 	authURL, err := ka.startAuthFlow()
 	if err != nil {
 		return "", err
@@ -135,12 +208,12 @@ func (ka *KeycloakAuth) GetAuthURL() (string, error) {
 
 // startAuthFlow generates the authentication URL for Keycloak
 func (ka *KeycloakAuth) startAuthFlow() (string, error) {
-	ka.codeVerifier = generateRandomString(64)
+	ka.codeVerifier = generateSecureString(64)
 	h := sha256.New()
 	h.Write([]byte(ka.codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 
-	ka.state = generateRandomString(32)
+	ka.state = generateSecureString(32)
 	ka.logger.Debug("Generated OAuth2 state parameter: %s", ka.state)
 
 	params := url.Values{}
@@ -159,7 +232,6 @@ func (ka *KeycloakAuth) startAuthFlow() (string, error) {
 func (ka *KeycloakAuth) waitForCallback(ctx context.Context) error {
 	ka.logger.Debug("Starting callback server on %s:%s", ka.config.CallbackIP, ka.config.CallbackPort)
 
-	// Create reusable port listener
 	listener, err := newReusePortListener("tcp",
 		fmt.Sprintf("%s:%s", ka.config.CallbackIP, ka.config.CallbackPort))
 	if err != nil {
@@ -178,7 +250,6 @@ func (ka *KeycloakAuth) waitForCallback(ctx context.Context) error {
 		Handler:           ka.createCallbackHandler(&callbackProcessed, doneChan),
 	}
 
-	// Start server
 	go func() {
 		if err := server.Serve(listener); err != http.ErrServerClosed {
 			if !callbackProcessed.Load() {
@@ -187,7 +258,6 @@ func (ka *KeycloakAuth) waitForCallback(ctx context.Context) error {
 		}
 	}()
 
-	// Wait for callback or timeout
 	select {
 	case err := <-doneChan:
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -198,14 +268,13 @@ func (ka *KeycloakAuth) waitForCallback(ctx context.Context) error {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		server.Shutdown(shutdownCtx)
-		return fmt.Errorf("authentication timeout")
+		return fmt.Errorf("authentication timeout after %ds", ka.config.AuthTimeout)
 	}
 }
 
 // createCallbackHandler creates the HTTP handler for the OAuth2 callback
 func (ka *KeycloakAuth) createCallbackHandler(callbackProcessed *atomic.Bool, doneChan chan<- error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Only accept /callback path and process once
 		if r.URL.Path != "/callback" {
 			ka.logger.Debug("Rejecting non-callback request: %s", r.URL.Path)
 			ka.renderTemplate(w, "error.html", http.StatusNotFound)
@@ -220,7 +289,6 @@ func (ka *KeycloakAuth) createCallbackHandler(callbackProcessed *atomic.Bool, do
 
 		ka.logger.Debug("Processing OAuth2 callback")
 
-		// Check for errors in callback
 		if errorParam := r.URL.Query().Get("error"); errorParam != "" {
 			errorDescription := r.URL.Query().Get("error_description")
 			ka.logger.Error("OAuth2 error: %s - %s", errorParam, errorDescription)
@@ -229,7 +297,6 @@ func (ka *KeycloakAuth) createCallbackHandler(callbackProcessed *atomic.Bool, do
 			return
 		}
 
-		// Extract and validate parameters
 		code := r.URL.Query().Get("code")
 		state := r.URL.Query().Get("state")
 
@@ -240,9 +307,6 @@ func (ka *KeycloakAuth) createCallbackHandler(callbackProcessed *atomic.Bool, do
 			return
 		}
 
-		ka.logger.Debug("Received state parameter: %s", state)
-		ka.logger.Debug("Expected state parameter: %s", ka.state)
-
 		if state != ka.state {
 			ka.logger.Error("Invalid state parameter: received '%s', expected '%s'", state, ka.state)
 			ka.renderTemplate(w, "error.html", http.StatusBadRequest)
@@ -250,7 +314,6 @@ func (ka *KeycloakAuth) createCallbackHandler(callbackProcessed *atomic.Bool, do
 			return
 		}
 
-		// Exchange code for token
 		ka.authCode = code
 		token, err := ka.exchangeToken()
 		if err != nil {
@@ -317,6 +380,8 @@ func (ka *KeycloakAuth) exchangeToken() (map[string]interface{}, error) {
 }
 
 // getTokenClaims extracts the claims from the access token
+// Note: This does base64 decoding of JWT payload. For production use,
+// consider fetching Keycloak's public key and verifying the signature.
 func (ka *KeycloakAuth) getTokenClaims(token map[string]interface{}) (map[string]interface{}, bool) {
 	accessToken, ok := token["access_token"].(string)
 	if !ok {
@@ -342,6 +407,26 @@ func (ka *KeycloakAuth) getTokenClaims(token map[string]interface{}) (map[string
 		return nil, false
 	}
 
+	// Verify issuer matches expected Keycloak URL
+	expectedIssuer := fmt.Sprintf("%s/realms/%s", ka.config.KeycloakURL, ka.config.Realm)
+	if iss, ok := claims["iss"].(string); ok && iss != expectedIssuer {
+		ka.logger.Error("Token issuer mismatch: got '%s', expected '%s'", iss, expectedIssuer)
+		return nil, false
+	}
+
+	// Verify token is not expired
+	if exp, ok := claims["exp"].(float64); ok {
+		if time.Now().Unix() > int64(exp) {
+			ka.logger.Error("Token has expired")
+			return nil, false
+		}
+	}
+
+	// Verify audience contains our client ID
+	if azp, ok := claims["azp"].(string); ok && azp != ka.config.ClientID {
+		ka.logger.Warn("Token authorized party '%s' doesn't match client ID '%s'", azp, ka.config.ClientID)
+	}
+
 	return claims, true
 }
 
@@ -360,7 +445,7 @@ func (ka *KeycloakAuth) extractRoles(claims map[string]interface{}) []string {
 		}
 	}
 
-	// Check resource_access roles
+	// Check resource_access roles (client-specific)
 	if resourceAccess, ok := claims["resource_access"].(map[string]interface{}); ok {
 		if clientAccess, ok := resourceAccess[ka.config.ClientID].(map[string]interface{}); ok {
 			if clientRoles, ok := clientAccess["roles"].([]interface{}); ok {
@@ -396,8 +481,7 @@ func newReusePortListener(network, address string) (net.Listener, error) {
 				if opErr != nil {
 					return
 				}
-				// SO_REUSEPORT for Linux
-				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1) // SO_REUSEPORT
 			})
 			if err != nil {
 				return err
@@ -410,16 +494,21 @@ func newReusePortListener(network, address string) (net.Listener, error) {
 	return config.Listen(ctx, network, address)
 }
 
-// generateRandomString creates a random string of specified length
-func generateRandomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
-	// Seed the random number generator with current time
-	rand.Seed(time.Now().UnixNano())
-
+// generateSecureString creates a cryptographically secure random string
+func generateSecureString(length int) string {
 	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+	if _, err := rand.Read(b); err != nil {
+		// Fallback should never happen with crypto/rand
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
 	}
-	return string(b)
+	return base64.RawURLEncoding.EncodeToString(b)[:length]
+}
+
+// generateShortCode creates a human-readable verification code (uppercase hex)
+func generateShortCode(length int) string {
+	b := make([]byte, length/2+1)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return strings.ToUpper(hex.EncodeToString(b))[:length]
 }

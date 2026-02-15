@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-REPO_OWNER="Fu6gie"
+REPO_OWNER="nk-dev"
 REPO_NAME="keycloak-ssh-auth"
 VERSION_FILE="VERSION"
 

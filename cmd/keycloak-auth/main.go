@@ -14,11 +14,10 @@ import (
 )
 
 const (
-	VERSION  = "0.2.6"
+	VERSION  = "0.3.0"
 	LOG_FILE = "/var/log/keycloak-ssh-auth.log"
 )
 
-// printHelp displays usage information
 func printHelp() {
 	help := fmt.Sprintf(`Keycloak SSH Authentication v%s
 
@@ -28,42 +27,21 @@ Options:
   --version       Display version information
   --help          Display this help message
   --debug         Enable debug logging
+  --mode <mode>   Authentication mode: "browser" (default) or "code"
+                  browser: User clicks link in browser
+                  code:    User sees code + link, auth via browser callback
 
-Authentication Configuration:
-  1. Edit /etc/keycloak-ssh-auth/keycloak-pam.json to configure:
-     - Keycloak URL
-     - Realm
-     - Client ID
-     - Client Secret
-     - Required Role
+Configuration:
+  File: /etc/keycloak-ssh-auth/keycloak-pam.json
+  
+  Environment variables override config file:
+    KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID,
+    KEYCLOAK_CLIENT_SECRET, KEYCLOAK_REQUIRED_ROLE,
+    CALLBACK_IP, CALLBACK_PORT, AUTH_TIMEOUT, DEBUG_MODE
 
-  Configuration Example:
-  {
-    "keycloak_url": "https://your-keycloak.example.com",
-    "realm": "your-realm",
-    "client_id": "ssh-auth-client",
-    "client_secret": "your-client-secret",
-    "required_role": "ssh-access",
-    "callback_ip": "YOUR_SERVER_IP",
-    "callback_port": "33499"
-  }
+Logs: %s
 
-Environment Variables (override config file):
-  KEYCLOAK_URL              Keycloak server URL
-  KEYCLOAK_REALM            Keycloak realm name
-  KEYCLOAK_CLIENT_ID        OAuth2 client ID
-  KEYCLOAK_CLIENT_SECRET    OAuth2 client secret
-  KEYCLOAK_REQUIRED_ROLE    Required role for SSH access
-  CALLBACK_IP               Server IP for OAuth2 callback
-  CALLBACK_PORT             Server port for OAuth2 callback
-  AUTH_TIMEOUT              Authentication timeout in seconds
-  DEBUG_MODE                Enable debug logging (true/false)
-
-Troubleshooting:
-  - Check logs: %s
-  - Verify Keycloak connectivity
-  - Ensure correct role assignments
-  - Test configuration with --debug flag
+Repository: https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
 `, VERSION, LOG_FILE)
 
 	fmt.Println(help)
@@ -71,12 +49,7 @@ Troubleshooting:
 
 // getClientIP retrieves the client IP from environment variables
 func getClientIP() string {
-	envVars := []string{
-		"SSH_CONNECTION", // Contains "client-ip client-port server-ip server-port"
-		"SSH_CLIENT",     // Contains "client-ip client-port server-port"
-		"PAM_RHOST",      // Should contain the remote host
-		"REMOTE_ADDR",    // Fallback
-	}
+	envVars := []string{"SSH_CONNECTION", "SSH_CLIENT", "PAM_RHOST", "REMOTE_ADDR"}
 
 	for _, env := range envVars {
 		if value := os.Getenv(env); value != "" {
@@ -91,12 +64,12 @@ func getClientIP() string {
 	return "unknown"
 }
 
-// main is the entry point of the application
 func main() {
-	// Parse command line arguments
 	debugMode := false
-	for _, arg := range os.Args[1:] {
-		switch arg {
+	authMode := "browser"
+
+	for i := 1; i < len(os.Args); i++ {
+		switch os.Args[i] {
 		case "--version":
 			fmt.Printf("Keycloak SSH Authentication v%s\n", VERSION)
 			os.Exit(0)
@@ -105,6 +78,11 @@ func main() {
 			os.Exit(0)
 		case "--debug":
 			debugMode = true
+		case "--mode":
+			if i+1 < len(os.Args) {
+				i++
+				authMode = os.Args[i]
+			}
 		}
 	}
 
@@ -125,7 +103,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get client IP
 	clientIP := getClientIP()
 	if clientIP == "unknown" {
 		log.Warn("Could not determine client IP address")
@@ -133,6 +110,7 @@ func main() {
 
 	log.Info("Login attempt from IP: %s", clientIP)
 	log.Info("Requested user account: %s", sshUser)
+	log.Info("Auth mode: %s", authMode)
 
 	// Load configuration
 	cfg, err := config.LoadConfig("")
@@ -144,7 +122,7 @@ func main() {
 	log.Debug("Configuration loaded: %s", cfg.String())
 
 	// Perform authentication
-	if err := authenticate(log, cfg, sshUser); err != nil {
+	if err := authenticate(log, cfg, sshUser, authMode); err != nil {
 		log.Error("Authentication failed: %v", err)
 		os.Exit(1)
 	}
@@ -155,25 +133,31 @@ func main() {
 }
 
 // authenticate performs the complete authentication flow
-func authenticate(log *logger.Logger, cfg *config.Config, sshUser string) error {
+func authenticate(log *logger.Logger, cfg *config.Config, sshUser string, mode string) error {
 	log.LogPhase("SSO AUTHENTICATION")
 
-	// Create Keycloak authenticator
 	keycloakAuth := auth.NewKeycloakAuth(cfg, log)
 
-	// Get authentication URL
-	authURL, err := keycloakAuth.GetAuthURL()
-	if err != nil {
-		return fmt.Errorf("failed to generate auth URL: %v", err)
+	var result *auth.AuthResult
+	var err error
+
+	ctx := context.Background()
+
+	switch mode {
+	case "code":
+		result, err = keycloakAuth.AuthenticateWithCode(ctx, sshUser)
+	default: // "browser"
+		// Get auth URL first to display
+		authURL, urlErr := keycloakAuth.GetAuthURL()
+		if urlErr != nil {
+			return fmt.Errorf("failed to generate auth URL: %v", urlErr)
+		}
+		fmt.Printf("\nSSO Login erforderlich!\nÖffne den folgenden Link:\n%s\n\n", authURL)
+		log.Info("Authentication URL provided to user")
+
+		result, err = keycloakAuth.Authenticate(ctx, sshUser)
 	}
 
-	// Display authentication URL to user
-	fmt.Printf("SSO Login erforderlich!\nOpen the following Link:\n%s\n", authURL)
-	log.Info("Authentication URL provided to user")
-
-	// Perform authentication with context
-	ctx := context.Background()
-	result, err := keycloakAuth.Authenticate(ctx, sshUser)
 	if err != nil {
 		return err
 	}
@@ -190,7 +174,7 @@ func authenticate(log *logger.Logger, cfg *config.Config, sshUser string) error 
 		"Roles":    strings.Join(result.Roles, ", "),
 	})
 
-	// Setup user account if needed
+	// Setup user account
 	if cfg.CreateUsers || cfg.AddToSudo {
 		log.LogPhase("SYSTEM SETUP")
 
@@ -200,7 +184,6 @@ func authenticate(log *logger.Logger, cfg *config.Config, sshUser string) error 
 		}
 	}
 
-	// Log final summary
 	log.LogSummary("Login Summary", map[string]string{
 		"User":           result.Username,
 		"Name":           result.Name,

@@ -70,7 +70,7 @@ SSH Client → SSH Server → PAM Module → Go Binary → Keycloak → User Bro
 
 ```bash
 # Download the latest release
-wget https://github.com/Fu6gie/keycloak-ssh-auth/releases/download/v0.2.6/keycloak-ssh-auth_0.2.6_amd64.deb
+wget https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/releases (oder direkt vom Build-CT)
 
 # Install the package
 sudo dpkg -i keycloak-ssh-auth_0.2.6_amd64.deb
@@ -83,7 +83,7 @@ sudo apt-get install -f
 
 ```bash
 # Clone the repository
-git clone https://github.com/Fu6gie/keycloak-ssh-auth.git
+git clone https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth.git
 cd keycloak-ssh-auth
 
 # Build the project
@@ -457,7 +457,7 @@ grep "LOGIN COMPLETED" /var/log/keycloak-ssh-auth.log
 
 2. **Clone and Build**:
    ```bash
-   git clone https://github.com/Fu6gie/keycloak-ssh-auth.git
+   git clone https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth.git
    cd keycloak-ssh-auth
    make all
    ```
@@ -486,9 +486,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🆘 Support
 
-- **Issues**: [GitHub Issues](https://github.com/Fu6gie/keycloak-ssh-auth/issues)
-- **Documentation**: [Wiki](https://github.com/Fu6gie/keycloak-ssh-auth/wiki)
-- **Discussions**: [GitHub Discussions](https://github.com/Fu6gie/keycloak-ssh-auth/discussions)
+- **Issues**: https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/issues
+- **Documentation**: https://wiki.server.nk-it.cloud/en/n8nbert/keycloak-ssh-auth
+- **Discussions**: Matrix #dev:nk-it.cloud
 
 ## 📊 Version History
 
