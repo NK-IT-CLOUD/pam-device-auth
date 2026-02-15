@@ -17,8 +17,11 @@ jobs:
       - name: Build binary
         run: make build
 
+      - name: Build PAM module
+        run: make pam_keycloak.so
+
       - name: Run tests
-        run: go test -v -race ./...
+        run: go test -v -race -count=1 ./...
 
       - name: Run vet
         run: go vet ./...

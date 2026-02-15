@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"keycloak-ssh-auth/internal/config"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
 )
 
 // Test configuration validation

@@ -39,18 +39,21 @@ type Logger struct {
 	level  LogLevel
 	logger *log.Logger
 	debug  bool
+	file   *os.File // track file handle for cleanup
 }
 
 // NewLogger creates a new logger instance
 func NewLogger(logFile string, debug bool) (*Logger, error) {
 	var writer io.Writer = os.Stderr
+	var logFileHandle *os.File
 	
 	if logFile != "" {
-		file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open log file: %v", err)
 		}
-		writer = file
+		writer = f
+		logFileHandle = f
 	}
 
 	logger := log.New(writer, "", 0) // No default prefix or flags
@@ -64,6 +67,7 @@ func NewLogger(logFile string, debug bool) (*Logger, error) {
 		level:  level,
 		logger: logger,
 		debug:  debug,
+		file:   logFileHandle,
 	}, nil
 }
 
@@ -134,10 +138,11 @@ func (l *Logger) IsDebugEnabled() bool {
 	return l.debug
 }
 
-// Close closes the logger (if it uses a file)
+// Close closes the logger's file handle if one was opened
 func (l *Logger) Close() error {
-	// If the logger uses a file, we should close it
-	// For now, we don't track the file handle, so this is a no-op
+	if l.file != nil {
+		return l.file.Close()
+	}
 	return nil
 }
 

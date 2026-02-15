@@ -53,15 +53,21 @@ const char* get_client_ip(pam_handle_t *pamh) {
     // Check PAM_RHOST first
     if (pam_get_item(pamh, PAM_RHOST, (const void **)&rhost) == PAM_SUCCESS && rhost) {
         strncpy(ip_str, rhost, sizeof(ip_str) - 1);
+        ip_str[sizeof(ip_str) - 1] = '\0';
         return ip_str;
     }
 
     // Check SSH_CONNECTION environment variable
     const char *ssh_conn = getenv("SSH_CONNECTION");
     if (ssh_conn) {
-        char *token = strtok((char *)ssh_conn, " ");
+        // Copy to local buffer before tokenizing (strtok modifies the string)
+        char conn_buf[256];
+        strncpy(conn_buf, ssh_conn, sizeof(conn_buf) - 1);
+        conn_buf[sizeof(conn_buf) - 1] = '\0';
+        char *token = strtok(conn_buf, " ");
         if (token) {
             strncpy(ip_str, token, sizeof(ip_str) - 1);
+            ip_str[sizeof(ip_str) - 1] = '\0';
             return ip_str;
         }
     }
@@ -69,9 +75,13 @@ const char* get_client_ip(pam_handle_t *pamh) {
     // Check SSH_CLIENT environment variable
     const char *ssh_client = getenv("SSH_CLIENT");
     if (ssh_client) {
-        char *token = strtok((char *)ssh_client, " ");
+        char client_buf[256];
+        strncpy(client_buf, ssh_client, sizeof(client_buf) - 1);
+        client_buf[sizeof(client_buf) - 1] = '\0';
+        char *token = strtok(client_buf, " ");
         if (token) {
             strncpy(ip_str, token, sizeof(ip_str) - 1);
+            ip_str[sizeof(ip_str) - 1] = '\0';
             return ip_str;
         }
     }

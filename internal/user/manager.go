@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"keycloak-ssh-auth/internal/logger"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
 )
 
 // Manager handles user account management

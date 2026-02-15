@@ -1,3 +1,3 @@
-module keycloak-ssh-auth
+module git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
 
-go 1.24.0
+go 1.22

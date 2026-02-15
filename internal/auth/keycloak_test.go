@@ -1,11 +1,28 @@
 package auth
 
 import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
-	"keycloak-ssh-auth/internal/config"
-	"keycloak-ssh-auth/internal/logger"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
 )
+
+var testRSAKey *rsa.PrivateKey
+
+func init() {
+	testRSAKey, _ = rsa.GenerateKey(rand.Reader, 2048)
+}
 
 func testLogger() *logger.Logger {
 	log, _ := logger.NewLogger("", true)
@@ -23,6 +40,50 @@ func testConfig() *config.Config {
 		CallbackPort: "33499",
 		AuthTimeout:  60,
 	}
+}
+
+// createSignedJWT builds a complete signed JWT from claims
+func createSignedJWT(claims map[string]interface{}, kid string) string {
+	headerMap := map[string]string{"alg": "RS256", "kid": kid, "typ": "JWT"}
+	headerBytes, _ := json.Marshal(headerMap)
+	header := base64.RawURLEncoding.EncodeToString(headerBytes)
+
+	payloadBytes, _ := json.Marshal(claims)
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+
+	signedContent := header + "." + payload
+	h := sha256.Sum256([]byte(signedContent))
+	sig, _ := rsa.SignPKCS1v15(rand.Reader, testRSAKey, crypto.SHA256, h[:])
+	return signedContent + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// startJWKSServer starts a mock JWKS endpoint
+func startJWKSServer(kid string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := base64.RawURLEncoding.EncodeToString(testRSAKey.PublicKey.N.Bytes())
+		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(testRSAKey.PublicKey.E)).Bytes())
+		jwks := fmt.Sprintf(`{"keys":[{"kty":"RSA","kid":"%s","use":"sig","alg":"RS256","n":"%s","e":"%s"}]}`, kid, n, e)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(jwks))
+	}))
+}
+
+// testConfigWithJWKS creates a config pointing to a mock JWKS server, returns config + cleanup
+func testKeycloakAuthWithJWKS(kid string) (*KeycloakAuth, *httptest.Server) {
+	jwksServer := startJWKSServer(kid)
+	cfg := testConfig()
+	cfg.KeycloakURL = jwksServer.URL
+	cfg.Realm = "test-realm"
+
+	ka := &KeycloakAuth{
+		config:    cfg,
+		logger:    testLogger(),
+		jwksCache: NewJWKSCache(jwksServer.URL+"/realms/test-realm/protocol/openid-connect/certs", 1*time.Hour),
+	}
+	// Override JWKS URL to point to our test server root
+	ka.jwksCache.jwksURL = jwksServer.URL
+
+	return ka, jwksServer
 }
 
 func TestNewKeycloakAuth(t *testing.T) {
@@ -146,49 +207,67 @@ func TestHasRequiredRole(t *testing.T) {
 }
 
 func TestGetTokenClaims_ValidToken(t *testing.T) {
-	ka := NewKeycloakAuth(testConfig(), testLogger())
+	kid := "test-key-1"
+	ka, jwksServer := testKeycloakAuthWithJWKS(kid)
+	defer jwksServer.Close()
 
-	// Build a fake JWT (header.payload.signature) with matching issuer
-	// Payload: {"iss":"https://sso.example.com/realms/test-realm","preferred_username":"testuser","exp":9999999999,"azp":"ssh-auth"}
-	payload := "eyJpc3MiOiJodHRwczovL3Nzby5leGFtcGxlLmNvbS9yZWFsbXMvdGVzdC1yZWFsbSIsInByZWZlcnJlZF91c2VybmFtZSI6InRlc3R1c2VyIiwiZXhwIjo5OTk5OTk5OTk5LCJhenAiOiJzc2gtYXV0aCJ9"
-	fakeToken := map[string]interface{}{
-		"access_token": "eyJhbGciOiJSUzI1NiJ9." + payload + ".fake-signature",
+	claims := map[string]interface{}{
+		"iss":                jwksServer.URL + "/realms/test-realm",
+		"preferred_username": "testuser",
+		"exp":                float64(9999999999),
+		"azp":                "ssh-auth",
 	}
+	jwt := createSignedJWT(claims, kid)
+	token := map[string]interface{}{"access_token": jwt}
 
-	claims, ok := ka.getTokenClaims(fakeToken)
+	// Update config to match issuer
+	ka.config.KeycloakURL = jwksServer.URL
+
+	result, ok := ka.getTokenClaims(token)
 	if !ok {
-		t.Fatal("getTokenClaims failed for valid token")
+		t.Fatal("getTokenClaims failed for valid signed token")
 	}
-	if claims["preferred_username"] != "testuser" {
-		t.Errorf("expected username 'testuser', got '%v'", claims["preferred_username"])
+	if result["preferred_username"] != "testuser" {
+		t.Errorf("expected username 'testuser', got '%v'", result["preferred_username"])
 	}
 }
 
 func TestGetTokenClaims_ExpiredToken(t *testing.T) {
-	ka := NewKeycloakAuth(testConfig(), testLogger())
+	kid := "test-key-2"
+	ka, jwksServer := testKeycloakAuthWithJWKS(kid)
+	defer jwksServer.Close()
 
-	// Payload with exp in the past: {"iss":"https://sso.example.com/realms/test-realm","exp":1000000000,"azp":"ssh-auth"}
-	payload := "eyJpc3MiOiJodHRwczovL3Nzby5leGFtcGxlLmNvbS9yZWFsbXMvdGVzdC1yZWFsbSIsImV4cCI6MTAwMDAwMDAwMCwiYXpwIjoic3NoLWF1dGgifQ"
-	fakeToken := map[string]interface{}{
-		"access_token": "eyJhbGciOiJSUzI1NiJ9." + payload + ".fake",
+	claims := map[string]interface{}{
+		"iss": jwksServer.URL + "/realms/test-realm",
+		"exp": float64(1000000000), // expired
+		"azp": "ssh-auth",
 	}
+	jwt := createSignedJWT(claims, kid)
+	token := map[string]interface{}{"access_token": jwt}
 
-	_, ok := ka.getTokenClaims(fakeToken)
+	ka.config.KeycloakURL = jwksServer.URL
+
+	_, ok := ka.getTokenClaims(token)
 	if ok {
 		t.Error("getTokenClaims should fail for expired token")
 	}
 }
 
 func TestGetTokenClaims_WrongIssuer(t *testing.T) {
-	ka := NewKeycloakAuth(testConfig(), testLogger())
+	kid := "test-key-3"
+	ka, jwksServer := testKeycloakAuthWithJWKS(kid)
+	defer jwksServer.Close()
 
-	// Payload with wrong issuer: {"iss":"https://evil.com/realms/hack","exp":9999999999}
-	payload := "eyJpc3MiOiJodHRwczovL2V2aWwuY29tL3JlYWxtcy9oYWNrIiwiZXhwIjo5OTk5OTk5OTk5fQ"
-	fakeToken := map[string]interface{}{
-		"access_token": "eyJhbGciOiJSUzI1NiJ9." + payload + ".fake",
+	claims := map[string]interface{}{
+		"iss": "https://evil.com/realms/hack",
+		"exp": float64(9999999999),
 	}
+	jwt := createSignedJWT(claims, kid)
+	token := map[string]interface{}{"access_token": jwt}
 
-	_, ok := ka.getTokenClaims(fakeToken)
+	ka.config.KeycloakURL = jwksServer.URL
+
+	_, ok := ka.getTokenClaims(token)
 	if ok {
 		t.Error("getTokenClaims should fail for wrong issuer")
 	}
@@ -210,6 +289,53 @@ func TestGetTokenClaims_InvalidJWT(t *testing.T) {
 			t.Errorf("case %d: getTokenClaims should fail for invalid token", i)
 		}
 	}
+}
+
+func TestGetTokenClaims_TamperedPayload(t *testing.T) {
+	kid := "test-key-4"
+	ka, jwksServer := testKeycloakAuthWithJWKS(kid)
+	defer jwksServer.Close()
+
+	claims := map[string]interface{}{
+		"iss":                jwksServer.URL + "/realms/test-realm",
+		"preferred_username": "admin",
+		"exp":                float64(9999999999),
+		"azp":                "ssh-auth",
+	}
+	jwt := createSignedJWT(claims, kid)
+
+	// Tamper with the payload (change username)
+	parts := splitJWT(jwt)
+	tamperedClaims := map[string]interface{}{
+		"iss":                jwksServer.URL + "/realms/test-realm",
+		"preferred_username": "evil-admin",
+		"exp":                float64(9999999999),
+		"azp":                "ssh-auth",
+	}
+	tamperedPayload, _ := json.Marshal(tamperedClaims)
+	parts[1] = base64.RawURLEncoding.EncodeToString(tamperedPayload)
+	tamperedJWT := parts[0] + "." + parts[1] + "." + parts[2]
+
+	token := map[string]interface{}{"access_token": tamperedJWT}
+	ka.config.KeycloakURL = jwksServer.URL
+
+	_, ok := ka.getTokenClaims(token)
+	if ok {
+		t.Error("getTokenClaims should fail for tampered token")
+	}
+}
+
+func splitJWT(jwt string) []string {
+	parts := make([]string, 0, 3)
+	start := 0
+	for i := 0; i < len(jwt); i++ {
+		if jwt[i] == '.' {
+			parts = append(parts, jwt[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, jwt[start:])
+	return parts
 }
 
 // Helper

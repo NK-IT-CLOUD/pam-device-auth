@@ -17,9 +17,9 @@ import (
 	"syscall"
 	"time"
 
-	"keycloak-ssh-auth/internal/config"
-	"keycloak-ssh-auth/internal/html"
-	"keycloak-ssh-auth/internal/logger"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/html"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
 )
 
 // KeycloakAuth manages the authentication process with Keycloak
@@ -32,6 +32,7 @@ type KeycloakAuth struct {
 	token        map[string]interface{}
 	logger       *logger.Logger
 	authURL      string // Cache the auth URL to prevent regeneration
+	jwksCache    *JWKSCache
 }
 
 // AuthResult represents the result of an authentication attempt
@@ -46,9 +47,11 @@ type AuthResult struct {
 
 // NewKeycloakAuth creates a new KeycloakAuth instance
 func NewKeycloakAuth(cfg *config.Config, log *logger.Logger) *KeycloakAuth {
+	jwksURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/certs", cfg.KeycloakURL, cfg.Realm)
 	return &KeycloakAuth{
-		config: cfg,
-		logger: log,
+		config:    cfg,
+		logger:    log,
+		jwksCache: NewJWKSCache(jwksURL, 1*time.Hour),
 	}
 }
 
@@ -379,9 +382,8 @@ func (ka *KeycloakAuth) exchangeToken() (map[string]interface{}, error) {
 	return token, nil
 }
 
-// getTokenClaims extracts the claims from the access token
-// Note: This does base64 decoding of JWT payload. For production use,
-// consider fetching Keycloak's public key and verifying the signature.
+// getTokenClaims extracts and verifies claims from the access token.
+// Verifies JWT signature via Keycloak's JWKS endpoint, issuer, expiry, and audience.
 func (ka *KeycloakAuth) getTokenClaims(token map[string]interface{}) (map[string]interface{}, bool) {
 	accessToken, ok := token["access_token"].(string)
 	if !ok {
@@ -394,6 +396,14 @@ func (ka *KeycloakAuth) getTokenClaims(token map[string]interface{}) (map[string
 		ka.logger.Error("Invalid JWT format")
 		return nil, false
 	}
+
+	// Verify JWT signature via JWKS
+	if err := VerifyJWT(accessToken, ka.jwksCache); err != nil {
+		ka.logger.Error("JWT signature verification failed: %v", err)
+		return nil, false
+	}
+
+	ka.logger.Debug("JWT signature verified successfully")
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {

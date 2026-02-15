@@ -3,9 +3,9 @@ package unit
 import (
 	"testing"
 
-	"keycloak-ssh-auth/internal/auth"
-	"keycloak-ssh-auth/internal/config"
-	"keycloak-ssh-auth/internal/logger"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/auth"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
 )
 
 // TestStateParameterConsistency tests that GetAuthURL and Authenticate use the same state parameter

@@ -7,10 +7,10 @@ import (
 	"os"
 	"strings"
 
-	"keycloak-ssh-auth/internal/auth"
-	"keycloak-ssh-auth/internal/config"
-	"keycloak-ssh-auth/internal/logger"
-	"keycloak-ssh-auth/internal/user"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/auth"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/user"
 )
 
 const (
