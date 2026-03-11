@@ -123,10 +123,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("client_id is required")
 	}
 	
-	if c.ClientSecret == "" {
-		return fmt.Errorf("client_secret is required")
-	}
-	
+	// client_secret is optional — public clients use PKCE without a secret
+
 	if c.RequiredRole == "" {
 		return fmt.Errorf("required_role is required")
 	}
