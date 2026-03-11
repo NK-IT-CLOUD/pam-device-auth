@@ -3,194 +3,126 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
-	"strings"
+	"time"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/auth"
 	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/device"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/discovery"
 	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
+	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/token"
 	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/user"
 )
 
-const (
-	VERSION  = "0.3.0"
-	LOG_FILE = "/var/log/keycloak-ssh-auth.log"
-)
+var VERSION = "0.4.0"
 
-func printHelp() {
-	help := fmt.Sprintf(`Keycloak SSH Authentication v%s
-
-Usage: keycloak-auth [OPTIONS]
-
-Options:
-  --version       Display version information
-  --help          Display this help message
-  --debug         Enable debug logging
-  --mode <mode>   Authentication mode: "browser" (default) or "code"
-                  browser: User clicks link in browser
-                  code:    User sees code + link, auth via browser callback
-
-Configuration:
-  File: /etc/keycloak-ssh-auth/keycloak-pam.json
-  
-  Environment variables override config file:
-    KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID,
-    KEYCLOAK_CLIENT_SECRET, KEYCLOAK_REQUIRED_ROLE,
-    CALLBACK_IP, CALLBACK_PORT, AUTH_TIMEOUT, DEBUG_MODE
-
-Logs: %s
-
-Repository: https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
-`, VERSION, LOG_FILE)
-
-	fmt.Println(help)
-}
-
-// getClientIP retrieves the client IP from environment variables
-func getClientIP() string {
-	envVars := []string{"SSH_CONNECTION", "SSH_CLIENT", "PAM_RHOST", "REMOTE_ADDR"}
-
-	for _, env := range envVars {
-		if value := os.Getenv(env); value != "" {
-			parts := strings.Fields(value)
-			if len(parts) > 0 {
-				if net.ParseIP(parts[0]) != nil {
-					return parts[0]
-				}
-			}
-		}
-	}
-	return "unknown"
-}
+const logFile = "/var/log/keycloak-ssh-auth.log"
 
 func main() {
-	debugMode := false
-	authMode := "browser"
-
-	for i := 1; i < len(os.Args); i++ {
-		switch os.Args[i] {
+	debug := false
+	for _, arg := range os.Args[1:] {
+		switch arg {
 		case "--version":
-			fmt.Printf("Keycloak SSH Authentication v%s\n", VERSION)
+			fmt.Printf("keycloak-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			printHelp()
+			fmt.Println("Usage: keycloak-auth [--debug] [--version] [--help]")
+			fmt.Println("  SSH authentication via Keycloak Device Authorization Grant")
 			os.Exit(0)
 		case "--debug":
-			debugMode = true
-		case "--mode":
-			if i+1 < len(os.Args) {
-				i++
-				authMode = os.Args[i]
-			}
+			debug = true
 		}
 	}
 
-	// Initialize logger
-	log, err := logger.NewLogger(LOG_FILE, debugMode)
+	log, err := logger.NewLogger(logFile, debug)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Logger init failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer log.Close()
 
-	log.LogPhase("SSH LOGIN INITIATED")
+	log.Info("keycloak-auth %s starting", VERSION)
 
-	// Get SSH username
+	cfg, err := config.Load("")
+	if err != nil {
+		log.Error("Config error: %v", err)
+		os.Exit(1)
+	}
+
 	sshUser := os.Getenv("PAM_USER")
 	if sshUser == "" {
-		log.Error("No SSH username provided (PAM_USER environment variable missing)")
+		log.Error("PAM_USER not set")
 		os.Exit(1)
 	}
+	log.Info("Authenticating user: %s", sshUser)
 
-	clientIP := getClientIP()
-	if clientIP == "unknown" {
-		log.Warn("Could not determine client IP address")
-	}
-
-	log.Info("Login attempt from IP: %s", clientIP)
-	log.Info("Requested user account: %s", sshUser)
-	log.Info("Auth mode: %s", authMode)
-
-	// Load configuration
-	cfg, err := config.LoadConfig("")
+	endpoints, err := discovery.Fetch(cfg.KeycloakURL, cfg.Realm)
 	if err != nil {
-		log.Error("Failed to load configuration: %v", err)
+		log.Error("OIDC Discovery failed: %v", err)
+		os.Exit(1)
+	}
+	log.Debug("Discovery OK: device=%s", endpoints.DeviceAuthorizationEndpoint)
+
+	dc, err := device.RequestCode(endpoints.DeviceAuthorizationEndpoint, cfg.ClientID)
+	if err != nil {
+		log.Error("Device code request failed: %v", err)
 		os.Exit(1)
 	}
 
-	log.Debug("Configuration loaded: %s", cfg.String())
+	// Print to stdout — PAM pipes to SSH terminal
+	fmt.Println("────────────────────────────────────")
+	fmt.Printf("Login: %s\n", dc.VerificationURI)
+	fmt.Printf("Code:  %s\n", dc.UserCode)
+	if dc.VerificationURIComplete != "" {
+		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
+	}
+	fmt.Println("────────────────────────────────────")
 
-	// Perform authentication
-	if err := authenticate(log, cfg, sshUser, authMode); err != nil {
-		log.Error("Authentication failed: %v", err)
+	timeout := cfg.AuthTimeout
+	if dc.ExpiresIn > 0 && dc.ExpiresIn < timeout {
+		timeout = dc.ExpiresIn
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	log.Info("Waiting for authorization (timeout: %ds)", timeout)
+	tokenResp, err := device.PollToken(ctx, endpoints.TokenEndpoint, cfg.ClientID, dc.DeviceCode, dc.Interval)
+	if err != nil {
+		log.Error("Token polling failed: %v", err)
+		fmt.Println("Anmeldung fehlgeschlagen.")
 		os.Exit(1)
 	}
 
-	log.LogPhase("LOGIN COMPLETED")
-	log.Info("SSH authentication successful for user: %s", sshUser)
+	keys, err := token.FetchJWKS(endpoints.JwksURI)
+	if err != nil {
+		log.Error("JWKS fetch failed: %v", err)
+		os.Exit(1)
+	}
+
+	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID)
+	if err != nil {
+		log.Error("Token validation failed: %v", err)
+		os.Exit(1)
+	}
+
+	if result.Username != sshUser {
+		log.Error("Username mismatch: token=%q ssh=%q", result.Username, sshUser)
+		os.Exit(1)
+	}
+
+	if !token.HasRole(result.Roles, cfg.RequiredRole) {
+		log.Error("User %s lacks required role: %s", sshUser, cfg.RequiredRole)
+		fmt.Println("Zugriff verweigert.")
+		os.Exit(1)
+	}
+
+	log.Info("Auth OK: user=%s email=%s roles=%v", result.Username, result.Email, result.Roles)
+
+	if err := user.Setup(sshUser, log); err != nil {
+		log.Error("User setup failed: %v", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Login erfolgreich!")
 	os.Exit(0)
-}
-
-// authenticate performs the complete authentication flow
-func authenticate(log *logger.Logger, cfg *config.Config, sshUser string, mode string) error {
-	log.LogPhase("SSO AUTHENTICATION")
-
-	keycloakAuth := auth.NewKeycloakAuth(cfg, log)
-
-	var result *auth.AuthResult
-	var err error
-
-	ctx := context.Background()
-
-	switch mode {
-	case "code":
-		result, err = keycloakAuth.AuthenticateWithCode(ctx, sshUser)
-	default: // "browser"
-		// Get auth URL first to display
-		authURL, urlErr := keycloakAuth.GetAuthURL()
-		if urlErr != nil {
-			return fmt.Errorf("failed to generate auth URL: %v", urlErr)
-		}
-		fmt.Printf("\nSSO Login erforderlich!\nÖffne den folgenden Link:\n%s\n\n", authURL)
-		log.Info("Authentication URL provided to user")
-
-		result, err = keycloakAuth.Authenticate(ctx, sshUser)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	if !result.Success {
-		return fmt.Errorf("authentication failed: %s", result.ErrorMessage)
-	}
-
-	log.LogPhase("USER VERIFICATION")
-	log.LogSummary("SSO Identity Verification", map[string]string{
-		"Username": result.Username,
-		"Name":     result.Name,
-		"Email":    result.Email,
-		"Roles":    strings.Join(result.Roles, ", "),
-	})
-
-	// Setup user account
-	if cfg.CreateUsers || cfg.AddToSudo {
-		log.LogPhase("SYSTEM SETUP")
-
-		userManager := user.NewManager(log)
-		if err := userManager.SetupUser(result.Username, cfg.CreateUsers, cfg.AddToSudo); err != nil {
-			return fmt.Errorf("user setup failed: %v", err)
-		}
-	}
-
-	log.LogSummary("Login Summary", map[string]string{
-		"User":           result.Username,
-		"Name":           result.Name,
-		"Email":          result.Email,
-		"System Account": "Configured",
-		"Sudo Access":    fmt.Sprintf("%v", cfg.AddToSudo),
-	})
-
-	return nil
 }
