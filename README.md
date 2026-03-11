@@ -1,17 +1,18 @@
 # Keycloak SSH Authentication
 
-SSH-Login via Keycloak SSO — PAM-Modul + Go-Binary für OAuth2/OIDC-basierte SSH-Authentifizierung.
+SSH-Login via Keycloak SSO — PAM-Modul + Go-Binary mit Device Authorization Grant (RFC 8628).
 
 ## Architektur
 
 ```
 SSH Client → PAM Module (C) → keycloak-auth (Go) → Keycloak OIDC
                                     ↓
-                              Local HTTP Server ← Browser Callback
+                              Device Auth Grant (RFC 8628)
+                              User öffnet URL + Code im Browser
                                     ↓
                               JWT Verification (JWKS)
                                     ↓
-                              User Setup (create, sudo)
+                              User Setup (create + sudo)
 ```
 
 ### Komponenten
@@ -19,19 +20,27 @@ SSH Client → PAM Module (C) → keycloak-auth (Go) → Keycloak OIDC
 | Komponente | Sprache | Beschreibung |
 |---|---|---|
 | `pam_keycloak.so` | C | PAM-Modul, ruft Go-Binary auf |
-| `keycloak-auth` | Go | OAuth2/OIDC Flow mit PKCE, JWT-Verifizierung |
+| `keycloak-auth` | Go | Device Auth Grant, JWT-Verifizierung, User-Setup |
 | Config | JSON | `/etc/keycloak-ssh-auth/keycloak-pam.json` |
 
-### Auth-Flow
+### Auth-Flow (Device Authorization Grant)
 
 1. User verbindet per SSH → PAM ruft `keycloak-auth` auf
-2. Binary startet lokalen HTTP-Server für OAuth2 Callback
-3. User öffnet angezeigten Link im Browser → Keycloak Login
-4. Keycloak redirected zu Callback-URL mit Auth-Code
-5. Binary tauscht Code gegen Token (mit PKCE)
+2. Binary holt Device Code von Keycloak
+3. Terminal zeigt Verification-URL + User-Code an:
+   ```
+   ────────────────────────────────────
+   Login: https://sso.nk-it.cloud/realms/nk-it.cloud/protocol/openid-connect/auth/device
+   Code:  ABCD-EFGH
+   ────────────────────────────────────
+   ```
+4. User öffnet URL in beliebigem Browser (lokal, Handy, anderes Gerät) und gibt Code ein
+5. Binary pollt Token-Endpoint bis Autorisierung erfolgt (RFC 8628)
 6. **JWT-Signatur wird via JWKS-Endpoint verifiziert** (RSA/ECDSA)
-7. Claims werden geprüft: Issuer, Expiry, Required Role, Username-Match
-8. Optional: System-User wird erstellt + sudo konfiguriert
+7. Claims werden geprüft: Issuer, Expiry, Username-Match, Required Role
+8. System-User wird erstellt + sudo konfiguriert
+
+Kein lokaler HTTP-Server, kein Browser-Redirect, kein Callback — funktioniert identisch auf headless Servern und Desktop-Terminals.
 
 ## Build
 
@@ -49,7 +58,7 @@ make test-unit
 make deb
 ```
 
-**Voraussetzungen:** Go 1.23+, GCC, libpam0g-dev
+**Voraussetzungen:** Go 1.22+, GCC, libpam0g-dev
 
 ## Konfiguration
 
@@ -57,26 +66,32 @@ make deb
 
 ```json
 {
-  "keycloak_url": "https://sso.nk-it.cloud",
-  "realm": "nk-it.cloud",
-  "client_id": "ssh-auth",
-  "client_secret": "...",
-  "required_role": "ssh-access",
-  "callback_ip": "0.0.0.0",
-  "callback_port": "33499",
-  "auth_timeout": 180,
-  "create_users": true,
-  "add_to_sudo": true
+    "keycloak_url": "https://sso.nk-it.cloud",
+    "realm": "nk-it.cloud",
+    "client_id": "ssh-server",
+    "required_role": "ssh-access"
 }
 ```
 
+| Feld | Pflicht | Default | Beschreibung |
+|------|---------|---------|-------------|
+| `keycloak_url` | Ja | — | Keycloak Base-URL |
+| `realm` | Ja | — | Keycloak Realm |
+| `client_id` | Ja | — | OAuth2 Client ID (Public Client) |
+| `required_role` | Ja | — | Benötigte Rolle für SSH-Zugang |
+| `auth_timeout` | Nein | 180 | Timeout in Sekunden (30–600) |
+
 Alle Werte können per Umgebungsvariable überschrieben werden:
-`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, etc.
+`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_REQUIRED_ROLE`, `KEYCLOAK_AUTH_TIMEOUT`
+
+Debug-Modus: `keycloak-auth --debug` (CLI-Flag, kein Config-Feld)
+
+Die Shipped Config funktioniert out-of-the-box auf NKIT-Hosts — kein Editieren nötig nach `dpkg -i`.
 
 ## Installation
 
 ```bash
-# Via .deb Paket
+# Via .deb Paket (empfohlen)
 make install
 
 # Oder manuell
@@ -87,29 +102,54 @@ sudo cp configs/keycloak-pam.json /etc/keycloak-ssh-auth/
 
 PAM-Konfiguration in `/etc/pam.d/sshd` und SSHD-Config in `/etc/ssh/sshd_config.d/`.
 
+### SSH-Konfiguration
+
+Die SSHD-Config (`10-keycloak-auth.conf`) erlaubt SSH-Key-Fallback:
+
+```
+AuthenticationMethods publickey keyboard-interactive
+```
+
+SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn kein Key vorhanden.
+
+## Keycloak-Setup
+
+**Client `ssh-server`** im Realm `nk-it.cloud`:
+
+| Setting | Value |
+|---------|-------|
+| Client Type | Public (kein Secret) |
+| Standard Flow | Disabled |
+| Direct Access Grants | Disabled |
+| Device Authorization Grant | **Enabled** |
+| Scopes | `openid profile email` |
+
+**Rolle `ssh-access`**: Als Client-Rolle auf `ssh-server` anlegen, an Admin-User zuweisen.
+
 ## Sicherheit
 
-- **JWT-Signatur-Verifizierung** via Keycloak JWKS-Endpoint (RSA256, RS384, RS512, ES256, ES384, ES512)
-- **PKCE** (S256) für den Authorization Code Flow
-- **State-Parameter** gegen CSRF
-- **Issuer/Expiry/Audience** Validation
+- **JWT-Signatur-Verifizierung** via Keycloak JWKS-Endpoint (RS256, RS384, RS512, ES256, ES384, ES512)
+- **OIDC Discovery** beim Start — fail-fast wenn SSO nicht erreichbar
+- **Issuer/Expiry/Not-Before** Validation
 - **Username-Matching**: SSO-Username muss SSH-Username entsprechen
 - **Role-Based Access**: Nur User mit konfigurierter Rolle dürfen sich einloggen
+- **Public Client** — kein Secret zu verwalten/rotieren
+- **Sudoers Drop-in**: `/etc/sudoers.d/keycloak-ssh-auth` (validiert mit `visudo -cf`)
 
 ## Projektstruktur
 
 ```
-cmd/keycloak-auth/     → Main Binary (CLI + Auth Flow)
+cmd/keycloak-auth/     → Main Binary (Config → Discovery → Device Auth → User Setup)
 internal/
-  auth/                → Keycloak Auth + JWKS Verification
-  config/              → Config Loading + Validation
-  html/                → HTML Templates für Browser-Callback
+  config/              → Config Loading + Validation (5 Felder)
+  discovery/           → OIDC Discovery (Endpoints laden)
+  device/              → Device Authorization Grant (RFC 8628)
+  token/               → JWKS Fetch, JWT Verify, Role Extraction
+  user/                → System User Management (create + sudo)
   logger/              → Structured Logging
-  user/                → System User Management
 pam_keycloak.c         → PAM Module (C)
-configs/               → Default Configs
+configs/               → Default Configs (Zero-Config für NKIT)
 debian/                → Debian Package Files
-test/                  → Additional Tests
 ```
 
 ## Repository
@@ -117,3 +157,4 @@ test/                  → Additional Tests
 - **Repo**: https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
 - **CI**: Gitea Actions (`.gitea/workflows/ci.yaml`)
 - **Build Host**: CT 104 (ssh-keycloak-build) auf proxmox-ai
+- **Test Host**: CT 110 (kc-ssh-test) auf proxmox-ai
