@@ -1,12 +1,12 @@
 Package: keycloak-ssh-auth
-Version: 0.2.6
-Section: admin
-Priority: optional
+Version: 0.4.0
 Architecture: amd64
 Depends: libc6, openssh-server
 Maintainer: Norbert Krucky <norbert.krucky@pm.me>
-Description: Keycloak SSH Authentication
- Provides SSH authentication via Keycloak SSO.
- Includes PAM module integration and web-based authentication flow.
- Version 0.2.4 includes improved error handling, modular architecture,
- environment variable support, and comprehensive testing.
+Section: admin
+Priority: optional
+Homepage: https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
+Description: Keycloak SSH Authentication via Device Authorization Grant
+ Provides PAM-based SSH authentication using Keycloak SSO.
+ Uses RFC 8628 Device Authorization Grant for headless and
+ desktop SSH sessions. Zero-config for NKIT infrastructure.

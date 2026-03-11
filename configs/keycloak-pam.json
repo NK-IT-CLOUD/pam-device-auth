@@ -1,9 +1,6 @@
 {
     "keycloak_url": "https://sso.nk-it.cloud",
     "realm": "nk-it.cloud",
-    "client_id": "ssh-demo",
-    "client_secret": "ojcKS56fVPJnEt5qiMxvvYHzstxLMA1V",
-    "required_role": "admin",
-    "callback_ip": "10.6.66.200",
-    "callback_port": "33499"
+    "client_id": "ssh-server",
+    "required_role": "ssh-access"
 }

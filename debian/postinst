@@ -1,9 +1,31 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
-# Setup logging
+SHARE_DIR="/usr/share/keycloak-ssh-auth"
+CONFIG_DIR="/etc/keycloak-ssh-auth"
+CONFIG_FILE="${CONFIG_DIR}/keycloak-pam.json"
+LOG_FILE="/var/log/keycloak-ssh-auth.log"
+
+check_os_compatibility() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu)
+                if [ "${VERSION_ID%%.*}" -lt 24 ]; then
+                    echo "WARNING: Ubuntu 24.04+ recommended (found $VERSION_ID)"
+                fi
+                ;;
+            debian)
+                if [ "${VERSION_ID%%.*}" -lt 12 ]; then
+                    echo "WARNING: Debian 12+ recommended (found $VERSION_ID)"
+                fi
+                ;;
+        esac
+    fi
+}
+
 setup_logrotate() {
-    cat > /etc/logrotate.d/keycloak-ssh-auth << EOF
+    cat > /etc/logrotate.d/keycloak-ssh-auth << 'LOGROTATE'
 /var/log/keycloak-ssh-auth.log {
     weekly
     rotate 4
@@ -11,151 +33,50 @@ setup_logrotate() {
     delaycompress
     missingok
     notifempty
-    create 640 root adm
+    create 0644 root root
 }
-EOF
-    chmod 644 /etc/logrotate.d/keycloak-ssh-auth
+LOGROTATE
 }
 
-# Function to check OS and version compatibility
-check_os_compatibility() {
-    # Check if /etc/os-release exists
-    if [ ! -f /etc/os-release ]; then
-        echo "Unable to determine OS. This script requires /etc/os-release."
-        exit 1
-    fi
+case "$1" in
+    configure)
+        check_os_compatibility
+        setup_logrotate
 
-    # Source the os-release file to get distribution and version information
-    . /etc/os-release
+        # Create directories
+        mkdir -p /etc/ssh/sshd_config.d
+        mkdir -p "$CONFIG_DIR"
 
-    # Convert VERSION_ID to a comparable number by removing dots
-    version_number=$(echo "$VERSION_ID" | sed 's/\.//g')
+        # Install SSH config
+        cp "${SHARE_DIR}/config/10-keycloak-auth.conf" /etc/ssh/sshd_config.d/
 
-    # Compatibility check for Ubuntu
-    if [ "$ID" = "ubuntu" ]; then
-        if [ "$version_number" -lt 2404 ]; then
-            echo "Unsupported Ubuntu version. Requires Ubuntu 24.04 or higher."
-            exit 1
+        # Install PAM config (backup original first)
+        if [ -f /etc/pam.d/sshd ] && [ ! -f /etc/pam.d/sshd.original ]; then
+            cp /etc/pam.d/sshd /etc/pam.d/sshd.original
         fi
-        return 0
-    fi
+        cp "${SHARE_DIR}/config/pam-sshd-keycloak" /etc/pam.d/sshd
 
-    # Compatibility check for Debian
-    if [ "$ID" = "debian" ]; then
-        if [ "$version_number" -lt 12 ]; then
-            echo "Unsupported Debian version. Requires Debian 12 or higher."
-            exit 1
+        # Install config (preserve existing custom config)
+        if [ ! -f "$CONFIG_FILE" ]; then
+            cp "${SHARE_DIR}/config/keycloak-pam.json" "$CONFIG_FILE"
         fi
-        return 0
-    fi
 
-    # If not Ubuntu or Debian
-    echo "Unsupported distribution. This script is designed for Ubuntu 24+ or Debian 12+."
-    exit 1
-}
+        # Set permissions
+        chmod 755 /usr/local/bin/keycloak-auth
+        chmod 755 /usr/lib/security/pam_keycloak.so
+        chmod 600 "$CONFIG_FILE"
 
-# Run OS compatibility check first
-check_os_compatibility
+        # Create log file
+        touch "$LOG_FILE"
+        chmod 644 "$LOG_FILE"
 
-# Setup logrotate configuration
-setup_logrotate
+        # Restart SSH
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service 2>/dev/null || true
+        fi
 
-# Create required directories
-mkdir -p /etc/ssh/sshd_config.d
-mkdir -p /etc/pam.d
-
-# Install SSH configuration
-cp /usr/share/keycloak-ssh-auth/config/10-keycloak-auth.conf /etc/ssh/sshd_config.d/
-
-# Backup original PAM sshd config if it hasn't been backed up before
-if [ ! -f /etc/pam.d/sshd.original ]; then
-    cp /etc/pam.d/sshd /etc/pam.d/sshd.original
-fi
-
-# Install new PAM configuration
-cp /usr/share/keycloak-ssh-auth/config/pam-sshd-keycloak /etc/pam.d/sshd
-
-# Handle keycloak-pam.json configuration
-CONFIG_DIR="/etc/keycloak-ssh-auth"
-CONFIG_FILE="${CONFIG_DIR}/keycloak-pam.json"
-TEMPLATE_FILE="/usr/share/keycloak-ssh-auth/config/keycloak-pam.json"
-
-# Create config directory if it doesn't exist
-mkdir -p "${CONFIG_DIR}"
-
-# Function to check if files are different
-files_are_different() {
-    # If either file doesn't exist, consider them different
-    [ ! -f "$1" ] && return 0
-    [ ! -f "$2" ] && return 0
-    
-    # Compare files ignoring whitespace
-    if diff -B -w "$1" "$2" >/dev/null 2>&1; then
-        return 1    # files are the same
-    else
-        return 0    # files are different
-    fi
-}
-
-# Check if config exists and is different from template
-if [ -f "${CONFIG_FILE}" ]; then
-    if files_are_different "${CONFIG_FILE}" "${TEMPLATE_FILE}"; then
-        # Existing config is different from template - preserve it
-        chmod 600 "${CONFIG_FILE}"
-        echo "Preserving existing Keycloak configuration at ${CONFIG_FILE}"
-    else
-        # Files are identical - safe to update
-        cp "${TEMPLATE_FILE}" "${CONFIG_FILE}"
-        chmod 600 "${CONFIG_FILE}"
-        echo "Updated Keycloak configuration at ${CONFIG_FILE}"
-    fi
-else
-    # No config exists - copy default
-    cp "${TEMPLATE_FILE}" "${CONFIG_FILE}"
-    chmod 600 "${CONFIG_FILE}"
-    echo "Initial Keycloak configuration installed at ${CONFIG_FILE}"
-fi
-
-# Set correct permissions for other files
-chmod 644 /etc/ssh/sshd_config.d/10-keycloak-auth.conf
-chmod 644 /etc/pam.d/sshd
-
-# Verify PAM module is executable
-chmod 755 /usr/local/bin/keycloak-auth
-
-# Test PAM configuration
-if command -v pam-auth-update >/dev/null 2>&1; then
-    pam-auth-update --package
-fi
-
-# Modify service restart logic
-if [ -x "$(command -v systemctl)" ]; then
-    if systemctl list-unit-files | grep -q ssh.service; then
-        systemctl restart ssh || true
-    elif systemctl list-unit-files | grep -q sshd.service; then
-        systemctl restart sshd || true
-    fi
-else
-    service ssh restart || true
-fi
-
-# Post-installation message
-post_install_message() {
-    echo ""
-    echo "Keycloak SSH Authentication Installed Successfully!"
-    echo ""
-    echo "Next steps:"
-    if [ ! -f /etc/keycloak-ssh-auth/keycloak-pam.json ]; then
-        echo "1. Configure Keycloak settings in /etc/keycloak-ssh-auth/keycloak-pam.json"
-    else
-        echo "1. Your existing Keycloak configuration has been preserved"
-        echo "   Review settings in: /etc/keycloak-ssh-auth/keycloak-pam.json"
-    fi
-    echo "2. For Example and help, run '$0 --help'"
-    echo ""
-}
-
-# Call post-installation message
-post_install_message
+        echo "keycloak-ssh-auth 0.4.0 installed successfully."
+        ;;
+esac
 
 exit 0
