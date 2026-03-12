@@ -46,7 +46,7 @@ type Logger struct {
 func NewLogger(logFile string, debug bool) (*Logger, error) {
 	var writer io.Writer = os.Stderr
 	var logFileHandle *os.File
-	
+
 	if logFile != "" {
 		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
@@ -57,7 +57,7 @@ func NewLogger(logFile string, debug bool) (*Logger, error) {
 	}
 
 	logger := log.New(writer, "", 0) // No default prefix or flags
-	
+
 	level := INFO
 	if debug {
 		level = DEBUG
@@ -136,48 +136,4 @@ func (l *Logger) Close() error {
 		return l.file.Close()
 	}
 	return nil
-}
-
-// Default logger instance
-var defaultLogger *Logger
-
-// InitDefaultLogger initializes the default logger
-func InitDefaultLogger(logFile string, debug bool) error {
-	var err error
-	defaultLogger, err = NewLogger(logFile, debug)
-	return err
-}
-
-// GetDefaultLogger returns the default logger instance
-func GetDefaultLogger() *Logger {
-	if defaultLogger == nil {
-		// Fallback to stderr logger
-		defaultLogger, _ = NewLogger("", false)
-	}
-	return defaultLogger
-}
-
-// Convenience functions using the default logger
-func Debug(format string, v ...interface{}) {
-	GetDefaultLogger().Debug(format, v...)
-}
-
-func Info(format string, v ...interface{}) {
-	GetDefaultLogger().Info(format, v...)
-}
-
-func Warn(format string, v ...interface{}) {
-	GetDefaultLogger().Warn(format, v...)
-}
-
-func Error(format string, v ...interface{}) {
-	GetDefaultLogger().Error(format, v...)
-}
-
-func LogPhase(phase string) {
-	GetDefaultLogger().LogPhase(phase)
-}
-
-func LogSummary(title string, items map[string]string) {
-	GetDefaultLogger().LogSummary(title, items)
 }

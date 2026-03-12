@@ -11,8 +11,28 @@ import (
 
 var validUsername = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
-const sudoersFile = "/etc/sudoers.d/keycloak-ssh-auth"
 const sudoersContent = "%sudo ALL=(ALL) NOPASSWD:ALL\n"
+
+var sudoersFile = "/etc/sudoers.d/keycloak-ssh-auth"
+var executor commandExecutor = systemCommandExecutor{}
+
+type commandExecutor interface {
+	Run(name string, args ...string) ([]byte, int, error)
+}
+
+type systemCommandExecutor struct{}
+
+func (systemCommandExecutor) Run(name string, args ...string) ([]byte, int, error) {
+	cmd := exec.Command(findBin(name), args...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return out, 0, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return out, exitErr.ExitCode(), err
+	}
+	return out, -1, err
+}
 
 // findBin resolves a command to its absolute path.
 // PAM sets a minimal PATH, so exec.Command("getent") fails.
@@ -40,16 +60,14 @@ func Setup(username string, log *logger.Logger) error {
 
 	if !exists {
 		log.Info("Creating user: %s", username)
-		cmd := exec.Command(findBin("useradd"), "-m", "-s", "/bin/bash", "-G", "sudo", username)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if out, _, err := executor.Run("useradd", "-m", "-s", "/bin/bash", "-G", "sudo", username); err != nil {
 			return fmt.Errorf("useradd failed: %s: %w", string(out), err)
 		}
 		log.Info("User %s created", username)
 	}
 
 	// Ensure sudo group membership (idempotent)
-	cmd := exec.Command(findBin("usermod"), "-aG", "sudo", username)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, _, err := executor.Run("usermod", "-aG", "sudo", username); err != nil {
 		return fmt.Errorf("add to sudo group: %s: %w", string(out), err)
 	}
 
@@ -62,11 +80,11 @@ func Setup(username string, log *logger.Logger) error {
 }
 
 func userExists(username string) (bool, error) {
-	err := exec.Command(findBin("getent"), "passwd", username).Run()
+	_, exitCode, err := executor.Run("getent", "passwd", username)
 	if err == nil {
 		return true, nil
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
+	if exitCode == 2 {
 		return false, nil
 	}
 	return false, err
@@ -84,8 +102,7 @@ func ensureSudoers(log *logger.Logger) error {
 	}
 
 	// Validate syntax
-	cmd := exec.Command(findBin("visudo"), "-cf", tmpFile)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, _, err := executor.Run("visudo", "-cf", tmpFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("visudo validation failed: %s: %w", string(out), err)
 	}

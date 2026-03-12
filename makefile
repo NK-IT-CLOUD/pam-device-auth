@@ -1,5 +1,5 @@
-# keycloak-ssh-auth v0.5.0 Build System
-VERSION=0.5.0
+# keycloak-ssh-auth v0.6.0 Build System
+VERSION=0.6.0
 MODULE=git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
 
 # Directories
@@ -17,8 +17,10 @@ GO_TEST_FLAGS=-v -race -coverprofile=coverage.out -count=1
 PAM_SRC=pam_keycloak.c
 PAM_OBJ=pam_keycloak.o
 PAM_SO=pam_keycloak.so
+PAM_CFLAGS=-Wall -Wextra -fPIC
+PAM_LDFLAGS=-shared -lpam
 
-.PHONY: all build build-all test test-unit lint format clean clean-all deb release install uninstall
+.PHONY: all build pam build-all test test-unit lint format clean clean-all deb release install uninstall
 
 all: clean build-all test
 
@@ -28,11 +30,17 @@ build:
 	@mkdir -p $(BIN_DIR)
 	go build $(GO_BUILD_FLAGS) -o $(BIN_DIR)/keycloak-auth ./cmd/keycloak-auth/
 
+pam: $(PAM_SO)
+	@echo "PAM module ready."
+
+$(PAM_OBJ): $(PAM_SRC)
+	gcc $(PAM_CFLAGS) -c $(PAM_SRC) -o $(PAM_OBJ)
+
+$(PAM_SO): $(PAM_OBJ)
+	gcc $(PAM_LDFLAGS) -o $(PAM_SO) $(PAM_OBJ)
+
 # Build binary + PAM module
-build-all: build
-	@echo "Building PAM module..."
-	gcc -fPIC -c $(PAM_SRC) -o $(PAM_OBJ)
-	gcc -shared -o $(PAM_SO) $(PAM_OBJ) -lpam
+build-all: build pam
 	@echo "Build complete."
 
 # Run all tests

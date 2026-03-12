@@ -2,7 +2,7 @@
 
 SSH-Login via Keycloak SSO — PAM-Modul + Go-Binary mit Device Authorization Grant (RFC 8628).
 
-**Version:** 0.5.0 | **Voraussetzung:** Ubuntu 24.04+ (OpenSSH >= 9.6)
+**Version:** 0.6.0 | **Voraussetzung:** Ubuntu 24.04+ (OpenSSH >= 9.6)
 
 ## Architektur
 
@@ -51,7 +51,7 @@ SSH Client → PAM Module (C) → keycloak-auth (Go) → Keycloak OIDC
 
 Kein lokaler HTTP-Server, kein Browser-Redirect, kein Callback — funktioniert identisch auf headless Servern und Desktop-Terminals.
 
-### Token Caching (v0.5.0)
+### Token Caching (v0.6.0)
 
 Refresh Tokens werden in `/run/keycloak-ssh-auth/<user>.json` gecacht (tmpfs — verschwindet bei Reboot). Bei jedem Cache-Hit wird der Token bei Keycloak refreshed — User-Deaktivierung oder Rollen-Entzug wirken sofort.
 
@@ -70,6 +70,9 @@ make build-all
 
 # Nur Binary
 make build
+
+# Nur PAM-Modul
+make pam
 
 # Tests
 make test
@@ -124,6 +127,8 @@ sudo cp configs/keycloak-pam.json /etc/keycloak-ssh-auth/
 
 Das .deb-Paket installiert PAM- und SSH-Configs nur bei Erstinstallation. Lokale Anpassungen bleiben bei Upgrades erhalten.
 
+Wichtig: Bei der Erstinstallation sichert `postinst` die bestehende Datei `/etc/pam.d/sshd` nach `/etc/pam.d/sshd.original` und ersetzt sie mit dem Template aus diesem Projekt. Auf Hosts mit angepasstem PAM-Stack sollte die Datei `configs/pam-sshd-keycloak` vor dem Rollout manuell in die bestehende PAM-Konfiguration eingemerged werden.
+
 ### SSH-Konfiguration
 
 Die SSHD-Config (`10-keycloak-auth.conf`) erlaubt SSH-Key-Fallback:
@@ -133,7 +138,7 @@ AuthenticationMethods publickey keyboard-interactive
 PermitRootLogin prohibit-password
 ```
 
-SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn kein Key vorhanden.
+SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn der `keyboard-interactive`/PAM-Pfad gewaehlt wird.
 
 ## Keycloak-Setup
 
@@ -154,6 +159,7 @@ SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn kein 
 - **JWT-Signatur-Verifizierung** via Keycloak JWKS-Endpoint (RS256, RS384, RS512, ES256, ES384, ES512)
 - **OIDC Discovery** beim Start — fail-fast wenn SSO nicht erreichbar
 - **Issuer/Expiry/Not-Before** Validation
+- **Authorized Party / Audience Validation**: `azp` oder `aud` muss zur konfigurierten `client_id` passen
 - **Username-Matching**: SSO-Username muss SSH-Username entsprechen
 - **Role-Based Access**: Nur User mit konfigurierter Rolle dürfen sich einloggen
 - **Token Refresh validiert bei Keycloak**: Kein staler Cache — User-Deaktivierung wirkt sofort
@@ -187,7 +193,7 @@ Einheitliches Format für PAM-Modul und Go-Binary:
 
 ```
 2026/03/12 02:13:11 [PAM]    INFO  Authentication attempt for user nk from IP 10.0.88.70
-2026/03/12 02:13:11 [SSO-GO] INFO  keycloak-auth 0.5.0 starting
+2026/03/12 02:13:11 [SSO-GO] INFO  keycloak-auth 0.6.0 starting
 2026/03/12 02:13:24 [SSO-GO] INFO  Cached session found for user: nk
 2026/03/12 02:13:24 [SSO-GO] INFO  Token refresh successful
 2026/03/12 02:13:24 [SSO-GO] INFO  Auth OK: user=nk email=nk@nk-it.cloud roles=[...]

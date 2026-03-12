@@ -1,10 +1,12 @@
 package discovery
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestFetchSuccess(t *testing.T) {
@@ -26,7 +28,7 @@ func TestFetchSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	result, err := Fetch(srv.URL, "test")
+	result, err := Fetch(context.Background(), srv.Client(), srv.URL, "test")
 	if err != nil {
 		t.Fatalf("Fetch() error: %v", err)
 	}
@@ -79,7 +81,7 @@ func TestFetchMissingFields(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, err := Fetch(srv.URL, "test")
+			_, err := Fetch(context.Background(), srv.Client(), srv.URL, "test")
 			if err == nil {
 				t.Error("Fetch() should have returned error for missing field")
 			}
@@ -93,14 +95,14 @@ func TestFetchServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := Fetch(srv.URL, "test")
+	_, err := Fetch(context.Background(), srv.Client(), srv.URL, "test")
 	if err == nil {
 		t.Error("Fetch() should fail on 500")
 	}
 }
 
 func TestFetchUnreachable(t *testing.T) {
-	_, err := Fetch("http://127.0.0.1:1", "test")
+	_, err := Fetch(context.Background(), &http.Client{Timeout: 100 * time.Millisecond}, "http://127.0.0.1:1", "test")
 	if err == nil {
 		t.Error("Fetch() should fail for unreachable server")
 	}

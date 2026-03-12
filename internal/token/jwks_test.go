@@ -1,6 +1,7 @@
 package token
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestFetchJWKS_RSA(t *testing.T) {
@@ -39,7 +41,7 @@ func TestFetchJWKS_RSA(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	keys, err := FetchJWKS(srv.URL)
+	keys, err := FetchJWKS(context.Background(), srv.Client(), srv.URL)
 	if err != nil {
 		t.Fatalf("FetchJWKS() error: %v", err)
 	}
@@ -91,7 +93,7 @@ func TestFetchJWKS_EC(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	keys, err := FetchJWKS(srv.URL)
+	keys, err := FetchJWKS(context.Background(), srv.Client(), srv.URL)
 	if err != nil {
 		t.Fatalf("FetchJWKS() error: %v", err)
 	}
@@ -134,7 +136,7 @@ func TestFetchJWKS_SkipsNonSigKeys(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	keys, err := FetchJWKS(srv.URL)
+	keys, err := FetchJWKS(context.Background(), srv.Client(), srv.URL)
 	if err != nil {
 		t.Fatalf("FetchJWKS() error: %v", err)
 	}
@@ -153,7 +155,7 @@ func TestFetchJWKS_EmptyKeys(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := FetchJWKS(srv.URL)
+	_, err := FetchJWKS(context.Background(), srv.Client(), srv.URL)
 	if err == nil {
 		t.Error("FetchJWKS() should fail with no signing keys")
 	}
@@ -165,8 +167,15 @@ func TestFetchJWKS_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := FetchJWKS(srv.URL)
+	_, err := FetchJWKS(context.Background(), srv.Client(), srv.URL)
 	if err == nil {
 		t.Error("FetchJWKS() should fail on 500")
+	}
+}
+
+func TestFetchJWKS_Unreachable(t *testing.T) {
+	_, err := FetchJWKS(context.Background(), &http.Client{Timeout: 100 * time.Millisecond}, "http://127.0.0.1:1")
+	if err == nil {
+		t.Error("FetchJWKS() should fail for an unreachable server")
 	}
 }

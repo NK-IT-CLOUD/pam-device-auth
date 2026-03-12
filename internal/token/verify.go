@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 )
@@ -20,7 +21,7 @@ type TokenResult struct {
 }
 
 // Validate verifies a JWT access token and extracts claims.
-// clientID is used for azp validation and role extraction from resource_access.
+// clientID is enforced against azp or aud and used for role extraction from resource_access.
 func Validate(accessToken string, keys map[string]crypto.PublicKey, issuer, clientID string) (*TokenResult, error) {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) != 3 {
@@ -71,6 +72,10 @@ func Validate(accessToken string, keys map[string]crypto.PublicKey, issuer, clie
 		return nil, fmt.Errorf("invalid issuer: got %q, want %q", iss, issuer)
 	}
 
+	if err := validateClientBinding(claims, clientID); err != nil {
+		return nil, err
+	}
+
 	// Validate expiry
 	exp, ok := claims["exp"].(float64)
 	if !ok {
@@ -109,6 +114,46 @@ func getStringClaim(claims map[string]interface{}, key string) string {
 	return ""
 }
 
+func validateClientBinding(claims map[string]interface{}, clientID string) error {
+	if azp := getStringClaim(claims, "azp"); azp != "" {
+		if azp != clientID {
+			return fmt.Errorf("invalid authorized party: got %q, want %q", azp, clientID)
+		}
+		return nil
+	}
+
+	aud, ok := claims["aud"]
+	if !ok {
+		return fmt.Errorf("token missing azp or aud claim")
+	}
+	if audienceContains(aud, clientID) {
+		return nil
+	}
+
+	return fmt.Errorf("token audience does not include %q", clientID)
+}
+
+func audienceContains(aud interface{}, clientID string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == clientID
+	case []string:
+		for _, candidate := range v {
+			if candidate == clientID {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, candidate := range v {
+			if s, ok := candidate.(string); ok && s == clientID {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func hashForAlgorithm(alg string) (crypto.Hash, error) {
 	switch alg {
 	case "RS256", "ES256":
@@ -136,11 +181,42 @@ func verifySignature(alg string, key crypto.PublicKey, signedContent, signature 
 	case *rsa.PublicKey:
 		return rsa.VerifyPKCS1v15(k, hashFunc, hashed, signature)
 	case *ecdsa.PublicKey:
-		if !ecdsa.VerifyASN1(k, hashed, signature) {
-			return fmt.Errorf("ECDSA signature verification failed")
-		}
-		return nil
+		return verifyECDSAJWSSignature(alg, k, hashed, signature)
 	default:
 		return fmt.Errorf("unsupported key type: %T", key)
+	}
+}
+
+func verifyECDSAJWSSignature(alg string, key *ecdsa.PublicKey, hashed, signature []byte) error {
+	partSize, err := ecdsaCoordinateSize(alg)
+	if err != nil {
+		return err
+	}
+	if len(signature) != partSize*2 {
+		return fmt.Errorf("invalid ECDSA signature length: got %d, want %d", len(signature), partSize*2)
+	}
+
+	r := new(big.Int).SetBytes(signature[:partSize])
+	s := new(big.Int).SetBytes(signature[partSize:])
+	if r.Sign() <= 0 || s.Sign() <= 0 {
+		return fmt.Errorf("invalid ECDSA signature values")
+	}
+	if !ecdsa.Verify(key, hashed, r, s) {
+		return fmt.Errorf("ECDSA signature verification failed")
+	}
+
+	return nil
+}
+
+func ecdsaCoordinateSize(alg string) (int, error) {
+	switch alg {
+	case "ES256":
+		return 32, nil
+	case "ES384":
+		return 48, nil
+	case "ES512":
+		return 66, nil
+	default:
+		return 0, fmt.Errorf("unsupported algorithm: %s", alg)
 	}
 }

@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,11 +15,22 @@ type Endpoints struct {
 	JwksURI                     string `json:"jwks_uri"`
 }
 
-func Fetch(keycloakURL, realm string) (*Endpoints, error) {
+func Fetch(ctx context.Context, client *http.Client, keycloakURL, realm string) (*Endpoints, error) {
 	discoveryURL := fmt.Sprintf("%s/realms/%s/.well-known/openid-configuration", keycloakURL, realm)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(discoveryURL)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build OIDC discovery request: %w", err)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch OIDC discovery: %w", err)
 	}

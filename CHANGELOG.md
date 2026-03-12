@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.6.0] - 2026-03-12
+### Fixed
+- **JOSE ECDSA verification**: ES256/384/512 JWTs are now verified using RFC 7515 raw `R||S` signatures instead of ASN.1 DER encoding
+- **Client binding validation**: `token.Validate()` now enforces `azp` or `aud` against the configured `client_id`
+- **HTTP cancellation**: Device Code, polling, refresh, discovery and JWKS requests now use `context.Context` and a caller-supplied `http.Client`
+- **CI PAM build**: Gitea CI now uses an explicit `make pam` target instead of relying on a pre-existing `pam_keycloak.so`
+
+### Changed
+- **Release tooling**: Removed the stale GitHub release script and aligned build documentation with the current Gitea/Make workflow
+- **PAM template**: Removed `pam_permit.so` short-circuit from the shipped `sshd` PAM template and documented the first-install overwrite behavior more clearly
+- **Version script**: `scripts/version.sh` now ensures an `Unreleased` section exists before inserting a release entry
+
+### Added
+- **HTTP timeout tests**: Added regression tests for request cancellation and hanging device-flow requests
+- **User setup tests**: Added mocked command-executor coverage for `useradd`, `usermod` and `visudo` failure paths
+
 ## [0.5.0] - 2026-03-12
 
 ### Added

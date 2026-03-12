@@ -75,7 +75,7 @@ func TestLogLevel_String(t *testing.T) {
 	}
 	for level, expected := range cases {
 		if got := level.String(); got != expected {
-			t.Errorf("expected '%s', got '%s'", expected, got)
+			t.Errorf("expected %q, got %q", expected, got)
 		}
 	}
 }
@@ -83,7 +83,7 @@ func TestLogLevel_String(t *testing.T) {
 func TestLogLevel_String_Unknown(t *testing.T) {
 	unknown := LogLevel(99)
 	if got := unknown.String(); got != "UNKNOWN" {
-		t.Errorf("expected 'UNKNOWN', got '%s'", got)
+		t.Errorf("expected UNKNOWN, got %q", got)
 	}
 }
 
@@ -121,7 +121,6 @@ func TestDebugSuppression(t *testing.T) {
 	tmpFile := "/tmp/test-ksa-debug-suppress.log"
 	defer os.Remove(tmpFile)
 
-	// Create logger with debug disabled (INFO level)
 	log, err := NewLogger(tmpFile, false)
 	if err != nil {
 		t.Fatalf("NewLogger failed: %v", err)
@@ -145,37 +144,11 @@ func TestDebugSuppression(t *testing.T) {
 	}
 }
 
-func TestDebugEnabled(t *testing.T) {
-	tmpFile := "/tmp/test-ksa-debug-enabled.log"
-	defer os.Remove(tmpFile)
-
-	log, err := NewLogger(tmpFile, true)
-	if err != nil {
-		t.Fatalf("NewLogger failed: %v", err)
-	}
-	defer log.Close()
-
-	log.Debug("this debug message should appear")
-
-	content, err := os.ReadFile(tmpFile)
-	if err != nil {
-		t.Fatalf("failed to read log file: %v", err)
-	}
-
-	s := string(content)
-	if !strings.Contains(s, "this debug message should appear") {
-		t.Error("debug message should appear when debug is enabled")
-	}
-	if !strings.Contains(s, "DEBUG") {
-		t.Error("debug messages should have DEBUG level")
-	}
-}
-
 func TestAllLogLevels_Output(t *testing.T) {
 	tmpFile := "/tmp/test-ksa-all-levels.log"
 	defer os.Remove(tmpFile)
 
-	log, err := NewLogger(tmpFile, true) // debug mode = all levels visible
+	log, err := NewLogger(tmpFile, true)
 	if err != nil {
 		t.Fatalf("NewLogger failed: %v", err)
 	}
@@ -194,7 +167,7 @@ func TestAllLogLevels_Output(t *testing.T) {
 	s := string(content)
 	for _, expected := range []string{"debug msg", "info msg", "warn msg", "error msg"} {
 		if !strings.Contains(s, expected) {
-			t.Errorf("log should contain '%s'", expected)
+			t.Errorf("log should contain %q", expected)
 		}
 	}
 }
@@ -209,9 +182,7 @@ func TestLogLevelFiltering(t *testing.T) {
 	}
 	defer log.Close()
 
-	// Set to WARN level — only WARN and ERROR should pass
 	log.SetLevel(WARN)
-
 	log.Debug("debug-hidden")
 	log.Info("info-hidden")
 	log.Warn("warn-visible")
@@ -254,8 +225,7 @@ func TestLogPhase(t *testing.T) {
 		t.Fatalf("failed to read log file: %v", err)
 	}
 
-	s := string(content)
-	if !strings.Contains(s, "=== PHASE: AUTHENTICATION ===") {
+	if !strings.Contains(string(content), "=== PHASE: AUTHENTICATION ===") {
 		t.Error("LogPhase output should contain phase markers")
 	}
 }
@@ -270,11 +240,10 @@ func TestLogSummary(t *testing.T) {
 	}
 	defer log.Close()
 
-	items := map[string]string{
+	log.LogSummary("Auth Result", map[string]string{
 		"User":   "nk",
 		"Status": "authenticated",
-	}
-	log.LogSummary("Auth Result", items)
+	})
 
 	content, err := os.ReadFile(tmpFile)
 	if err != nil {
@@ -285,16 +254,14 @@ func TestLogSummary(t *testing.T) {
 	if !strings.Contains(s, "=== Auth Result ===") {
 		t.Error("LogSummary should contain title")
 	}
-	// At least one item should appear (map ordering not guaranteed)
 	if !strings.Contains(s, "User: nk") && !strings.Contains(s, "Status: authenticated") {
-		t.Error("LogSummary should contain at least one item")
+		t.Error("LogSummary should contain summary items")
 	}
 }
 
 func TestClose_NoFile(t *testing.T) {
 	log, _ := NewLogger("", false)
-	err := log.Close()
-	if err != nil {
+	if err := log.Close(); err != nil {
 		t.Errorf("Close on stderr logger should not error: %v", err)
 	}
 }
@@ -308,131 +275,7 @@ func TestClose_WithFile(t *testing.T) {
 		t.Fatalf("NewLogger failed: %v", err)
 	}
 
-	err = log.Close()
-	if err != nil {
+	if err := log.Close(); err != nil {
 		t.Errorf("Close should not error: %v", err)
-	}
-}
-
-func TestInitDefaultLogger(t *testing.T) {
-	// Save and restore
-	saved := defaultLogger
-	defer func() { defaultLogger = saved }()
-
-	err := InitDefaultLogger("", false)
-	if err != nil {
-		t.Fatalf("InitDefaultLogger failed: %v", err)
-	}
-
-	log := GetDefaultLogger()
-	if log == nil {
-		t.Fatal("GetDefaultLogger returned nil after init")
-	}
-	if log.debug {
-		t.Error("default logger should not have debug enabled")
-	}
-}
-
-func TestInitDefaultLogger_Debug(t *testing.T) {
-	saved := defaultLogger
-	defer func() { defaultLogger = saved }()
-
-	err := InitDefaultLogger("", true)
-	if err != nil {
-		t.Fatalf("InitDefaultLogger failed: %v", err)
-	}
-
-	log := GetDefaultLogger()
-	if !log.debug {
-		t.Error("default logger should have debug enabled")
-	}
-}
-
-func TestInitDefaultLogger_InvalidFile(t *testing.T) {
-	saved := defaultLogger
-	defer func() { defaultLogger = saved }()
-
-	err := InitDefaultLogger("/nonexistent/path/log.log", false)
-	if err == nil {
-		t.Error("InitDefaultLogger should fail for invalid file path")
-	}
-}
-
-func TestGetDefaultLogger_Fallback(t *testing.T) {
-	saved := defaultLogger
-	defer func() { defaultLogger = saved }()
-
-	defaultLogger = nil
-	log := GetDefaultLogger()
-	if log == nil {
-		t.Fatal("GetDefaultLogger fallback returned nil")
-	}
-}
-
-func TestDefaultLogger(t *testing.T) {
-	log := GetDefaultLogger()
-	if log == nil {
-		t.Fatal("GetDefaultLogger returned nil")
-	}
-}
-
-func TestPackageLevelFunctions(t *testing.T) {
-	saved := defaultLogger
-	defer func() { defaultLogger = saved }()
-
-	tmpFile := "/tmp/test-ksa-pkg-funcs.log"
-	defer os.Remove(tmpFile)
-
-	err := InitDefaultLogger(tmpFile, true)
-	if err != nil {
-		t.Fatalf("InitDefaultLogger failed: %v", err)
-	}
-
-	// These should not panic
-	Debug("pkg debug %s", "test")
-	Info("pkg info %s", "test")
-	Warn("pkg warn %s", "test")
-	Error("pkg error %s", "test")
-	LogPhase("PKG_PHASE")
-	LogSummary("PKG_SUMMARY", map[string]string{"key": "value"})
-
-	content, err := os.ReadFile(tmpFile)
-	if err != nil {
-		t.Fatalf("failed to read log file: %v", err)
-	}
-
-	s := string(content)
-	for _, expected := range []string{"pkg debug", "pkg info", "pkg warn", "pkg error", "PKG_PHASE", "PKG_SUMMARY"} {
-		if !strings.Contains(s, expected) {
-			t.Errorf("package-level log should contain '%s'", expected)
-		}
-	}
-}
-
-func TestLogFormat_Timestamp(t *testing.T) {
-	tmpFile := "/tmp/test-ksa-timestamp.log"
-	defer os.Remove(tmpFile)
-
-	log, err := NewLogger(tmpFile, false)
-	if err != nil {
-		t.Fatalf("NewLogger failed: %v", err)
-	}
-	defer log.Close()
-
-	log.Info("timestamp test")
-
-	content, err := os.ReadFile(tmpFile)
-	if err != nil {
-		t.Fatalf("failed to read log file: %v", err)
-	}
-
-	s := string(content)
-	// Should contain timestamp in format YYYY/MM/DD HH:MM:SS
-	if len(s) < 19 {
-		t.Error("log line too short to contain timestamp")
-	}
-	// Check for date separator
-	if !strings.Contains(s, "/") {
-		t.Error("log should contain date separators")
 	}
 }

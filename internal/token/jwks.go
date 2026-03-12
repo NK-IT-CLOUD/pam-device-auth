@@ -1,6 +1,7 @@
 package token
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -31,9 +32,20 @@ type jwksResponse struct {
 
 // FetchJWKS fetches JWKS from the given URI and returns a map of kid -> public key.
 // No caching: the binary runs once per SSH login.
-func FetchJWKS(jwksURI string) (map[string]crypto.PublicKey, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(jwksURI)
+func FetchJWKS(ctx context.Context, client *http.Client, jwksURI string) (map[string]crypto.PublicKey, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURI, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build JWKS request: %w", err)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}

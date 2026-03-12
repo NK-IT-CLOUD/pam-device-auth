@@ -2,7 +2,7 @@
 set -e
 
 PKG="keycloak-ssh-auth"
-PKG_VERSION="0.5.0"
+PKG_VERSION="0.6.0"
 SHARE_DIR="/usr/share/${PKG}"
 CONFIG_DIR="/etc/${PKG}"
 CONFIG_FILE="${CONFIG_DIR}/keycloak-pam.json"
@@ -84,6 +84,7 @@ case "$1" in
             [ -f /etc/pam.d/sshd ] && cp /etc/pam.d/sshd /etc/pam.d/sshd.original
             cp "${SHARE_DIR}/config/pam-sshd-keycloak" /etc/pam.d/sshd
             log "Installed PAM config (original backed up)"
+            log "WARNING: Review /etc/pam.d/sshd if this host uses a custom PAM stack"
         fi
 
         if [ ! -f "${CONFIG_FILE}" ]; then

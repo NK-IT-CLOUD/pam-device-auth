@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -15,9 +16,12 @@ import (
 	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/user"
 )
 
-var VERSION = "0.5.0"
+var VERSION = "0.6.0"
 
-const logFile = "/var/log/keycloak-ssh-auth.log"
+const (
+	logFile     = "/var/log/keycloak-ssh-auth.log"
+	httpTimeout = 10 * time.Second
+)
 
 func main() {
 	debug := false
@@ -57,8 +61,12 @@ func main() {
 	}
 	log.Info("Authenticating user: %s", sshUser)
 
+	httpClient := &http.Client{Timeout: httpTimeout}
+
 	// OIDC Discovery (fail-fast if Keycloak unreachable)
-	endpoints, err := discovery.Fetch(cfg.KeycloakURL, cfg.Realm)
+	discoveryCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	endpoints, err := discovery.Fetch(discoveryCtx, httpClient, cfg.KeycloakURL, cfg.Realm)
+	cancel()
 	if err != nil {
 		log.Error("OIDC Discovery failed: %v", err)
 		os.Exit(1)
@@ -66,18 +74,18 @@ func main() {
 	log.Debug("Discovery OK: device=%s", endpoints.DeviceAuthorizationEndpoint)
 
 	// Try cached refresh token
-	if tryCachedRefresh(log, cfg, endpoints, sshUser) {
+	if tryCachedRefresh(log, cfg, httpClient, endpoints, sshUser) {
 		os.Exit(0)
 	}
 
 	// Full Device Auth flow
-	deviceAuthFlow(log, cfg, endpoints, sshUser)
+	deviceAuthFlow(log, cfg, httpClient, endpoints, sshUser)
 	os.Exit(0)
 }
 
 // tryCachedRefresh attempts to use a cached refresh token.
 // Returns true on success, false if Device Auth should run.
-func tryCachedRefresh(log *logger.Logger, cfg *config.Config, endpoints *discovery.Endpoints, sshUser string) bool {
+func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser string) bool {
 	session, err := cache.Load(sshUser)
 	if err != nil {
 		log.Debug("Cache load error: %v", err)
@@ -90,7 +98,9 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, endpoints *discove
 	log.Info("Cached session found for user: %s", sshUser)
 
 	// Refresh the token
-	tokenResp, err := device.RefreshToken(endpoints.TokenEndpoint, cfg.ClientID, session.RefreshToken)
+	refreshCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	tokenResp, err := device.RefreshToken(refreshCtx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, session.RefreshToken)
+	cancel()
 	if err != nil {
 		log.Info("Token refresh failed: %v", err)
 		cache.Delete(sshUser)
@@ -100,7 +110,9 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, endpoints *discove
 	log.Info("Token refresh successful")
 
 	// Validate the new access token
-	keys, err := token.FetchJWKS(endpoints.JwksURI)
+	jwksCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	keys, err := token.FetchJWKS(jwksCtx, httpClient, endpoints.JwksURI)
+	cancel()
 	if err != nil {
 		log.Info("JWKS fetch failed after refresh: %v", err)
 		cache.Delete(sshUser)
@@ -146,8 +158,10 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, endpoints *discove
 }
 
 // deviceAuthFlow runs the full Device Authorization Grant flow.
-func deviceAuthFlow(log *logger.Logger, cfg *config.Config, endpoints *discovery.Endpoints, sshUser string) {
-	dc, err := device.RequestCode(endpoints.DeviceAuthorizationEndpoint, cfg.ClientID)
+func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser string) {
+	requestCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	dc, err := device.RequestCode(requestCtx, httpClient, endpoints.DeviceAuthorizationEndpoint, cfg.ClientID)
+	cancel()
 	if err != nil {
 		log.Error("Device code request failed: %v", err)
 		os.Exit(1)
@@ -170,14 +184,16 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, endpoints *discovery
 	defer cancel()
 
 	log.Info("Waiting for authorization (timeout: %ds)", timeout)
-	tokenResp, err := device.PollToken(ctx, endpoints.TokenEndpoint, cfg.ClientID, dc.DeviceCode, dc.Interval)
+	tokenResp, err := device.PollToken(ctx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, dc.DeviceCode, dc.Interval)
 	if err != nil {
 		log.Error("Token polling failed: %v", err)
 		fmt.Println("Anmeldung fehlgeschlagen.")
 		os.Exit(1)
 	}
 
-	keys, err := token.FetchJWKS(endpoints.JwksURI)
+	jwksCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	keys, err := token.FetchJWKS(jwksCtx, httpClient, endpoints.JwksURI)
+	cancel()
 	if err != nil {
 		log.Error("JWKS fetch failed: %v", err)
 		os.Exit(1)

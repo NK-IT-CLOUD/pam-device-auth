@@ -6,32 +6,116 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
 )
 
-// Helper: create a signed JWT with RSA
-func createTestJWT(t *testing.T, privKey *rsa.PublicKey, signingKey *rsa.PrivateKey, kid string, claims map[string]interface{}) string {
+func createRSATestJWT(t *testing.T, signingKey *rsa.PrivateKey, kid string, claims map[string]interface{}) string {
 	t.Helper()
 
-	header := map[string]string{"alg": "RS256", "kid": kid, "typ": "JWT"}
-	headerJSON, _ := json.Marshal(header)
-	claimsJSON, _ := json.Marshal(claims)
+	return buildJWT(t, map[string]string{
+		"alg": "RS256",
+		"kid": kid,
+		"typ": "JWT",
+	}, claims, func(signedContent string) []byte {
+		hashed := hashSignedContent(t, "RS256", signedContent)
+		sig, err := rsa.SignPKCS1v15(rand.Reader, signingKey, crypto.SHA256, hashed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sig
+	})
+}
 
-	headerB64 := base64.RawURLEncoding.EncodeToString(headerJSON)
-	claimsB64 := base64.RawURLEncoding.EncodeToString(claimsJSON)
+func createECDSATestJWT(t *testing.T, signingKey *ecdsa.PrivateKey, alg, kid string, claims map[string]interface{}) string {
+	t.Helper()
 
-	signedContent := headerB64 + "." + claimsB64
-	h := sha256.Sum256([]byte(signedContent))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, signingKey, crypto.SHA256, h[:])
+	return buildJWT(t, map[string]string{
+		"alg": alg,
+		"kid": kid,
+		"typ": "JWT",
+	}, claims, func(signedContent string) []byte {
+		hashed := hashSignedContent(t, alg, signedContent)
+		partSize, err := ecdsaCoordinateSize(alg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r, s, err := ecdsa.Sign(rand.Reader, signingKey, hashed)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sig := make([]byte, partSize*2)
+		rBytes := r.Bytes()
+		sBytes := s.Bytes()
+		copy(sig[partSize-len(rBytes):partSize], rBytes)
+		copy(sig[len(sig)-len(sBytes):], sBytes)
+		return sig
+	})
+}
+
+func createECDSAASN1JWT(t *testing.T, signingKey *ecdsa.PrivateKey, alg, kid string, claims map[string]interface{}) string {
+	t.Helper()
+
+	return buildJWT(t, map[string]string{
+		"alg": alg,
+		"kid": kid,
+		"typ": "JWT",
+	}, claims, func(signedContent string) []byte {
+		hashed := hashSignedContent(t, alg, signedContent)
+		sig, err := ecdsa.SignASN1(rand.Reader, signingKey, hashed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sig
+	})
+}
+
+func buildJWT(t *testing.T, header map[string]string, claims map[string]interface{}, sign func(string) []byte) string {
+	t.Helper()
+
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimsJSON, err := json.Marshal(claims)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return signedContent + "." + base64.RawURLEncoding.EncodeToString(sig)
+	headerB64 := base64.RawURLEncoding.EncodeToString(headerJSON)
+	claimsB64 := base64.RawURLEncoding.EncodeToString(claimsJSON)
+	signedContent := headerB64 + "." + claimsB64
+
+	return signedContent + "." + base64.RawURLEncoding.EncodeToString(sign(signedContent))
+}
+
+func hashSignedContent(t *testing.T, alg, signedContent string) []byte {
+	t.Helper()
+
+	hashFunc, err := hashForAlgorithm(alg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := hashFunc.New()
+	if _, err := h.Write([]byte(signedContent)); err != nil {
+		t.Fatal(err)
+	}
+
+	return h.Sum(nil)
+}
+
+func validClaims() map[string]interface{} {
+	return map[string]interface{}{
+		"iss":                "https://sso.example.com/realms/test",
+		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
+		"azp":                "ssh-server",
+		"preferred_username": "testuser",
+	}
 }
 
 func TestValidate_Success(t *testing.T) {
@@ -42,20 +126,15 @@ func TestValidate_Success(t *testing.T) {
 		kid: &privKey.PublicKey,
 	}
 
-	claims := map[string]interface{}{
-		"iss":                "https://sso.example.com/realms/test",
-		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"nbf":                float64(time.Now().Add(-1 * time.Minute).Unix()),
-		"azp":                "ssh-server",
-		"preferred_username": "testuser",
-		"email":              "test@example.com",
-		"name":               "Test User",
-		"realm_access": map[string]interface{}{
-			"roles": []interface{}{"ssh-access"},
-		},
+	claims := validClaims()
+	claims["nbf"] = float64(time.Now().Add(-1 * time.Minute).Unix())
+	claims["email"] = "test@example.com"
+	claims["name"] = "Test User"
+	claims["realm_access"] = map[string]interface{}{
+		"roles": []interface{}{"ssh-access"},
 	}
 
-	jwt := createTestJWT(t, &privKey.PublicKey, privKey, kid, claims)
+	jwt := createRSATestJWT(t, privKey, kid, claims)
 
 	result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err != nil {
@@ -81,13 +160,10 @@ func TestValidate_ExpiredToken(t *testing.T) {
 	kid := "test-key-1"
 	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
 
-	claims := map[string]interface{}{
-		"iss":                "https://sso.example.com/realms/test",
-		"exp":                float64(time.Now().Add(-1 * time.Hour).Unix()),
-		"preferred_username": "testuser",
-	}
+	claims := validClaims()
+	claims["exp"] = float64(time.Now().Add(-1 * time.Hour).Unix())
 
-	jwt := createTestJWT(t, &privKey.PublicKey, privKey, kid, claims)
+	jwt := createRSATestJWT(t, privKey, kid, claims)
 	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err == nil {
 		t.Error("should fail for expired token")
@@ -99,13 +175,10 @@ func TestValidate_WrongIssuer(t *testing.T) {
 	kid := "test-key-1"
 	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
 
-	claims := map[string]interface{}{
-		"iss":                "https://wrong-issuer.com",
-		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"preferred_username": "testuser",
-	}
+	claims := validClaims()
+	claims["iss"] = "https://wrong-issuer.com"
 
-	jwt := createTestJWT(t, &privKey.PublicKey, privKey, kid, claims)
+	jwt := createRSATestJWT(t, privKey, kid, claims)
 	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err == nil {
 		t.Error("should fail for wrong issuer")
@@ -117,14 +190,10 @@ func TestValidate_NBFInFuture(t *testing.T) {
 	kid := "test-key-1"
 	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
 
-	claims := map[string]interface{}{
-		"iss":                "https://sso.example.com/realms/test",
-		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"nbf":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"preferred_username": "testuser",
-	}
+	claims := validClaims()
+	claims["nbf"] = float64(time.Now().Add(1 * time.Hour).Unix())
 
-	jwt := createTestJWT(t, &privKey.PublicKey, privKey, kid, claims)
+	jwt := createRSATestJWT(t, privKey, kid, claims)
 	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err == nil {
 		t.Error("should fail for nbf in future")
@@ -136,12 +205,10 @@ func TestValidate_MissingUsername(t *testing.T) {
 	kid := "test-key-1"
 	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
 
-	claims := map[string]interface{}{
-		"iss": "https://sso.example.com/realms/test",
-		"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
-	}
+	claims := validClaims()
+	delete(claims, "preferred_username")
 
-	jwt := createTestJWT(t, &privKey.PublicKey, privKey, kid, claims)
+	jwt := createRSATestJWT(t, privKey, kid, claims)
 	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err == nil {
 		t.Error("should fail for missing preferred_username")
@@ -154,13 +221,7 @@ func TestValidate_UnknownKid(t *testing.T) {
 		"other-key": &privKey.PublicKey,
 	}
 
-	claims := map[string]interface{}{
-		"iss":                "https://sso.example.com/realms/test",
-		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"preferred_username": "testuser",
-	}
-
-	jwt := createTestJWT(t, &privKey.PublicKey, privKey, "wrong-kid", claims)
+	jwt := createRSATestJWT(t, privKey, "wrong-kid", validClaims())
 	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err == nil {
 		t.Error("should fail for unknown kid")
@@ -173,14 +234,8 @@ func TestValidate_WrongSignature(t *testing.T) {
 	kid := "test-key-1"
 
 	keys := map[string]crypto.PublicKey{kid: &privKey1.PublicKey}
+	jwt := createRSATestJWT(t, privKey2, kid, validClaims())
 
-	claims := map[string]interface{}{
-		"iss":                "https://sso.example.com/realms/test",
-		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"preferred_username": "testuser",
-	}
-
-	jwt := createTestJWT(t, &privKey2.PublicKey, privKey2, kid, claims)
 	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
 	if err == nil {
 		t.Error("should fail for wrong signature")
@@ -201,37 +256,124 @@ func TestValidate_InvalidJWTFormat(t *testing.T) {
 	}
 }
 
-func TestValidate_ECDSA(t *testing.T) {
+func TestValidate_AudienceFallback_String(t *testing.T) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kid := "test-key-1"
+	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
+
+	claims := validClaims()
+	delete(claims, "azp")
+	claims["aud"] = "ssh-server"
+
+	jwt := createRSATestJWT(t, privKey, kid, claims)
+	if _, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server"); err != nil {
+		t.Fatalf("Validate() with string aud failed: %v", err)
+	}
+}
+
+func TestValidate_AudienceFallback_Array(t *testing.T) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kid := "test-key-1"
+	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
+
+	claims := validClaims()
+	delete(claims, "azp")
+	claims["aud"] = []interface{}{"account", "ssh-server"}
+
+	jwt := createRSATestJWT(t, privKey, kid, claims)
+	if _, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server"); err != nil {
+		t.Fatalf("Validate() with array aud failed: %v", err)
+	}
+}
+
+func TestValidate_WrongAuthorizedParty(t *testing.T) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kid := "test-key-1"
+	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
+
+	claims := validClaims()
+	claims["azp"] = "other-client"
+	claims["aud"] = []interface{}{"ssh-server"}
+
+	jwt := createRSATestJWT(t, privKey, kid, claims)
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	if err == nil {
+		t.Error("should fail for wrong azp even when aud contains client")
+	}
+}
+
+func TestValidate_WrongAudience(t *testing.T) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kid := "test-key-1"
+	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
+
+	claims := validClaims()
+	delete(claims, "azp")
+	claims["aud"] = []interface{}{"account", "other-client"}
+
+	jwt := createRSATestJWT(t, privKey, kid, claims)
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	if err == nil {
+		t.Error("should fail for wrong aud")
+	}
+}
+
+func TestValidate_MissingClientBinding(t *testing.T) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kid := "test-key-1"
+	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
+
+	claims := validClaims()
+	delete(claims, "azp")
+
+	jwt := createRSATestJWT(t, privKey, kid, claims)
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	if err == nil {
+		t.Error("should fail when azp and aud are missing")
+	}
+}
+
+func TestValidate_ECDSAJWS(t *testing.T) {
+	tests := []struct {
+		name  string
+		alg   string
+		curve elliptic.Curve
+	}{
+		{name: "ES256", alg: "ES256", curve: elliptic.P256()},
+		{name: "ES384", alg: "ES384", curve: elliptic.P384()},
+		{name: "ES512", alg: "ES512", curve: elliptic.P521()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			privKey, _ := ecdsa.GenerateKey(tt.curve, rand.Reader)
+			kid := "test-ec-key"
+			keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
+
+			claims := validClaims()
+			claims["realm_access"] = map[string]interface{}{"roles": []interface{}{"ssh-access"}}
+
+			jwt := createECDSATestJWT(t, privKey, tt.alg, kid, claims)
+
+			result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+			if err != nil {
+				t.Fatalf("Validate() error: %v", err)
+			}
+			if result.Username != "testuser" {
+				t.Errorf("Username = %q", result.Username)
+			}
+		})
+	}
+}
+
+func TestValidate_ECDSARejectsASN1JWTSignature(t *testing.T) {
 	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	kid := "test-ec-key"
 	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
 
-	claims := map[string]interface{}{
-		"iss":                "https://sso.example.com/realms/test",
-		"exp":                float64(time.Now().Add(1 * time.Hour).Unix()),
-		"preferred_username": "testuser",
-		"realm_access":       map[string]interface{}{"roles": []interface{}{"ssh-access"}},
-	}
-
-	header := map[string]string{"alg": "ES256", "kid": kid, "typ": "JWT"}
-	headerJSON, _ := json.Marshal(header)
-	claimsJSON, _ := json.Marshal(claims)
-	headerB64 := base64.RawURLEncoding.EncodeToString(headerJSON)
-	claimsB64 := base64.RawURLEncoding.EncodeToString(claimsJSON)
-
-	signedContent := headerB64 + "." + claimsB64
-	h := sha256.Sum256([]byte(signedContent))
-	sig, err := ecdsa.SignASN1(rand.Reader, privKey, h[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	jwt := signedContent + "." + base64.RawURLEncoding.EncodeToString(sig)
-
-	result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
-	if err != nil {
-		t.Fatalf("Validate() error: %v", err)
-	}
-	if result.Username != "testuser" {
-		t.Errorf("Username = %q", result.Username)
+	jwt := createECDSAASN1JWT(t, privKey, "ES256", kid, validClaims())
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	if err == nil {
+		t.Error("ASN.1 ECDSA signature should not be accepted as a JWS signature")
 	}
 }

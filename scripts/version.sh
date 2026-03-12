@@ -135,9 +135,8 @@ update_changelog() {
     local date=$(date +%Y-%m-%d)
     
     echo -e "${YELLOW}Updating CHANGELOG.md...${NC}"
-    
-    # Create backup
-    cp "$CHANGELOG" "$CHANGELOG.bak"
+
+    ensure_unreleased_section
     
     # Add new version entry
     sed -i "/^## \[Unreleased\]/a\\
@@ -155,6 +154,33 @@ update_changelog() {
     
     echo -e "${GREEN}✓ CHANGELOG.md updated${NC}"
     echo -e "${YELLOW}Please edit CHANGELOG.md to add specific changes${NC}"
+}
+
+ensure_unreleased_section() {
+    if grep -q '^## \[Unreleased\]' "$CHANGELOG"; then
+        return
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp)
+
+    awk '
+        BEGIN { inserted = 0 }
+        /^## \[/ && inserted == 0 {
+            print "## [Unreleased]"
+            print ""
+            inserted = 1
+        }
+        { print }
+        END {
+            if (inserted == 0) {
+                print ""
+                print "## [Unreleased]"
+            }
+        }
+    ' "$CHANGELOG" > "$tmp_file"
+
+    mv "$tmp_file" "$CHANGELOG"
 }
 
 create_release() {
@@ -186,7 +212,7 @@ create_release() {
     echo "1. Review the changes: git log --oneline -5"
     echo "2. Push changes: git push"
     echo "3. Push tag: git push origin v$new_version"
-    echo "4. Create GitHub release with build/releases/$new_version/ artifacts"
+    echo "4. Review release artifacts in build/releases/keycloak-ssh-auth-$new_version/ and build/packages/"
 }
 
 # Main script
