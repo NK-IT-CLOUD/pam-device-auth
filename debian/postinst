@@ -47,16 +47,20 @@ case "$1" in
         mkdir -p /etc/ssh/sshd_config.d
         mkdir -p "$CONFIG_DIR"
 
-        # Install SSH config
-        cp "${SHARE_DIR}/config/10-keycloak-auth.conf" /etc/ssh/sshd_config.d/
-
-        # Install PAM config (backup original first)
-        if [ -f /etc/pam.d/sshd ] && [ ! -f /etc/pam.d/sshd.original ]; then
-            cp /etc/pam.d/sshd /etc/pam.d/sshd.original
+        # Install SSH config (only on first install, preserve local changes on upgrade)
+        if [ ! -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf ]; then
+            cp "${SHARE_DIR}/config/10-keycloak-auth.conf" /etc/ssh/sshd_config.d/
         fi
-        cp "${SHARE_DIR}/config/pam-sshd-keycloak" /etc/pam.d/sshd
 
-        # Install config (preserve existing custom config)
+        # Install PAM config (only on first install, preserve local changes on upgrade)
+        if [ ! -f /etc/pam.d/sshd.original ]; then
+            if [ -f /etc/pam.d/sshd ]; then
+                cp /etc/pam.d/sshd /etc/pam.d/sshd.original
+            fi
+            cp "${SHARE_DIR}/config/pam-sshd-keycloak" /etc/pam.d/sshd
+        fi
+
+        # Install keycloak config (preserve existing custom config)
         if [ ! -f "$CONFIG_FILE" ]; then
             cp "${SHARE_DIR}/config/keycloak-pam.json" "$CONFIG_FILE"
         fi
