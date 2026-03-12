@@ -166,8 +166,8 @@ func TestDebugEnabled(t *testing.T) {
 	if !strings.Contains(s, "this debug message should appear") {
 		t.Error("debug message should appear when debug is enabled")
 	}
-	if !strings.Contains(s, "[DEBUG]") {
-		t.Error("debug messages should have [DEBUG] prefix")
+	if !strings.Contains(s, "DEBUG") {
+		t.Error("debug messages should have DEBUG level")
 	}
 }
 

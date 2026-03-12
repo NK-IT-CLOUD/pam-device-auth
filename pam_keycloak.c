@@ -17,29 +17,36 @@
 #define LOG_FILE "/var/log/keycloak-ssh-auth.log"
 #define PAM_LOG_PREFIX "[PAM] "
 
+// Map syslog priority to level string
+static const char* priority_to_level(int priority) {
+    switch (priority) {
+        case LOG_ERR:     return "ERROR";
+        case LOG_WARNING: return "WARN ";
+        case LOG_INFO:    return "INFO ";
+        case LOG_DEBUG:   return "DEBUG";
+        default:          return "INFO ";
+    }
+}
+
 // Helper function for logging
 void log_message(int priority, const char *format, ...) {
     va_list args;
     va_start(args, format);
 
-    // Prepare message
     char full_message[1024];
     vsnprintf(full_message, sizeof(full_message), format, args);
 
-    // Get current time
     time_t now;
     time(&now);
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), "%Y/%m/%d %H:%M:%S", localtime(&now));
 
-    // Write to file with consistent format
     FILE *f = fopen(LOG_FILE, "a");
     if (f != NULL) {
-        fprintf(f, "%s%s %s\n", PAM_LOG_PREFIX, timestamp, full_message);
+        fprintf(f, "%s [PAM]    %s %s\n", timestamp, priority_to_level(priority), full_message);
         fclose(f);
     }
 
-    // Also write to syslog for system logging
     syslog(priority, "%s", full_message);
 
     va_end(args);
