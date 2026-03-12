@@ -1,31 +1,18 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-SHARE_DIR="/usr/share/keycloak-ssh-auth"
-CONFIG_DIR="/etc/keycloak-ssh-auth"
+PKG="keycloak-ssh-auth"
+PKG_VERSION="0.5.0"
+SHARE_DIR="/usr/share/${PKG}"
+CONFIG_DIR="/etc/${PKG}"
 CONFIG_FILE="${CONFIG_DIR}/keycloak-pam.json"
-LOG_FILE="/var/log/keycloak-ssh-auth.log"
+LOG_FILE="/var/log/${PKG}.log"
+CACHE_DIR="/run/${PKG}"
 
-check_os_compatibility() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu)
-                if [ "${VERSION_ID%%.*}" -lt 24 ]; then
-                    echo "WARNING: Ubuntu 24.04+ recommended (found $VERSION_ID)"
-                fi
-                ;;
-            debian)
-                if [ "${VERSION_ID%%.*}" -lt 12 ]; then
-                    echo "WARNING: Debian 12+ recommended (found $VERSION_ID)"
-                fi
-                ;;
-        esac
-    fi
-}
+log() { echo "[${PKG}] $*"; }
 
 setup_logrotate() {
-    cat > /etc/logrotate.d/keycloak-ssh-auth << 'LOGROTATE'
+    cat > /etc/logrotate.d/${PKG} << 'EOF'
 /var/log/keycloak-ssh-auth.log {
     weekly
     rotate 4
@@ -35,51 +22,84 @@ setup_logrotate() {
     notifempty
     create 0644 root root
 }
-LOGROTATE
+EOF
+}
+
+setup_tmpfiles() {
+    cat > /etc/tmpfiles.d/${PKG}.conf << EOF
+d ${CACHE_DIR} 0700 root root -
+EOF
+    mkdir -p "${CACHE_DIR}"
+    chmod 700 "${CACHE_DIR}"
+}
+
+check_os() {
+    if [ -f /etc/os-release ]; then
+        # Subshell: os-release exports VERSION, ID, etc. — don't pollute our namespace
+        _os_warn=$(
+            . /etc/os-release
+            case "$ID" in
+                ubuntu)
+                    if [ "${VERSION_ID%%.*}" -lt 24 ] 2>/dev/null; then
+                        echo "WARNING: Ubuntu 24.04+ recommended (found ${VERSION_ID})"
+                    fi
+                    ;;
+                debian)
+                    if [ "${VERSION_ID%%.*}" -lt 12 ] 2>/dev/null; then
+                        echo "WARNING: Debian 12+ recommended (found ${VERSION_ID})"
+                    fi
+                    ;;
+            esac
+        )
+        [ -n "$_os_warn" ] && log "$_os_warn"
+    fi
+    return 0
+}
+
+restart_ssh() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart ssh.service 2>/dev/null || \
+        systemctl restart sshd.service 2>/dev/null || \
+        log "WARNING: Could not restart SSH (manual restart may be needed)"
+    fi
 }
 
 case "$1" in
     configure)
-        check_os_compatibility
+        check_os
         setup_logrotate
+        setup_tmpfiles
 
-        # Create directories
         mkdir -p /etc/ssh/sshd_config.d
-        mkdir -p "$CONFIG_DIR"
+        mkdir -p "${CONFIG_DIR}"
 
-        # Install SSH config (only on first install, preserve local changes on upgrade)
+        # --- Configs: install on first setup, preserve on upgrade ---
+
         if [ ! -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf ]; then
             cp "${SHARE_DIR}/config/10-keycloak-auth.conf" /etc/ssh/sshd_config.d/
+            log "Installed SSH config"
         fi
 
-        # Install PAM config (only on first install, preserve local changes on upgrade)
         if [ ! -f /etc/pam.d/sshd.original ]; then
-            if [ -f /etc/pam.d/sshd ]; then
-                cp /etc/pam.d/sshd /etc/pam.d/sshd.original
-            fi
+            [ -f /etc/pam.d/sshd ] && cp /etc/pam.d/sshd /etc/pam.d/sshd.original
             cp "${SHARE_DIR}/config/pam-sshd-keycloak" /etc/pam.d/sshd
+            log "Installed PAM config (original backed up)"
         fi
 
-        # Install keycloak config (preserve existing custom config)
-        if [ ! -f "$CONFIG_FILE" ]; then
-            cp "${SHARE_DIR}/config/keycloak-pam.json" "$CONFIG_FILE"
+        if [ ! -f "${CONFIG_FILE}" ]; then
+            cp "${SHARE_DIR}/config/keycloak-pam.json" "${CONFIG_FILE}"
+            log "Installed default keycloak config"
         fi
 
-        # Set permissions
+        # --- Permissions ---
         chmod 755 /usr/local/bin/keycloak-auth
         chmod 755 /usr/lib/security/pam_keycloak.so
-        chmod 600 "$CONFIG_FILE"
+        chmod 600 "${CONFIG_FILE}"
+        touch "${LOG_FILE}"
+        chmod 644 "${LOG_FILE}"
 
-        # Create log file
-        touch "$LOG_FILE"
-        chmod 644 "$LOG_FILE"
-
-        # Restart SSH
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service 2>/dev/null || true
-        fi
-
-        echo "keycloak-ssh-auth 0.5.0 installed successfully."
+        restart_ssh
+        log "${PKG} ${PKG_VERSION} configured successfully."
         ;;
 esac
 
