@@ -1,8 +1,7 @@
 Package: keycloak-ssh-auth
 Version: 0.5.0
 Architecture: amd64
-Depends: libc6, libpam0g (>= 1.5.3), openssh-server
-Pre-Depends: dpkg (>= 1.22)
+Depends: libc6, openssh-server (>= 1:9.6p1)
 Maintainer: Norbert Krucky <norbert.krucky@pm.me>
 Section: admin
 Priority: optional
