@@ -75,7 +75,7 @@ case "$1" in
             systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service 2>/dev/null || true
         fi
 
-        echo "keycloak-ssh-auth 0.4.0 installed successfully."
+        echo "keycloak-ssh-auth 0.5.0 installed successfully."
         ;;
 esac
 

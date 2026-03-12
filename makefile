@@ -1,5 +1,5 @@
-# keycloak-ssh-auth v0.4.0 Build System
-VERSION=0.4.0
+# keycloak-ssh-auth v0.5.0 Build System
+VERSION=0.5.0
 MODULE=git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
 
 # Directories
