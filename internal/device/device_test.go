@@ -121,9 +121,10 @@ func TestRequestCode_MissingFields(t *testing.T) {
 func TestPollToken_ImmediateSuccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"access_token": "test-token-xyz",
-			"token_type":   "Bearer",
-			"expires_in":   300,
+			"access_token":  "test-token-xyz",
+			"refresh_token": "test-rt-xyz",
+			"token_type":    "Bearer",
+			"expires_in":    300,
 		})
 	}))
 	defer srv.Close()
@@ -137,6 +138,9 @@ func TestPollToken_ImmediateSuccess(t *testing.T) {
 	}
 	if token.AccessToken != "test-token-xyz" {
 		t.Errorf("AccessToken = %q", token.AccessToken)
+	}
+	if token.RefreshToken != "test-rt-xyz" {
+		t.Errorf("RefreshToken = %q, want %q", token.RefreshToken, "test-rt-xyz")
 	}
 }
 
@@ -153,8 +157,9 @@ func TestPollToken_PendingThenSuccess(t *testing.T) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"access_token": "success-token",
-			"token_type":   "Bearer",
+			"access_token":  "success-token",
+			"refresh_token": "rt-success",
+			"token_type":    "Bearer",
 		})
 	}))
 	defer srv.Close()
@@ -238,8 +243,9 @@ func TestPollToken_SlowDown(t *testing.T) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"access_token": "token",
-			"token_type":   "Bearer",
+			"access_token":  "token",
+			"refresh_token": "rt-slow",
+			"token_type":    "Bearer",
 		})
 	}))
 	defer srv.Close()
@@ -256,5 +262,65 @@ func TestPollToken_SlowDown(t *testing.T) {
 	// After slow_down, interval should increase by 5s (MinPollInterval=1 in tests, so 1+5=6s).
 	if elapsed < 5*time.Second {
 		t.Errorf("slow_down should have increased interval, but elapsed = %v", elapsed)
+	}
+}
+
+func TestRefreshToken_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		r.ParseForm()
+		if r.Form.Get("grant_type") != "refresh_token" {
+			t.Errorf("grant_type = %s", r.Form.Get("grant_type"))
+		}
+		if r.Form.Get("refresh_token") != "old-rt" {
+			t.Errorf("refresh_token = %s", r.Form.Get("refresh_token"))
+		}
+		if r.Form.Get("client_id") != "ssh-server" {
+			t.Errorf("client_id = %s", r.Form.Get("client_id"))
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token":  "new-at",
+			"refresh_token": "new-rt",
+			"token_type":    "Bearer",
+			"expires_in":    300,
+		})
+	}))
+	defer srv.Close()
+
+	token, err := RefreshToken(srv.URL, "ssh-server", "old-rt")
+	if err != nil {
+		t.Fatalf("RefreshToken() error: %v", err)
+	}
+	if token.AccessToken != "new-at" {
+		t.Errorf("AccessToken = %q", token.AccessToken)
+	}
+	if token.RefreshToken != "new-rt" {
+		t.Errorf("RefreshToken = %q", token.RefreshToken)
+	}
+}
+
+func TestRefreshToken_Rejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":             "invalid_grant",
+			"error_description": "Token is not active",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := RefreshToken(srv.URL, "ssh-server", "expired-rt")
+	if err == nil {
+		t.Error("should fail on rejected refresh")
+	}
+}
+
+func TestRefreshToken_ServerDown(t *testing.T) {
+	_, err := RefreshToken("http://127.0.0.1:1", "ssh-server", "rt")
+	if err == nil {
+		t.Error("should fail on unreachable server")
 	}
 }

@@ -23,9 +23,10 @@ type DeviceCode struct {
 
 // TokenResponse holds a successful token response.
 type TokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
 }
 
 type errorResponse struct {
@@ -132,4 +133,40 @@ func PollToken(ctx context.Context, endpoint, clientID, deviceCode string, inter
 			return nil, fmt.Errorf("token error: %s (%s)", errResp.Error, errResp.ErrorDescription)
 		}
 	}
+}
+
+// RefreshToken exchanges a refresh token for a new access token.
+func RefreshToken(tokenEndpoint, clientID, refreshToken string) (*TokenResponse, error) {
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {clientID},
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(tokenEndpoint, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("refresh token request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read refresh response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp errorResponse
+		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("refresh failed: %s (%s)", errResp.Error, errResp.ErrorDescription)
+		}
+		return nil, fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var token TokenResponse
+	if err := json.Unmarshal(body, &token); err != nil {
+		return nil, fmt.Errorf("parse refresh response: %w", err)
+	}
+
+	return &token, nil
 }
