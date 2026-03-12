@@ -2,17 +2,22 @@
 
 SSH-Login via Keycloak SSO — PAM-Modul + Go-Binary mit Device Authorization Grant (RFC 8628).
 
+**Version:** 0.5.0 | **Voraussetzung:** Ubuntu 24.04+ (OpenSSH >= 9.6)
+
 ## Architektur
 
 ```
 SSH Client → PAM Module (C) → keycloak-auth (Go) → Keycloak OIDC
                                     ↓
-                              Device Auth Grant (RFC 8628)
-                              User öffnet URL + Code im Browser
+                          1. Cache-Prüfung (Refresh Token)
+                             → Treffer: Token Refresh → "SSO-Session aktiv."
+                             → Kein Treffer: weiter zu 2.
+                          2. Device Auth Grant (RFC 8628)
+                             → User öffnet URL + Code im Browser
                                     ↓
-                              JWT Verification (JWKS)
+                          3. JWT Verification (JWKS)
                                     ↓
-                              User Setup (create + sudo)
+                          4. User Setup (create + sudo)
 ```
 
 ### Komponenten
@@ -20,27 +25,42 @@ SSH Client → PAM Module (C) → keycloak-auth (Go) → Keycloak OIDC
 | Komponente | Sprache | Beschreibung |
 |---|---|---|
 | `pam_keycloak.so` | C | PAM-Modul, ruft Go-Binary auf |
-| `keycloak-auth` | Go | Device Auth Grant, JWT-Verifizierung, User-Setup |
+| `keycloak-auth` | Go | Device Auth Grant, Token Caching, JWT-Verifizierung, User-Setup |
 | Config | JSON | `/etc/keycloak-ssh-auth/keycloak-pam.json` |
 
-### Auth-Flow (Device Authorization Grant)
+### Auth-Flow
 
 1. User verbindet per SSH → PAM ruft `keycloak-auth` auf
-2. Binary holt Device Code von Keycloak
-3. Terminal zeigt Verification-URL + User-Code an:
+2. **Cache-Check**: Existiert ein Refresh Token für den User?
+   - **Ja**: Token Refresh via Keycloak → JWT-Validierung → Rolle prüfen → `SSO-Session aktiv.`
+   - **Nein** (oder Refresh fehlgeschlagen): weiter mit Device Auth
+3. Binary holt Device Code von Keycloak
+4. Terminal zeigt Verification-URL + User-Code an:
    ```
    ────────────────────────────────────
-   Login: https://sso.nk-it.cloud/realms/nk-it.cloud/protocol/openid-connect/auth/device
+   Login: https://sso.nk-it.cloud/realms/nk-it.cloud/device
    Code:  ABCD-EFGH
    ────────────────────────────────────
    ```
-4. User öffnet URL in beliebigem Browser (lokal, Handy, anderes Gerät) und gibt Code ein
-5. Binary pollt Token-Endpoint bis Autorisierung erfolgt (RFC 8628)
-6. **JWT-Signatur wird via JWKS-Endpoint verifiziert** (RSA/ECDSA)
-7. Claims werden geprüft: Issuer, Expiry, Username-Match, Required Role
-8. System-User wird erstellt + sudo konfiguriert
+5. User öffnet URL in beliebigem Browser (lokal, Handy, anderes Gerät) und gibt Code ein
+6. Binary pollt Token-Endpoint bis Autorisierung erfolgt (RFC 8628)
+7. **JWT-Signatur wird via JWKS-Endpoint verifiziert** (RSA/ECDSA)
+8. Claims werden geprüft: Issuer, Expiry, Username-Match, Required Role
+9. Refresh Token wird gecacht für nächsten Login
+10. System-User wird erstellt + sudo konfiguriert
 
 Kein lokaler HTTP-Server, kein Browser-Redirect, kein Callback — funktioniert identisch auf headless Servern und Desktop-Terminals.
+
+### Token Caching (v0.5.0)
+
+Refresh Tokens werden in `/run/keycloak-ssh-auth/<user>.json` gecacht (tmpfs — verschwindet bei Reboot). Bei jedem Cache-Hit wird der Token bei Keycloak refreshed — User-Deaktivierung oder Rollen-Entzug wirken sofort.
+
+| Szenario | Verhalten |
+|----------|-----------|
+| Erster Login | Device Auth (URL + Code) → `Login erfolgreich!` |
+| Repeat Login (Cache) | Sofort → `SSO-Session aktiv.` |
+| Refresh fehlgeschlagen | Cache gelöscht → Device Auth |
+| Reboot | Alle Sessions gelöscht → Device Auth |
 
 ## Build
 
@@ -52,13 +72,13 @@ make build-all
 make build
 
 # Tests
-make test-unit
+make test
 
 # Debian-Paket
 make deb
 ```
 
-**Voraussetzungen:** Go 1.22+, GCC, libpam0g-dev
+**Build-Voraussetzungen:** Go 1.22+, GCC, libpam0g-dev
 
 ## Konfiguration
 
@@ -90,6 +110,8 @@ Die Shipped Config funktioniert out-of-the-box auf NKIT-Hosts — kein Editieren
 
 ## Installation
 
+**Systemanforderung:** Ubuntu 24.04 LTS (OpenSSH >= 9.6, libpam 1.5+)
+
 ```bash
 # Via .deb Paket (empfohlen)
 make install
@@ -100,7 +122,7 @@ sudo cp pam_keycloak.so /usr/lib/security/
 sudo cp configs/keycloak-pam.json /etc/keycloak-ssh-auth/
 ```
 
-PAM-Konfiguration in `/etc/pam.d/sshd` und SSHD-Config in `/etc/ssh/sshd_config.d/`.
+Das .deb-Paket installiert PAM- und SSH-Configs nur bei Erstinstallation. Lokale Anpassungen bleiben bei Upgrades erhalten.
 
 ### SSH-Konfiguration
 
@@ -108,6 +130,7 @@ Die SSHD-Config (`10-keycloak-auth.conf`) erlaubt SSH-Key-Fallback:
 
 ```
 AuthenticationMethods publickey keyboard-interactive
+PermitRootLogin prohibit-password
 ```
 
 SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn kein Key vorhanden.
@@ -124,7 +147,7 @@ SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn kein 
 | Device Authorization Grant | **Enabled** |
 | Scopes | `openid profile email` |
 
-**Rolle `ssh-access`**: Als Client-Rolle auf `ssh-server` anlegen, an Admin-User zuweisen.
+**Rolle `ssh-access`**: Als Client-Rolle auf `ssh-server` anlegen, an User zuweisen.
 
 ## Sicherheit
 
@@ -133,28 +156,48 @@ SSH-Key-Login funktioniert weiterhin — Device Auth wird nur genutzt wenn kein 
 - **Issuer/Expiry/Not-Before** Validation
 - **Username-Matching**: SSO-Username muss SSH-Username entsprechen
 - **Role-Based Access**: Nur User mit konfigurierter Rolle dürfen sich einloggen
+- **Token Refresh validiert bei Keycloak**: Kein staler Cache — User-Deaktivierung wirkt sofort
+- **Cache in tmpfs**: Tokens in `/run/` — verschwindet bei Reboot, nicht auf Disk
+- **Cache-Isolation**: Dir `0700 root:root`, Files `0600 root:root`
+- **Atomic Writes**: temp + rename verhindert teilweise Reads
+- **Path-Traversal-Schutz**: Username-Validierung vor Dateipfad-Konstruktion
 - **Public Client** — kein Secret zu verwalten/rotieren
 - **Sudoers Drop-in**: `/etc/sudoers.d/keycloak-ssh-auth` (validiert mit `visudo -cf`)
 
 ## Projektstruktur
 
 ```
-cmd/keycloak-auth/     → Main Binary (Config → Discovery → Device Auth → User Setup)
+cmd/keycloak-auth/     → Main Binary (Config → Discovery → Cache → Device Auth → User Setup)
 internal/
-  config/              → Config Loading + Validation (5 Felder)
+  cache/               → Refresh Token Cache (Load/Save/Delete in /run/)
+  config/              → Config Loading + Validation
   discovery/           → OIDC Discovery (Endpoints laden)
-  device/              → Device Authorization Grant (RFC 8628)
+  device/              → Device Authorization Grant + Token Refresh (RFC 8628)
   token/               → JWKS Fetch, JWT Verify, Role Extraction
   user/                → System User Management (create + sudo)
-  logger/              → Structured Logging
+  logger/              → Structured Logging (unified format)
 pam_keycloak.c         → PAM Module (C)
 configs/               → Default Configs (Zero-Config für NKIT)
-debian/                → Debian Package Files
+debian/                → Debian Package Files (postinst/postrm)
 ```
+
+## Logging
+
+Einheitliches Format für PAM-Modul und Go-Binary:
+
+```
+2026/03/12 02:13:11 [PAM]    INFO  Authentication attempt for user nk from IP 10.0.88.70
+2026/03/12 02:13:11 [SSO-GO] INFO  keycloak-auth 0.5.0 starting
+2026/03/12 02:13:24 [SSO-GO] INFO  Cached session found for user: nk
+2026/03/12 02:13:24 [SSO-GO] INFO  Token refresh successful
+2026/03/12 02:13:24 [SSO-GO] INFO  Auth OK: user=nk email=nk@nk-it.cloud roles=[...]
+2026/03/12 02:13:24 [PAM]    INFO  Authentication successful for user nk from IP 10.0.88.70
+```
+
+Log-Datei: `/var/log/keycloak-ssh-auth.log` (logrotate konfiguriert)
 
 ## Repository
 
 - **Repo**: https://git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
-- **CI**: Gitea Actions (`.gitea/workflows/ci.yaml`)
-- **Build Host**: CT 104 (ssh-keycloak-build) auf proxmox-ai
+- **Build Host**: CT 3005 (security-api) auf proxmox-ai
 - **Test Host**: CT 110 (kc-ssh-test) auf proxmox-ai

@@ -1,19 +1,21 @@
 # CLAUDE.md — Keycloak SSH Auth
 
 ## Überblick
-Go-Binary + PAM-Modul für SSH-Login via Keycloak SSO.
-User → SSH → PAM → Go Binary → Keycloak OAuth2 → Browser Auth → SSH Access.
+Go-Binary + PAM-Modul für SSH-Login via Keycloak SSO (v0.5.0).
+User → SSH → PAM → Go Binary → Cache/Refresh oder Device Auth → JWT Verify → SSH Access.
 
 ## Struktur
-- `cmd/keycloak-auth/main.go` — Entry point, CLI flags
-- `internal/auth/keycloak.go` — OAuth2/OIDC Flow, Token handling
-- `internal/config/config.go` — JSON config + env var override
+- `cmd/keycloak-auth/main.go` — Entry point, cache-first flow
+- `internal/cache/` — Refresh Token cache (Load/Save/Delete in /run/)
+- `internal/config/` — JSON config + env var override
+- `internal/discovery/` — OIDC Discovery (endpoints)
+- `internal/device/` — Device Auth Grant + RefreshToken (RFC 8628)
+- `internal/token/` — JWKS fetch, JWT verify, role extraction
 - `internal/user/manager.go` — Linux user creation + sudo
-- `internal/logger/logger.go` — Structured logging
-- `internal/html/` — Browser response templates
+- `internal/logger/` — Structured logging (unified format)
 - `pam_keycloak.c` — PAM module (C)
 - `configs/` — Default config files for .deb
-- `debian/` — Debian packaging
+- `debian/` — Debian packaging (postinst/postrm)
 
 ## Build
 ```bash
@@ -24,21 +26,24 @@ make test           # Run tests
 ```
 
 ## Config
-`/etc/keycloak-ssh-auth/keycloak-pam.json` — Keycloak URL, realm, client, required role, callback IP/port.
+`/etc/keycloak-ssh-auth/keycloak-pam.json` — Keycloak URL, realm, client, required role.
 All values overridable via environment variables.
 
-## Auth Modes
-- `--mode browser` (default): User gets URL, opens in browser, callback completes auth
-- `--mode code`: Same flow but with verification code display
+## Auth Flow
+1. Cache check: try refresh token from `/run/keycloak-ssh-auth/<user>.json`
+2. On hit: refresh at Keycloak → validate JWT → "SSO-Session aktiv."
+3. On miss/fail: Device Authorization Grant (URL + code in terminal)
+4. JWT issuer + expiry + username + role verification
+5. User setup (create + sudo)
 
 ## Security
-- PKCE (S256) for auth code exchange
-- crypto/rand for all random strings (state, code_verifier)
-- JWT issuer + expiry verification
-- Role-based access control
-- Username must match between SSH and Keycloak
+- JWT signature verification via JWKS (RSA + ECDSA)
+- Refresh Token in tmpfs (gone on reboot)
+- Keycloak validates user/roles on every refresh
+- Username validation prevents path traversal in cache
+- Atomic file writes (temp + rename)
 
-## Keycloak Requirements
-- OIDC client with Authorization Code Flow + PKCE
+## Requirements
+- Ubuntu 24.04+ (OpenSSH >= 9.6)
+- Keycloak OIDC client with Device Authorization Grant enabled
 - Required role (e.g. `ssh-access`) assigned to users
-- Redirect URI: `http://SERVER_IP:33499/callback`
