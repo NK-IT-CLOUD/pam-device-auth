@@ -1,0 +1,41 @@
+# Binaries
+pam-device-auth
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.test
+
+# Build artifacts
+build/
+debian_build/
+*.deb
+*.tar.gz
+*.zip
+
+# Coverage & logs
+*.out
+*.log
+
+# Temp
+*.tmp
+*.temp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+test_results/
+
+# Config with secrets (keep examples in configs/)
+/config.json
+!/configs/config.json

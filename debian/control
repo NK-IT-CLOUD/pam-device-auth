@@ -1,0 +1,14 @@
+Package: pam-device-auth
+Version: 0.1.1
+Architecture: amd64
+Depends: libc6, openssh-server (>= 1:9.6p1)
+Conflicts: keycloak-ssh-auth
+Replaces: keycloak-ssh-auth
+Maintainer: Norbert Krucky <norbert.krucky@pm.me>
+Section: admin
+Priority: optional
+Homepage: https://github.com/nk-dev/pam-device-auth
+Description: SSH authentication via OIDC Device Authorization Grant (RFC 8628)
+ PAM module for SSH login using any OIDC provider's Device Authorization
+ Grant flow. Works headless. Supports Keycloak, Auth0, Okta, Authentik.
+ Zero external Go dependencies.
