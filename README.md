@@ -41,8 +41,10 @@ On first login, new users are automatically prompted to set a local password (us
 ### 1. Install
 
 ```bash
-sudo dpkg -i pam-device-auth_0.1.0_amd64.deb
+sudo dpkg -i pam-device-auth_0.2.0_amd64.deb
 ```
+
+> PAM is **not activated** on install. Root SSH key access continues to work.
 
 ### 2. Configure
 
@@ -56,14 +58,36 @@ Edit `/etc/pam-device-auth/config.json`:
 }
 ```
 
-### 3. Test
+### 3. Check
+
+Validate your config and test OIDC connectivity:
+
+```bash
+sudo pam-device-auth --check
+# Config OK: issuer=https://sso.example.com/realms/myrealm client=ssh-server role=ssh-access
+# OIDC OK: issuer=https://sso.example.com/realms/myrealm
+# All checks passed. Run 'pam-device-auth --enable' to activate.
+```
+
+### 4. Enable
+
+Activate PAM authentication (restarts SSH automatically):
+
+```bash
+sudo pam-device-auth --enable
+# PAM config activated
+# SSH service restarted
+# pam-device-auth is now active.
+```
+
+### 5. Test
 
 ```bash
 ssh youruser@hostname
-# You'll see:
 # ────────────────────────────────────
-# Login: https://sso.example.com/realms/myrealm/protocol/openid-connect/auth/device
+# Link:  https://sso.example.com/.../device?user_code=ABCD-EFGH
 # Code:  ABCD-EFGH
+# [QR code]
 # ────────────────────────────────────
 ```
 
