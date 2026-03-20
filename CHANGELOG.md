@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-03-20
+
+### Added
+- `--check` command: validates config and tests OIDC provider connectivity before activation
+- `--enable` command: activates PAM authentication after successful config check, restarts SSH
+- Safe installation: fresh installs no longer auto-activate PAM — prevents lockout with default config
+
+### Changed
+- Upgrade installs preserve existing PAM activation and restart SSH automatically
+
 ## [0.1.1] - 2026-03-20
 
 ### Changed
