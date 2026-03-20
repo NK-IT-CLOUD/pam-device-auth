@@ -6,21 +6,30 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
-const DefaultConfigPath = "/etc/keycloak-ssh-auth/keycloak-pam.json"
+const DefaultConfigPath = "/etc/pam-device-auth/config.json"
 
 type Config struct {
-	KeycloakURL  string `json:"keycloak_url"`
-	Realm        string `json:"realm"`
-	ClientID     string `json:"client_id"`
-	RequiredRole string `json:"required_role"`
-	AuthTimeout  int    `json:"auth_timeout"`
+	IssuerURL           string   `json:"issuer_url"`
+	ClientID            string   `json:"client_id"`
+	RequiredRole        string   `json:"required_role"`
+	SudoRole            string   `json:"sudo_role"`
+	RoleClaim           string   `json:"role_claim"`
+	AuthTimeout         int      `json:"auth_timeout"`
+	CreateUser          bool     `json:"create_user"`
+	UserGroups          []string `json:"user_groups"`
+	AdminGroups         []string `json:"admin_groups"`
+	ForcePasswordChange bool     `json:"force_password_change"`
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		AuthTimeout: 180,
+		AuthTimeout:         180,
+		CreateUser:          true,
+		UserGroups:          []string{"sudo"},
+		ForcePasswordChange: true,
 	}
 }
 
@@ -40,6 +49,7 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	cfg.loadFromEnvironment()
+	cfg.IssuerURL = strings.TrimRight(cfg.IssuerURL, "/")
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -49,19 +59,22 @@ func Load(configPath string) (*Config, error) {
 }
 
 func (c *Config) loadFromEnvironment() {
-	if v := os.Getenv("KEYCLOAK_URL"); v != "" {
-		c.KeycloakURL = v
+	if v := os.Getenv("PAM_DEVICE_AUTH_ISSUER"); v != "" {
+		c.IssuerURL = v
 	}
-	if v := os.Getenv("KEYCLOAK_REALM"); v != "" {
-		c.Realm = v
-	}
-	if v := os.Getenv("KEYCLOAK_CLIENT_ID"); v != "" {
+	if v := os.Getenv("PAM_DEVICE_AUTH_CLIENT_ID"); v != "" {
 		c.ClientID = v
 	}
-	if v := os.Getenv("KEYCLOAK_REQUIRED_ROLE"); v != "" {
+	if v := os.Getenv("PAM_DEVICE_AUTH_REQUIRED_ROLE"); v != "" {
 		c.RequiredRole = v
 	}
-	if v := os.Getenv("KEYCLOAK_AUTH_TIMEOUT"); v != "" {
+	if v := os.Getenv("PAM_DEVICE_AUTH_SUDO_ROLE"); v != "" {
+		c.SudoRole = v
+	}
+	if v := os.Getenv("PAM_DEVICE_AUTH_ROLE_CLAIM"); v != "" {
+		c.RoleClaim = v
+	}
+	if v := os.Getenv("PAM_DEVICE_AUTH_TIMEOUT"); v != "" {
 		if timeout, err := strconv.Atoi(v); err == nil {
 			c.AuthTimeout = timeout
 		}
@@ -69,14 +82,11 @@ func (c *Config) loadFromEnvironment() {
 }
 
 func (c *Config) Validate() error {
-	if c.KeycloakURL == "" {
-		return fmt.Errorf("keycloak_url is required")
+	if c.IssuerURL == "" {
+		return fmt.Errorf("issuer_url is required")
 	}
-	if _, err := url.Parse(c.KeycloakURL); err != nil {
-		return fmt.Errorf("invalid keycloak_url: %w", err)
-	}
-	if c.Realm == "" {
-		return fmt.Errorf("realm is required")
+	if _, err := url.Parse(c.IssuerURL); err != nil {
+		return fmt.Errorf("invalid issuer_url: %w", err)
 	}
 	if c.ClientID == "" {
 		return fmt.Errorf("client_id is required")

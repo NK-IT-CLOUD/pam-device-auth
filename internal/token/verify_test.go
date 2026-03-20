@@ -136,7 +136,7 @@ func TestValidate_Success(t *testing.T) {
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
 
-	result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err != nil {
 		t.Fatalf("Validate() error: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestValidate_ExpiredToken(t *testing.T) {
 	claims["exp"] = float64(time.Now().Add(-1 * time.Hour).Unix())
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for expired token")
 	}
@@ -179,7 +179,7 @@ func TestValidate_WrongIssuer(t *testing.T) {
 	claims["iss"] = "https://wrong-issuer.com"
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for wrong issuer")
 	}
@@ -194,7 +194,7 @@ func TestValidate_NBFInFuture(t *testing.T) {
 	claims["nbf"] = float64(time.Now().Add(1 * time.Hour).Unix())
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for nbf in future")
 	}
@@ -209,7 +209,7 @@ func TestValidate_MissingUsername(t *testing.T) {
 	delete(claims, "preferred_username")
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for missing preferred_username")
 	}
@@ -222,7 +222,7 @@ func TestValidate_UnknownKid(t *testing.T) {
 	}
 
 	jwt := createRSATestJWT(t, privKey, "wrong-kid", validClaims())
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for unknown kid")
 	}
@@ -236,7 +236,7 @@ func TestValidate_WrongSignature(t *testing.T) {
 	keys := map[string]crypto.PublicKey{kid: &privKey1.PublicKey}
 	jwt := createRSATestJWT(t, privKey2, kid, validClaims())
 
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for wrong signature")
 	}
@@ -245,12 +245,12 @@ func TestValidate_WrongSignature(t *testing.T) {
 func TestValidate_InvalidJWTFormat(t *testing.T) {
 	keys := map[string]crypto.PublicKey{}
 
-	_, err := Validate("not.a.jwt.token.at.all", keys, "x", "x")
+	_, err := Validate("not.a.jwt.token.at.all", keys, "x", "x", "")
 	if err == nil {
 		t.Error("should fail for invalid JWT format")
 	}
 
-	_, err = Validate("only-one-part", keys, "x", "x")
+	_, err = Validate("only-one-part", keys, "x", "x", "")
 	if err == nil {
 		t.Error("should fail for single-part token")
 	}
@@ -266,7 +266,7 @@ func TestValidate_AudienceFallback_String(t *testing.T) {
 	claims["aud"] = "ssh-server"
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	if _, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server"); err != nil {
+	if _, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", ""); err != nil {
 		t.Fatalf("Validate() with string aud failed: %v", err)
 	}
 }
@@ -281,7 +281,7 @@ func TestValidate_AudienceFallback_Array(t *testing.T) {
 	claims["aud"] = []interface{}{"account", "ssh-server"}
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	if _, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server"); err != nil {
+	if _, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", ""); err != nil {
 		t.Fatalf("Validate() with array aud failed: %v", err)
 	}
 }
@@ -296,7 +296,7 @@ func TestValidate_WrongAuthorizedParty(t *testing.T) {
 	claims["aud"] = []interface{}{"ssh-server"}
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for wrong azp even when aud contains client")
 	}
@@ -312,7 +312,7 @@ func TestValidate_WrongAudience(t *testing.T) {
 	claims["aud"] = []interface{}{"account", "other-client"}
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail for wrong aud")
 	}
@@ -327,7 +327,7 @@ func TestValidate_MissingClientBinding(t *testing.T) {
 	delete(claims, "azp")
 
 	jwt := createRSATestJWT(t, privKey, kid, claims)
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("should fail when azp and aud are missing")
 	}
@@ -355,7 +355,7 @@ func TestValidate_ECDSAJWS(t *testing.T) {
 
 			jwt := createECDSATestJWT(t, privKey, tt.alg, kid, claims)
 
-			result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+			result, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 			if err != nil {
 				t.Fatalf("Validate() error: %v", err)
 			}
@@ -372,7 +372,7 @@ func TestValidate_ECDSARejectsASN1JWTSignature(t *testing.T) {
 	keys := map[string]crypto.PublicKey{kid: &privKey.PublicKey}
 
 	jwt := createECDSAASN1JWT(t, privKey, "ES256", kid, validClaims())
-	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server")
+	_, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "")
 	if err == nil {
 		t.Error("ASN.1 ECDSA signature should not be accepted as a JWS signature")
 	}

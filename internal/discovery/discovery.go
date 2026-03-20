@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -15,8 +16,8 @@ type Endpoints struct {
 	JwksURI                     string `json:"jwks_uri"`
 }
 
-func Fetch(ctx context.Context, client *http.Client, keycloakURL, realm string) (*Endpoints, error) {
-	discoveryURL := fmt.Sprintf("%s/realms/%s/.well-known/openid-configuration", keycloakURL, realm)
+func Fetch(ctx context.Context, client *http.Client, issuerURL string) (*Endpoints, error) {
+	discoveryURL := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
 
 	if ctx == nil {
 		ctx = context.Background()

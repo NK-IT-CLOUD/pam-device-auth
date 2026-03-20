@@ -12,9 +12,9 @@
 #include <time.h>
 #include <stdarg.h>
 
-#define KEYCLOAK_AUTH_BIN "/usr/local/bin/keycloak-auth"
+#define AUTH_BIN "/usr/local/bin/pam-device-auth"
 #define BUFFER_SIZE 4096
-#define LOG_FILE "/var/log/keycloak-ssh-auth.log"
+#define LOG_FILE "/var/log/pam-device-auth.log"
 #define PAM_LOG_PREFIX "[PAM] "
 
 // Map syslog priority to level string
@@ -43,7 +43,7 @@ void log_message(int priority, const char *format, ...) {
 
     FILE *f = fopen(LOG_FILE, "a");
     if (f != NULL) {
-        fprintf(f, "%s [PAM]    %s %s\n", timestamp, priority_to_level(priority), full_message);
+        fprintf(f, "%s " PAM_LOG_PREFIX "   %s %s\n", timestamp, priority_to_level(priority), full_message);
         fclose(f);
     }
 
@@ -125,9 +125,9 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     setenv("PAM_RHOST", client_ip, 1);
 
     // Execute the Go helper program
-    fp = popen(KEYCLOAK_AUTH_BIN, "r");
+    fp = popen(AUTH_BIN, "r");
     if (fp == NULL) {
-        log_message(LOG_ERR, "Failed to execute %s", KEYCLOAK_AUTH_BIN);
+        log_message(LOG_ERR, "Failed to execute %s", AUTH_BIN);
         unsetenv("PAM_USER");
         unsetenv("PAM_RHOST");
         return PAM_SYSTEM_ERR;
@@ -187,8 +187,8 @@ PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const c
 }
 
 #ifdef PAM_STATIC
-struct pam_module _pam_keycloak_modstruct = {
-    "pam_keycloak",
+struct pam_module _pam_device_auth_modstruct = {
+    "pam_device_auth",
     pam_sm_authenticate,
     pam_sm_setcred,
     pam_sm_acct_mgmt,

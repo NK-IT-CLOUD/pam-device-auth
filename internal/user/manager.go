@@ -6,14 +6,10 @@ import (
 	"os/exec"
 	"regexp"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/logger"
 )
 
 var validUsername = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
-
-const sudoersContent = "%sudo ALL=(ALL) NOPASSWD:ALL\n"
-
-var sudoersFile = "/etc/sudoers.d/keycloak-ssh-auth"
 var executor commandExecutor = systemCommandExecutor{}
 
 type commandExecutor interface {
@@ -34,8 +30,7 @@ func (systemCommandExecutor) Run(name string, args ...string) ([]byte, int, erro
 	return out, -1, err
 }
 
-// findBin resolves a command to its absolute path.
-// PAM sets a minimal PATH, so exec.Command("getent") fails.
+
 func findBin(name string) string {
 	for _, dir := range []string{"/usr/bin", "/usr/sbin", "/bin", "/sbin"} {
 		path := dir + "/" + name
@@ -43,40 +38,119 @@ func findBin(name string) string {
 			return path
 		}
 	}
-	return name // fallback to bare name
+	return name
 }
 
-// Setup creates a Linux user with sudo access if they don't exist.
-// Always adds to sudo group and ensures NOPASSWD sudoers drop-in.
-func Setup(username string, log *logger.Logger) error {
+// Setup creates a Linux user with group memberships if they don't exist.
+// If isAdmin is true, uses adminGroups; otherwise uses userGroups.
+// When adminGroups is configured and user is NOT admin, actively removes from admin-only groups.
+// Returns (created bool, tempPassword string, err error).
+// tempPassword is non-empty only when a new user is created with forcePasswd=true.
+func Setup(username string, userGroups, adminGroups []string, isAdmin bool, forcePasswd bool, log *logger.Logger) (bool, string, error) {
 	if !validUsername.MatchString(username) {
-		return fmt.Errorf("invalid username: %q", username)
+		return false, "", fmt.Errorf("invalid username: %q", username)
 	}
 
 	exists, err := userExists(username)
 	if err != nil {
-		return fmt.Errorf("check user exists: %w", err)
+		return false, "", fmt.Errorf("check user exists: %w", err)
 	}
 
+	created := false
 	if !exists {
 		log.Info("Creating user: %s", username)
-		if out, _, err := executor.Run("useradd", "-m", "-s", "/bin/bash", "-G", "sudo", username); err != nil {
-			return fmt.Errorf("useradd failed: %s: %w", string(out), err)
+		if out, _, err := executor.Run("useradd", "-m", "-s", "/bin/bash", username); err != nil {
+			return false, "", fmt.Errorf("useradd failed: %s: %w", string(out), err)
 		}
 		log.Info("User %s created", username)
+		created = true
 	}
 
-	// Ensure sudo group membership (idempotent)
-	if out, _, err := executor.Run("usermod", "-aG", "sudo", username); err != nil {
-		return fmt.Errorf("add to sudo group: %s: %w", string(out), err)
+	// Determine groups based on admin status
+	if isAdmin && len(adminGroups) > 0 {
+		for _, g := range adminGroups {
+			if out, _, err := executor.Run("usermod", "-aG", g, username); err != nil {
+				log.Warn("Failed to add %s to group %s: %s", username, g, string(out))
+			}
+		}
+		log.Info("Admin groups applied for %s: %v", username, adminGroups)
+	} else {
+		for _, g := range userGroups {
+			if out, _, err := executor.Run("usermod", "-aG", g, username); err != nil {
+				log.Warn("Failed to add %s to group %s: %s", username, g, string(out))
+			}
+		}
+
+		if len(adminGroups) > 0 {
+			adminOnly := groupDiff(adminGroups, userGroups)
+			for _, g := range adminOnly {
+				executor.Run("gpasswd", "-d", username, g)
+				log.Info("Removed %s from group %s (admin role revoked)", username, g)
+			}
+		}
 	}
 
-	// Ensure sudoers drop-in
-	if err := ensureSudoers(log); err != nil {
-		return fmt.Errorf("sudoers setup: %w", err)
+	if created && forcePasswd {
+		// Unlock account (remove password lock so passwd doesn't ask for "Current password")
+		executor.Run("passwd", "-d", username)
+
+		// Force password setup on first shell login via .bash_profile
+		if err := installPasswordPrompt(username, log); err != nil {
+			log.Warn("Failed to install password prompt: %v", err)
+		}
 	}
 
+	return created, "", nil
+}
+
+const passwordPromptScript = `# pam-device-auth: force local password setup on first login
+if [ ! -f "$HOME/.password_set" ]; then
+    echo ""
+    echo "========================================"
+    echo "  Please set your local password."
+    echo "========================================"
+    echo ""
+    if passwd; then
+        touch "$HOME/.password_set"
+        echo ""
+        echo "Password set successfully."
+    else
+        echo "Password not set. You will be asked again on next login."
+        exit 1
+    fi
+fi
+`
+
+func installPasswordPrompt(username string, log *logger.Logger) error {
+	homeDir := "/home/" + username
+	profilePath := homeDir + "/.bash_profile"
+
+	if err := os.WriteFile(profilePath, []byte(passwordPromptScript), 0644); err != nil {
+		return fmt.Errorf("write .bash_profile: %w", err)
+	}
+
+	// Ensure owned by user
+	if out, _, err := executor.Run("chown", username+":"+username, profilePath); err != nil {
+		return fmt.Errorf("chown .bash_profile: %s: %w", string(out), err)
+	}
+
+	log.Info("Password prompt installed for %s", username)
 	return nil
+}
+
+// groupDiff returns elements in a that are NOT in b.
+func groupDiff(a, b []string) []string {
+	bSet := make(map[string]bool)
+	for _, g := range b {
+		bSet[g] = true
+	}
+	var diff []string
+	for _, g := range a {
+		if !bSet[g] {
+			diff = append(diff, g)
+		}
+	}
+	return diff
 }
 
 func userExists(username string) (bool, error) {
@@ -88,31 +162,4 @@ func userExists(username string) (bool, error) {
 		return false, nil
 	}
 	return false, err
-}
-
-func ensureSudoers(log *logger.Logger) error {
-	if _, err := os.Stat(sudoersFile); err == nil {
-		return nil // already exists
-	}
-
-	// Write to temp file
-	tmpFile := sudoersFile + ".tmp"
-	if err := os.WriteFile(tmpFile, []byte(sudoersContent), 0440); err != nil {
-		return fmt.Errorf("write temp sudoers: %w", err)
-	}
-
-	// Validate syntax
-	if out, _, err := executor.Run("visudo", "-cf", tmpFile); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("visudo validation failed: %s: %w", string(out), err)
-	}
-
-	// Move into place
-	if err := os.Rename(tmpFile, sudoersFile); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("install sudoers: %w", err)
-	}
-
-	log.Info("Sudoers drop-in installed: %s", sudoersFile)
-	return nil
 }

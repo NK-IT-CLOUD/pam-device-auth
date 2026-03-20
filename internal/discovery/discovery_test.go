@@ -19,7 +19,7 @@ func TestFetchSuccess(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/realms/test/.well-known/openid-configuration" {
+		if r.URL.Path != "/.well-known/openid-configuration" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			http.NotFound(w, r)
 			return
@@ -28,7 +28,7 @@ func TestFetchSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	result, err := Fetch(context.Background(), srv.Client(), srv.URL, "test")
+	result, err := Fetch(context.Background(), srv.Client(), srv.URL)
 	if err != nil {
 		t.Fatalf("Fetch() error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestFetchMissingFields(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, err := Fetch(context.Background(), srv.Client(), srv.URL, "test")
+			_, err := Fetch(context.Background(), srv.Client(), srv.URL)
 			if err == nil {
 				t.Error("Fetch() should have returned error for missing field")
 			}
@@ -95,14 +95,14 @@ func TestFetchServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := Fetch(context.Background(), srv.Client(), srv.URL, "test")
+	_, err := Fetch(context.Background(), srv.Client(), srv.URL)
 	if err == nil {
 		t.Error("Fetch() should fail on 500")
 	}
 }
 
 func TestFetchUnreachable(t *testing.T) {
-	_, err := Fetch(context.Background(), &http.Client{Timeout: 100 * time.Millisecond}, "http://127.0.0.1:1", "test")
+	_, err := Fetch(context.Background(), &http.Client{Timeout: 100 * time.Millisecond}, "http://127.0.0.1:1")
 	if err == nil {
 		t.Error("Fetch() should fail for unreachable server")
 	}

@@ -2,12 +2,10 @@ package user
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/logger"
 )
 
 type mockResult struct {
@@ -34,6 +32,7 @@ func (m *mockExecutor) Run(name string, args ...string) ([]byte, int, error) {
 	return result.out, result.exitCode, result.err
 }
 
+
 func testLogger(t *testing.T) *logger.Logger {
 	t.Helper()
 
@@ -44,22 +43,15 @@ func testLogger(t *testing.T) *logger.Logger {
 	return log
 }
 
-func setupTestEnvironment(t *testing.T, exec commandExecutor) string {
+func setupTestEnvironment(t *testing.T, exec commandExecutor) {
 	t.Helper()
 
-	dir := t.TempDir()
 	origExecutor := executor
-	origSudoersFile := sudoersFile
-
 	executor = exec
-	sudoersFile = filepath.Join(dir, "keycloak-ssh-auth")
 
 	t.Cleanup(func() {
 		executor = origExecutor
-		sudoersFile = origSudoersFile
 	})
-
-	return dir
 }
 
 func TestIsValidUsername(t *testing.T) {
@@ -78,7 +70,7 @@ func TestIsValidUsername(t *testing.T) {
 	}
 }
 
-func TestSetupExistingUserWithExistingSudoers(t *testing.T) {
+func TestSetupExistingUser(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser":    {{exitCode: 0}},
@@ -87,12 +79,12 @@ func TestSetupExistingUserWithExistingSudoers(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	if err := os.WriteFile(sudoersFile, []byte(sudoersContent), 0440); err != nil {
-		t.Fatalf("WriteFile() error: %v", err)
-	}
-
-	if err := Setup("testuser", testLogger(t)); err != nil {
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
+	}
+	if created {
+		t.Fatal("Setup() should return created=false for existing user")
 	}
 
 	for _, call := range mock.calls {
@@ -102,28 +94,33 @@ func TestSetupExistingUserWithExistingSudoers(t *testing.T) {
 	}
 }
 
-func TestSetupCreatesUserAndSudoers(t *testing.T) {
+func TestSetupCreatesUser(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
-			"getent passwd testuser":                   {{exitCode: 2, err: errors.New("not found")}},
-			"useradd -m -s /bin/bash -G sudo testuser": {{exitCode: 0}},
-			"usermod -aG sudo testuser":                {{exitCode: 0}},
+			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
+			"usermod -aG sudo testuser":        {{exitCode: 0}},
 		},
 	}
 
 	setupTestEnvironment(t, mock)
-	mock.results["visudo -cf "+sudoersFile+".tmp"] = []mockResult{{exitCode: 0}}
 
-	if err := Setup("testuser", testLogger(t)); err != nil {
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
-
-	content, err := os.ReadFile(sudoersFile)
-	if err != nil {
-		t.Fatalf("ReadFile() error: %v", err)
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
 	}
-	if string(content) != sudoersContent {
-		t.Errorf("sudoers content = %q, want %q", string(content), sudoersContent)
+
+	hasUseradd := false
+	for _, call := range mock.calls {
+		if call == "useradd -m -s /bin/bash testuser" {
+			hasUseradd = true
+		}
+	}
+	if !hasUseradd {
+		t.Fatalf("useradd should be called for new user, calls = %v", mock.calls)
 	}
 }
 
@@ -131,7 +128,7 @@ func TestSetupUserAddFailure(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser": {{exitCode: 2, err: errors.New("not found")}},
-			"useradd -m -s /bin/bash -G sudo testuser": {{
+			"useradd -m -s /bin/bash testuser": {{
 				out:      []byte("useradd failed"),
 				exitCode: 1,
 				err:      errors.New("exit status 1"),
@@ -140,7 +137,7 @@ func TestSetupUserAddFailure(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	err := Setup("testuser", testLogger(t))
+	_, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err == nil {
 		t.Fatal("Setup() should fail when useradd fails")
 	}
@@ -149,7 +146,101 @@ func TestSetupUserAddFailure(t *testing.T) {
 	}
 }
 
-func TestSetupVisudoFailureCleansTempFile(t *testing.T) {
+func TestSetup_CustomGroups(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
+			"usermod -aG docker testuser":      {{exitCode: 0}},
+			"usermod -aG adm testuser":         {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("testuser", []string{"docker", "adm"}, nil, true, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
+	}
+
+	hasDocker := false
+	hasAdm := false
+	for _, call := range mock.calls {
+		if call == "usermod -aG docker testuser" {
+			hasDocker = true
+		}
+		if call == "usermod -aG adm testuser" {
+			hasAdm = true
+		}
+	}
+	if !hasDocker {
+		t.Fatalf("usermod for docker group should be called, calls = %v", mock.calls)
+	}
+	if !hasAdm {
+		t.Fatalf("usermod for adm group should be called, calls = %v", mock.calls)
+	}
+}
+
+func TestSetup_NoForcePasswd(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
+			"usermod -aG sudo testuser":        {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, false, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
+	}
+
+	// No passwd/chage calls should be made (forcePasswd is ignored)
+	for _, call := range mock.calls {
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called, calls = %v", mock.calls)
+		}
+	}
+}
+
+func TestSetup_ForcePasswdUnlocksAccount(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
+			"usermod -aG sudo testuser":        {{exitCode: 0}},
+			"passwd -d testuser":               {{exitCode: 0}},
+			"chown testuser:testuser /home/testuser/.bash_profile": {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
+	}
+
+	hasPasswdD := false
+	for _, call := range mock.calls {
+		if call == "passwd -d testuser" {
+			hasPasswdD = true
+		}
+	}
+	if !hasPasswdD {
+		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
+	}
+}
+
+func TestSetup_ExistingUser_NoPasswdCalls(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser":    {{exitCode: 0}},
@@ -157,20 +248,208 @@ func TestSetupVisudoFailureCleansTempFile(t *testing.T) {
 		},
 	}
 	setupTestEnvironment(t, mock)
-	mock.results["visudo -cf "+sudoersFile+".tmp"] = []mockResult{{
-		out:      []byte("syntax error"),
-		exitCode: 1,
-		err:      errors.New("exit status 1"),
-	}}
 
-	err := Setup("testuser", testLogger(t))
-	if err == nil {
-		t.Fatal("Setup() should fail when visudo validation fails")
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
 	}
-	if _, statErr := os.Stat(sudoersFile); !os.IsNotExist(statErr) {
-		t.Fatalf("sudoers file should not exist after validation failure, statErr = %v", statErr)
+	if created {
+		t.Fatal("Setup() should return created=false for existing user")
 	}
-	if _, statErr := os.Stat(sudoersFile + ".tmp"); !os.IsNotExist(statErr) {
-		t.Fatalf("temporary sudoers file should be cleaned up, statErr = %v", statErr)
+
+	// No passwd/chage calls for existing users
+	for _, call := range mock.calls {
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called for existing users, calls = %v", mock.calls)
+		}
+	}
+}
+
+// --- New tests for role-based group assignment ---
+
+func TestSetup_AdminUser(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd newuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash newuser": {{exitCode: 0}},
+			"usermod -aG sudo newuser":        {{exitCode: 0}},
+			"usermod -aG users newuser":       {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("newuser", []string{"users"}, []string{"sudo", "users"}, true, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
+	}
+
+	hasSudo := false
+	hasUsers := false
+	for _, call := range mock.calls {
+		if call == "usermod -aG sudo newuser" {
+			hasSudo = true
+		}
+		if call == "usermod -aG users newuser" {
+			hasUsers = true
+		}
+	}
+	if !hasSudo {
+		t.Fatalf("admin user should be added to sudo group, calls = %v", mock.calls)
+	}
+	if !hasUsers {
+		t.Fatalf("admin user should be added to users group, calls = %v", mock.calls)
+	}
+}
+
+func TestSetup_NormalUser(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd newuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash newuser": {{exitCode: 0}},
+			"usermod -aG users newuser":       {{exitCode: 0}},
+			"gpasswd -d newuser sudo":         {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("newuser", []string{"users"}, []string{"sudo", "users"}, false, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
+	}
+
+	hasUsersGroup := false
+	hasGpasswd := false
+	for _, call := range mock.calls {
+		if call == "usermod -aG users newuser" {
+			hasUsersGroup = true
+		}
+		if call == "gpasswd -d newuser sudo" {
+			hasGpasswd = true
+		}
+		// Normal user should NOT get sudo via usermod
+		if call == "usermod -aG sudo newuser" {
+			t.Fatalf("normal user should NOT be added to sudo group, calls = %v", mock.calls)
+		}
+	}
+	if !hasUsersGroup {
+		t.Fatalf("normal user should be added to users group, calls = %v", mock.calls)
+	}
+	if !hasGpasswd {
+		t.Fatalf("normal user should be removed from sudo (admin-only) group, calls = %v", mock.calls)
+	}
+}
+
+func TestSetup_Demotion(t *testing.T) {
+	// Existing user, isAdmin=false, adminGroups=["sudo","users"], userGroups=["users"]
+	// Expect: usermod -aG users, gpasswd -d username sudo
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd existuser":       {{exitCode: 0}},
+			"usermod -aG users existuser":   {{exitCode: 0}},
+			"gpasswd -d existuser sudo":     {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("existuser", []string{"users"}, []string{"sudo", "users"}, false, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if created {
+		t.Fatal("Setup() should return created=false for existing user")
+	}
+
+	hasUsersGroup := false
+	hasGpasswd := false
+	for _, call := range mock.calls {
+		if call == "usermod -aG users existuser" {
+			hasUsersGroup = true
+		}
+		if call == "gpasswd -d existuser sudo" {
+			hasGpasswd = true
+		}
+	}
+	if !hasUsersGroup {
+		t.Fatalf("demoted user should be added to users group, calls = %v", mock.calls)
+	}
+	if !hasGpasswd {
+		t.Fatalf("demoted user should be removed from sudo group, calls = %v", mock.calls)
+	}
+
+	// Ensure no passwd/chage calls for existing user
+	for _, call := range mock.calls {
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called for demotion, calls = %v", mock.calls)
+		}
+	}
+}
+
+func TestSetup_NoSudoRole(t *testing.T) {
+	// isAdmin=true, adminGroups=[] (empty) — backward compatible behavior
+	// Expect: usermod -aG for userGroups only
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
+			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
+			"usermod -aG users testuser":       {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	created, _, err := Setup("testuser", []string{"users"}, nil, true, true, testLogger(t))
+	if err != nil {
+		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
+	}
+
+	hasUsersGroup := false
+	for _, call := range mock.calls {
+		if call == "usermod -aG users testuser" {
+			hasUsersGroup = true
+		}
+		// No gpasswd calls should be made
+		if strings.HasPrefix(call, "gpasswd ") {
+			t.Fatalf("gpasswd should not be called when adminGroups is empty, calls = %v", mock.calls)
+		}
+	}
+	if !hasUsersGroup {
+		t.Fatalf("user should be added to users group, calls = %v", mock.calls)
+	}
+}
+
+func TestGroupDiff(t *testing.T) {
+	tests := []struct {
+		name string
+		a    []string
+		b    []string
+		want []string
+	}{
+		{"admin-only groups", []string{"sudo", "users"}, []string{"users"}, []string{"sudo"}},
+		{"no diff", []string{"users"}, []string{"users"}, nil},
+		{"all different", []string{"sudo", "docker"}, []string{"users"}, []string{"sudo", "docker"}},
+		{"empty a", nil, []string{"users"}, nil},
+		{"empty b", []string{"sudo"}, nil, []string{"sudo"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := groupDiff(tt.a, tt.b)
+			if len(got) != len(tt.want) {
+				t.Fatalf("groupDiff(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+			for i, g := range got {
+				if g != tt.want[i] {
+					t.Fatalf("groupDiff(%v, %v)[%d] = %q, want %q", tt.a, tt.b, i, g, tt.want[i])
+				}
+			}
+		})
 	}
 }

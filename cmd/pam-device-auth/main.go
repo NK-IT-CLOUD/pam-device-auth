@@ -7,19 +7,20 @@ import (
 	"os"
 	"time"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/cache"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/device"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/discovery"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/token"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/user"
+	"github.com/nk-dev/pam-device-auth/internal/cache"
+	"github.com/nk-dev/pam-device-auth/internal/config"
+	"github.com/nk-dev/pam-device-auth/internal/device"
+	"github.com/nk-dev/pam-device-auth/internal/discovery"
+	"github.com/nk-dev/pam-device-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/qr"
+	"github.com/nk-dev/pam-device-auth/internal/token"
+	"github.com/nk-dev/pam-device-auth/internal/user"
 )
 
-var VERSION = "0.6.0"
+var VERSION = "1.0.0"
 
 const (
-	logFile     = "/var/log/keycloak-ssh-auth.log"
+	logFile     = "/var/log/pam-device-auth.log"
 	httpTimeout = 10 * time.Second
 )
 
@@ -28,11 +29,11 @@ func main() {
 	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "--version":
-			fmt.Printf("keycloak-auth %s\n", VERSION)
+			fmt.Printf("pam-device-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			fmt.Println("Usage: keycloak-auth [--debug] [--version] [--help]")
-			fmt.Println("  SSH authentication via Keycloak Device Authorization Grant")
+			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--help]")
+			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
 			os.Exit(0)
 		case "--debug":
 			debug = true
@@ -46,7 +47,7 @@ func main() {
 	}
 	defer log.Close()
 
-	log.Info("keycloak-auth %s starting", VERSION)
+	log.Info("pam-device-auth %s starting", VERSION)
 
 	cfg, err := config.Load("")
 	if err != nil {
@@ -63,9 +64,9 @@ func main() {
 
 	httpClient := &http.Client{Timeout: httpTimeout}
 
-	// OIDC Discovery (fail-fast if Keycloak unreachable)
+	// OIDC Discovery (fail-fast if OIDC provider unreachable)
 	discoveryCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	endpoints, err := discovery.Fetch(discoveryCtx, httpClient, cfg.KeycloakURL, cfg.Realm)
+	endpoints, err := discovery.Fetch(discoveryCtx, httpClient, cfg.IssuerURL)
 	cancel()
 	if err != nil {
 		log.Error("OIDC Discovery failed: %v", err)
@@ -119,7 +120,7 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		return false
 	}
 
-	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID)
+	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID, cfg.RoleClaim)
 	if err != nil {
 		log.Info("Token validation failed after refresh: %v", err)
 		cache.Delete(sshUser)
@@ -135,7 +136,7 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		log.Error("User %s lacks required role: %s", sshUser, cfg.RequiredRole)
 		cache.Delete(sshUser)
-		fmt.Println("Zugriff verweigert.")
+		fmt.Println("Access denied.")
 		return false
 	}
 
@@ -148,12 +149,21 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		}
 	}
 
-	if err := user.Setup(sshUser, log); err != nil {
-		log.Error("User setup failed: %v", err)
-		return false
+	if cfg.CreateUser {
+		isAdmin := cfg.SudoRole == "" || token.HasRole(result.Roles, cfg.SudoRole)
+		created, _, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
+		if err != nil {
+			log.Error("User setup failed: %v", err)
+			return false
+		}
+		if created {
+			fmt.Printf("User %s created. Please reconnect.\n", sshUser)
+			log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
+			return true
+		}
 	}
 
-	fmt.Println("SSO-Session aktiv.")
+	fmt.Println("SSO session active.")
 	return true
 }
 
@@ -169,10 +179,17 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 
 	// Print to stdout — PAM pipes to SSH terminal
 	fmt.Println("────────────────────────────────────")
-	fmt.Printf("Login: %s\n", dc.VerificationURI)
-	fmt.Printf("Code:  %s\n", dc.UserCode)
 	if dc.VerificationURIComplete != "" {
 		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
+		fmt.Printf("Code:  %s\n", dc.UserCode)
+		fmt.Println()
+		qrStr, err := qr.Render(dc.VerificationURIComplete)
+		if err == nil {
+			fmt.Print(qrStr)
+		}
+	} else {
+		fmt.Printf("Open:  %s\n", dc.VerificationURI)
+		fmt.Printf("Code:  %s\n", dc.UserCode)
 	}
 	fmt.Println("────────────────────────────────────")
 
@@ -187,7 +204,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	tokenResp, err := device.PollToken(ctx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, dc.DeviceCode, dc.Interval)
 	if err != nil {
 		log.Error("Token polling failed: %v", err)
-		fmt.Println("Anmeldung fehlgeschlagen.")
+		fmt.Println("Authentication failed.")
 		os.Exit(1)
 	}
 
@@ -199,7 +216,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		os.Exit(1)
 	}
 
-	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID)
+	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID, cfg.RoleClaim)
 	if err != nil {
 		log.Error("Token validation failed: %v", err)
 		os.Exit(1)
@@ -212,7 +229,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		log.Error("User %s lacks required role: %s", sshUser, cfg.RequiredRole)
-		fmt.Println("Zugriff verweigert.")
+		fmt.Println("Access denied.")
 		os.Exit(1)
 	}
 
@@ -225,10 +242,20 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		}
 	}
 
-	if err := user.Setup(sshUser, log); err != nil {
-		log.Error("User setup failed: %v", err)
-		os.Exit(1)
+	if cfg.CreateUser {
+		isAdmin := cfg.SudoRole == "" || token.HasRole(result.Roles, cfg.SudoRole)
+		created, _, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
+		if err != nil {
+			log.Error("User setup failed: %v", err)
+			os.Exit(1)
+		}
+		if created {
+			fmt.Printf("Login successful! User %s created.\n", sshUser)
+			fmt.Println("Disconnecting — please reconnect.")
+		} else {
+			fmt.Println("Login successful!")
+		}
+	} else {
+		fmt.Println("Login successful!")
 	}
-
-	fmt.Println("Login erfolgreich!")
 }

@@ -1,6 +1,0 @@
-{
-    "keycloak_url": "https://sso.nk-it.cloud",
-    "realm": "nk-it.cloud",
-    "client_id": "ssh-server",
-    "required_role": "ssh-access"
-}

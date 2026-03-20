@@ -108,7 +108,7 @@ func (l *Logger) Error(format string, v ...interface{}) {
 func (l *Logger) log(level LogLevel, format string, v ...interface{}) {
 	timestamp := time.Now().Format("2006/01/02 15:04:05")
 	message := fmt.Sprintf(format, v...)
-	logLine := fmt.Sprintf("%s [SSO-GO] %-5s %s", timestamp, level.String(), message)
+	logLine := fmt.Sprintf("%s [AUTH]   %-5s %s", timestamp, level.String(), message)
 	l.logger.Println(logLine)
 }
 

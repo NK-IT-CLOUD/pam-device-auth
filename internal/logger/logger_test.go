@@ -51,8 +51,8 @@ func TestNewLogger_File(t *testing.T) {
 	if len(content) == 0 {
 		t.Error("log file should not be empty")
 	}
-	if !strings.Contains(string(content), "[SSO-GO]") {
-		t.Error("log should contain [SSO-GO] prefix")
+	if !strings.Contains(string(content), "[AUTH]") {
+		t.Error("log should contain [AUTH] prefix")
 	}
 	if !strings.Contains(string(content), "test message") {
 		t.Error("log should contain the test message")

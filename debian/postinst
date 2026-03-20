@@ -1,11 +1,11 @@
 #!/bin/sh
 set -e
 
-PKG="keycloak-ssh-auth"
-PKG_VERSION="0.6.0"
+PKG="pam-device-auth"
+PKG_VERSION="1.0.0"
 SHARE_DIR="/usr/share/${PKG}"
 CONFIG_DIR="/etc/${PKG}"
-CONFIG_FILE="${CONFIG_DIR}/keycloak-pam.json"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
 LOG_FILE="/var/log/${PKG}.log"
 CACHE_DIR="/run/${PKG}"
 
@@ -13,7 +13,7 @@ log() { echo "[${PKG}] $*"; }
 
 setup_logrotate() {
     cat > /etc/logrotate.d/${PKG} << 'EOF'
-/var/log/keycloak-ssh-auth.log {
+/var/log/pam-device-auth.log {
     weekly
     rotate 4
     compress
@@ -67,34 +67,48 @@ restart_ssh() {
 case "$1" in
     configure)
         check_os
-        setup_logrotate
-        setup_tmpfiles
 
         mkdir -p /etc/ssh/sshd_config.d
         mkdir -p "${CONFIG_DIR}"
 
+        # Migrate from keycloak-ssh-auth if present
+        if [ -d /etc/keycloak-ssh-auth ]; then
+            log "Migrating from keycloak-ssh-auth..."
+            rm -f /etc/logrotate.d/keycloak-ssh-auth
+            rm -f /usr/lib/tmpfiles.d/keycloak-ssh-auth.conf
+            rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf
+            if [ -f /etc/keycloak-ssh-auth/keycloak-pam.json ]; then
+                cp /etc/keycloak-ssh-auth/keycloak-pam.json "${CONFIG_DIR}/keycloak-pam.json.migrated"
+                log "Old config preserved at ${CONFIG_DIR}/keycloak-pam.json.migrated"
+            fi
+            rm -rf /etc/keycloak-ssh-auth
+        fi
+
+        setup_logrotate
+        setup_tmpfiles
+
         # --- Configs: install on first setup, preserve on upgrade ---
 
-        if [ ! -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf ]; then
-            cp "${SHARE_DIR}/config/10-keycloak-auth.conf" /etc/ssh/sshd_config.d/
+        if [ ! -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf ]; then
+            cp "${SHARE_DIR}/config/10-pam-device-auth.conf" /etc/ssh/sshd_config.d/
             log "Installed SSH config"
         fi
 
         if [ ! -f /etc/pam.d/sshd.original ]; then
             [ -f /etc/pam.d/sshd ] && cp /etc/pam.d/sshd /etc/pam.d/sshd.original
-            cp "${SHARE_DIR}/config/pam-sshd-keycloak" /etc/pam.d/sshd
+            cp "${SHARE_DIR}/config/pam-sshd-device-auth" /etc/pam.d/sshd
             log "Installed PAM config (original backed up)"
             log "WARNING: Review /etc/pam.d/sshd if this host uses a custom PAM stack"
         fi
 
         if [ ! -f "${CONFIG_FILE}" ]; then
-            cp "${SHARE_DIR}/config/keycloak-pam.json" "${CONFIG_FILE}"
-            log "Installed default keycloak config"
+            cp "${SHARE_DIR}/config/config.json" "${CONFIG_FILE}"
+            log "Installed default config"
         fi
 
         # --- Permissions ---
-        chmod 755 /usr/local/bin/keycloak-auth
-        chmod 755 /usr/lib/security/pam_keycloak.so
+        chmod 755 /usr/local/bin/pam-device-auth
+        chmod 755 /usr/lib/security/pam_device_auth.so
         chmod 600 "${CONFIG_FILE}"
         touch "${LOG_FILE}"
         chmod 644 "${LOG_FILE}"

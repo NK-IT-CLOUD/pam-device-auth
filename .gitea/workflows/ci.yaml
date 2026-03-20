@@ -1,4 +1,4 @@
-name: Keycloak SSH Auth CI
+name: pam-device-auth CI
 on:
   push:
     branches: [main]
