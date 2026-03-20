@@ -22,8 +22,8 @@ SSH Client --> sshd (PAM) --> pam_device_auth.so --> pam-device-auth binary
                                                       |
                                          Device Authorization Request
                                                       |
-                                   User sees URL + Code in terminal
-                                   --> Opens browser --> Logs in at OIDC provider
+                                   User sees URL + Code + QR code in terminal
+                                   --> Opens browser or scans QR --> Logs in at OIDC provider
                                                       |
                                          Token Polling (RFC 8628)
                                                       |
@@ -34,12 +34,14 @@ SSH Client --> sshd (PAM) --> pam_device_auth.so --> pam-device-auth binary
 
 On repeat logins, a cached refresh token is used instead. The token is refreshed against the OIDC provider on every login, so user deactivation or role removal takes effect immediately.
 
+On first login, new users are automatically prompted to set a local password (used for `sudo`). A QR code is displayed alongside the verification URL for convenient scanning on mobile devices.
+
 ## Quick Start
 
 ### 1. Install
 
 ```bash
-sudo dpkg -i pam-device-auth_1.0.0_amd64.deb
+sudo dpkg -i pam-device-auth_0.1.0_amd64.deb
 ```
 
 ### 2. Configure

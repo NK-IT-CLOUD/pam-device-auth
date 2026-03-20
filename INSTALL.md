@@ -18,7 +18,7 @@ ssh -V
 Download the latest release and install:
 
 ```bash
-sudo dpkg -i pam-device-auth_1.0.0_amd64.deb
+sudo dpkg -i pam-device-auth_0.1.0_amd64.deb
 ```
 
 The package installs:
@@ -94,13 +94,18 @@ This example uses Keycloak, but the same principles apply to any OIDC provider.
 
 5. Under **Client scopes**, ensure `openid`, `profile`, and `email` are assigned
 
-### Create the SSH Access Role
+### Create the SSH Roles
 
 1. Go to your client > **Roles** > **Create role**
-2. Name it `ssh-access`
-3. Assign this role to users who should have SSH access:
+2. Create two roles:
+   - `ssh-access` -- required for all SSH users
+   - `ssh-admin` -- grants sudo/admin group membership
+3. Assign roles to users:
    - Go to **Users** > select user > **Role mapping** > **Assign role**
-   - Filter by client, select `ssh-access`
+   - Filter by client, select `ssh-access` for regular users
+   - Assign both `ssh-access` and `ssh-admin` to users who need sudo privileges
+
+Users with only `ssh-access` are created as normal users. Users with both `ssh-access` and `ssh-admin` are placed into admin groups (e.g., `sudo`) and can elevate privileges.
 
 ### Update config.json
 
@@ -108,9 +113,18 @@ This example uses Keycloak, but the same principles apply to any OIDC provider.
 {
     "issuer_url": "https://sso.example.com/realms/myrealm",
     "client_id": "ssh-server",
-    "required_role": "ssh-access"
+    "required_role": "ssh-access",
+    "sudo_role": "ssh-admin",
+    "user_groups": ["users"],
+    "admin_groups": ["sudo", "users"]
 }
 ```
+
+With this configuration:
+
+- Users with only `ssh-access` are added to the `users` group (no sudo).
+- Users with both `ssh-access` and `ssh-admin` are added to `sudo` and `users` groups.
+- If a user loses `ssh-admin`, they are demoted to `users` only on next login.
 
 The `issuer_url` is the base URL of your realm. You can verify it works by visiting:
 
@@ -163,13 +177,50 @@ Restart sshd after making changes:
 sudo systemctl restart ssh
 ```
 
+## Role-Based Group Assignment
+
+When `sudo_role` is configured in `config.json`, users are assigned to different Linux groups based on their OIDC roles:
+
+- **Regular users** (have `required_role` only): added to `user_groups` (default: `["sudo"]`).
+- **Admin users** (have both `required_role` and `sudo_role`): added to `admin_groups` instead, which typically includes `sudo`.
+- **Demotion**: if a user previously had `sudo_role` but it was revoked in Keycloak, they are automatically demoted to `user_groups` on their next login. Admin-only groups are removed.
+
+Example configuration for separating admins and regular users:
+
+```json
+{
+    "issuer_url": "https://sso.example.com/realms/myrealm",
+    "client_id": "ssh-server",
+    "required_role": "ssh-access",
+    "sudo_role": "ssh-admin",
+    "user_groups": ["users"],
+    "admin_groups": ["sudo", "users"]
+}
+```
+
+With this setup, regular SSH users can log in but cannot use `sudo`. Only users who also hold the `ssh-admin` role in Keycloak are placed in the `sudo` group.
+
+If `sudo_role` is not configured, the behavior is backward compatible: all users receive `user_groups`.
+
+## First Login Password Setup
+
+On first login, new users are automatically prompted to set a local Linux password via a `.bash_profile` hook. This password is used for `sudo` and any other local authentication that requires a password.
+
+The prompt is triggered by the `force_password_change` config option (default: `true`). After the user sets a password, the prompt is removed and subsequent logins proceed normally.
+
+This ensures that OIDC-provisioned users have a working local password for privilege escalation without requiring manual setup by an administrator.
+
+## QR Code Display
+
+During device authorization, a QR code is displayed in the terminal alongside the verification URL and one-time code. Users can scan the QR code with their phone to open the verification URL directly, avoiding the need to type the URL manually.
+
 ## Testing Your Setup
 
 ### 1. Verify the binary
 
 ```bash
 pam-device-auth --version
-# pam-device-auth 1.0.0
+# pam-device-auth 0.1.0
 ```
 
 ### 2. Test with debug logging
@@ -223,7 +274,7 @@ Key changes:
 - `keycloak_url` + `realm` replaced by a single `issuer_url` (the full OIDC issuer URL)
 - Config path changed from `/etc/keycloak-ssh-auth/` to `/etc/pam-device-auth/`
 - Environment variables changed from `KEYCLOAK_*` to `PAM_DEVICE_AUTH_*`
-- New optional fields: `role_claim`, `create_user`, `user_groups`, `force_password_change`
+- New optional fields: `role_claim`, `create_user`, `user_groups`, `sudo_role`, `admin_groups`, `force_password_change`
 
 ## Troubleshooting
 

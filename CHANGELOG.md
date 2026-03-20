@@ -15,7 +15,8 @@ First public release. Generic OIDC Device Authorization Grant for SSH PAM authen
 - Automatic user creation with configurable group membership
 - Role-based group assignment: `sudo_role` + `admin_groups` for admin/user separation
 - Automatic demotion: revoking `sudo_role` removes admin groups on next login
-- Forced password change on first login for sudo security
+- QR code displayed during device authorization for easy mobile scanning
+- Forced local password setup on first login via `.bash_profile` prompt (used for sudo)
 - JWT signature verification via JWKS (RSA + ECDSA)
 - Debian package with zero-config install
 - stdlib-only Go binary -- zero external dependencies
