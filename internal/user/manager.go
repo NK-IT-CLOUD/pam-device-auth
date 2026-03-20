@@ -90,8 +90,11 @@ func Setup(username string, userGroups, adminGroups []string, isAdmin bool, forc
 		}
 	}
 
-	// Force password setup on first shell login via .bash_profile
-	if created {
+	if created && forcePasswd {
+		// Unlock account (remove password lock so passwd doesn't ask for "Current password")
+		executor.Run("passwd", "-d", username)
+
+		// Force password setup on first shell login via .bash_profile
 		if err := installPasswordPrompt(username, log); err != nil {
 			log.Warn("Failed to install password prompt: %v", err)
 		}

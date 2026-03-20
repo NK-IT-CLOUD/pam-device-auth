@@ -209,12 +209,14 @@ func TestSetup_NoForcePasswd(t *testing.T) {
 	}
 }
 
-func TestSetup_ForcePasswdIgnored(t *testing.T) {
+func TestSetup_ForcePasswdUnlocksAccount(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG sudo testuser":        {{exitCode: 0}},
+			"passwd -d testuser":               {{exitCode: 0}},
+			"chown testuser:testuser /home/testuser/.bash_profile": {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -227,11 +229,14 @@ func TestSetup_ForcePasswdIgnored(t *testing.T) {
 		t.Fatal("Setup() should return created=true for new user")
 	}
 
-	// forcePasswd=true should be ignored — no passwd/chage/chpasswd calls
+	hasPasswdD := false
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
-			t.Fatalf("passwd/chage/chpasswd should not be called even with forcePasswd=true, calls = %v", mock.calls)
+		if call == "passwd -d testuser" {
+			hasPasswdD = true
 		}
+	}
+	if !hasPasswdD {
+		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
 	}
 }
 

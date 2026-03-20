@@ -158,7 +158,6 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		}
 		if created {
 			fmt.Printf("User %s created. Please reconnect.\n", sshUser)
-			fmt.Println("Run 'passwd' after login to set your sudo password.")
 			log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
 			return true
 		}
@@ -252,7 +251,6 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		}
 		if created {
 			fmt.Printf("Login successful! User %s created.\n", sshUser)
-			fmt.Println("Run 'passwd' after login to set your sudo password.")
 			fmt.Println("Disconnecting — please reconnect.")
 		} else {
 			fmt.Println("Login successful!")
