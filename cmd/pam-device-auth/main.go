@@ -180,14 +180,17 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 
 	// Print to stdout — PAM pipes to SSH terminal
 	fmt.Println("────────────────────────────────────")
-	fmt.Printf("Open:  %s\n", dc.VerificationURI)
-	fmt.Printf("Code:  %s\n", dc.UserCode)
 	if dc.VerificationURIComplete != "" {
+		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
+		fmt.Printf("Code:  %s\n", dc.UserCode)
 		fmt.Println()
 		qrStr, err := qr.Render(dc.VerificationURIComplete)
 		if err == nil {
 			fmt.Print(qrStr)
 		}
+	} else {
+		fmt.Printf("Open:  %s\n", dc.VerificationURI)
+		fmt.Printf("Code:  %s\n", dc.UserCode)
 	}
 	fmt.Println("────────────────────────────────────")
 
