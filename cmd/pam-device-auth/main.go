@@ -12,6 +12,7 @@ import (
 	"github.com/nk-dev/pam-device-auth/internal/device"
 	"github.com/nk-dev/pam-device-auth/internal/discovery"
 	"github.com/nk-dev/pam-device-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/qr"
 	"github.com/nk-dev/pam-device-auth/internal/token"
 	"github.com/nk-dev/pam-device-auth/internal/user"
 )
@@ -179,10 +180,14 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 
 	// Print to stdout — PAM pipes to SSH terminal
 	fmt.Println("────────────────────────────────────")
-	fmt.Printf("Login: %s\n", dc.VerificationURI)
+	fmt.Printf("Open:  %s\n", dc.VerificationURI)
 	fmt.Printf("Code:  %s\n", dc.UserCode)
 	if dc.VerificationURIComplete != "" {
-		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
+		fmt.Println()
+		qrStr, err := qr.Render(dc.VerificationURIComplete)
+		if err == nil {
+			fmt.Print(qrStr)
+		}
 	}
 	fmt.Println("────────────────────────────────────")
 
