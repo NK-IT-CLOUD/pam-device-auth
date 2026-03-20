@@ -76,11 +76,26 @@ Config file: `/etc/pam-device-auth/config.json`
 | `issuer_url` | Yes | -- | OIDC issuer URL (used for discovery) |
 | `client_id` | Yes | -- | OAuth2 client ID (public client, no secret) |
 | `required_role` | Yes | -- | Role claim value required for SSH access |
-| `role_claim` | No | `realm_access.roles` | JSON path to extract roles from the ID token |
+| `sudo_role` | No | -- | Role that grants admin group membership (see below) |
+| `role_claim` | No | `realm_access.roles` | JWT claim key to extract roles from |
 | `auth_timeout` | No | `180` | Device flow timeout in seconds (30--600) |
 | `create_user` | No | `true` | Create local Linux user on first login |
-| `user_groups` | No | `["sudo"]` | Groups to add new users to |
-| `force_password_change` | No | `true` | Force password change on first login (for sudo) |
+| `user_groups` | No | `["sudo"]` | Groups for normal users |
+| `admin_groups` | No | -- | Groups for users with `sudo_role` (overrides `user_groups`) |
+| `force_password_change` | No | `true` | Force password change on first login |
+
+### Role-based group assignment
+
+When `sudo_role` is configured, users are assigned to different groups based on their OIDC roles:
+
+| User has... | Groups assigned | Sudo? |
+|---|---|---|
+| `required_role` only | `user_groups` | No |
+| `required_role` + `sudo_role` | `admin_groups` | Yes |
+| Loses `sudo_role` | Demoted to `user_groups`, removed from admin-only groups | No |
+| Loses `required_role` | SSH access denied | -- |
+
+When `sudo_role` is not set, all users get `user_groups` (backward compatible).
 
 ### Environment variable overrides
 
@@ -91,6 +106,7 @@ Every config field can be overridden via environment variables:
 | `PAM_DEVICE_AUTH_ISSUER` | `issuer_url` |
 | `PAM_DEVICE_AUTH_CLIENT_ID` | `client_id` |
 | `PAM_DEVICE_AUTH_REQUIRED_ROLE` | `required_role` |
+| `PAM_DEVICE_AUTH_SUDO_ROLE` | `sudo_role` |
 | `PAM_DEVICE_AUTH_ROLE_CLAIM` | `role_claim` |
 | `PAM_DEVICE_AUTH_TIMEOUT` | `auth_timeout` |
 

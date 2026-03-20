@@ -13,6 +13,8 @@ First public release. Generic OIDC Device Authorization Grant for SSH PAM authen
 - Custom role claim extraction via `role_claim` config
 - Refresh token caching in tmpfs for fast repeat logins (~200ms)
 - Automatic user creation with configurable group membership
+- Role-based group assignment: `sudo_role` + `admin_groups` for admin/user separation
+- Automatic demotion: revoking `sudo_role` removes admin groups on next login
 - Forced password change on first login for sudo security
 - JWT signature verification via JWKS (RSA + ECDSA)
 - Debian package with zero-config install
