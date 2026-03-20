@@ -150,15 +150,18 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 	}
 
 	if cfg.CreateUser {
-		// Determine admin status based on sudo_role
 		isAdmin := cfg.SudoRole == "" || token.HasRole(result.Roles, cfg.SudoRole)
-		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
+		created, tempPwd, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
 		if err != nil {
 			log.Error("User setup failed: %v", err)
 			return false
 		}
 		if created {
 			fmt.Printf("User %s created. Please reconnect.\n", sshUser)
+			if tempPwd != "" {
+				fmt.Printf("Temporary password: %s\n", tempPwd)
+				fmt.Println("You will be asked to change it on next login.")
+			}
 			log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
 			return true
 		}
@@ -244,15 +247,18 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	}
 
 	if cfg.CreateUser {
-		// Determine admin status based on sudo_role
 		isAdmin := cfg.SudoRole == "" || token.HasRole(result.Roles, cfg.SudoRole)
-		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
+		created, tempPwd, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
 		if err != nil {
 			log.Error("User setup failed: %v", err)
 			os.Exit(1)
 		}
 		if created {
 			fmt.Printf("Login successful! User %s created.\n", sshUser)
+			if tempPwd != "" {
+				fmt.Printf("Temporary password: %s\n", tempPwd)
+				fmt.Println("You will be asked to change it on next login.")
+			}
 			fmt.Println("Disconnecting — please reconnect.")
 		} else {
 			fmt.Println("Login successful!")

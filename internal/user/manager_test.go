@@ -32,6 +32,19 @@ func (m *mockExecutor) Run(name string, args ...string) ([]byte, int, error) {
 	return result.out, result.exitCode, result.err
 }
 
+func (m *mockExecutor) RunWithStdin(name string, stdin string, args ...string) ([]byte, int, error) {
+	call := strings.Join(append([]string{name}, args...), " ")
+	m.calls = append(m.calls, call)
+
+	if len(m.results[call]) == 0 {
+		return nil, 0, nil
+	}
+
+	result := m.results[call][0]
+	m.results[call] = m.results[call][1:]
+	return result.out, result.exitCode, result.err
+}
+
 func testLogger(t *testing.T) *logger.Logger {
 	t.Helper()
 
@@ -78,7 +91,7 @@ func TestSetupExistingUser(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -108,7 +121,7 @@ func TestSetupCreatesUser(t *testing.T) {
 
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -147,7 +160,7 @@ func TestSetupUserAddFailure(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	_, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	_, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err == nil {
 		t.Fatal("Setup() should fail when useradd fails")
 	}
@@ -168,7 +181,7 @@ func TestSetup_CustomGroups(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"docker", "adm"}, nil, true, true, testLogger(t))
+	created, _, err := Setup("testuser", []string{"docker", "adm"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -204,7 +217,7 @@ func TestSetup_NoForcePasswd(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"sudo"}, nil, true, false, testLogger(t))
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, false, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -230,7 +243,7 @@ func TestSetup_ForcePasswd(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -258,7 +271,7 @@ func TestSetup_ExistingUser_NoChage(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -287,7 +300,7 @@ func TestSetup_AdminUser(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("newuser", []string{"users"}, []string{"sudo", "users"}, true, true, testLogger(t))
+	created, _, err := Setup("newuser", []string{"users"}, []string{"sudo", "users"}, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -332,7 +345,7 @@ func TestSetup_NormalUser(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("newuser", []string{"users"}, []string{"sudo", "users"}, false, true, testLogger(t))
+	created, _, err := Setup("newuser", []string{"users"}, []string{"sudo", "users"}, false, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -374,7 +387,7 @@ func TestSetup_Demotion(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("existuser", []string{"users"}, []string{"sudo", "users"}, false, true, testLogger(t))
+	created, _, err := Setup("existuser", []string{"users"}, []string{"sudo", "users"}, false, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
@@ -420,7 +433,7 @@ func TestSetup_NoSudoRole(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	created, err := Setup("testuser", []string{"users"}, nil, true, true, testLogger(t))
+	created, _, err := Setup("testuser", []string{"users"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
