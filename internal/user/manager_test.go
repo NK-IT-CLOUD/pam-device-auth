@@ -91,9 +91,6 @@ func TestSetupExistingUser(t *testing.T) {
 		if strings.HasPrefix(call, "useradd ") {
 			t.Fatalf("useradd should not be called for existing users, calls = %v", mock.calls)
 		}
-		if strings.HasPrefix(call, "passwd -d ") {
-			t.Fatalf("passwd -d should not be called for existing users, calls = %v", mock.calls)
-		}
 	}
 }
 
@@ -103,7 +100,6 @@ func TestSetupCreatesUser(t *testing.T) {
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG sudo testuser":        {{exitCode: 0}},
-			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 
@@ -118,20 +114,13 @@ func TestSetupCreatesUser(t *testing.T) {
 	}
 
 	hasUseradd := false
-	hasChage := false
 	for _, call := range mock.calls {
 		if call == "useradd -m -s /bin/bash testuser" {
 			hasUseradd = true
 		}
-		if call == "passwd -d testuser" {
-			hasChage = true
-		}
 	}
 	if !hasUseradd {
 		t.Fatalf("useradd should be called for new user, calls = %v", mock.calls)
-	}
-	if !hasChage {
-		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
 	}
 }
 
@@ -164,7 +153,6 @@ func TestSetup_CustomGroups(t *testing.T) {
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG docker testuser":      {{exitCode: 0}},
 			"usermod -aG adm testuser":         {{exitCode: 0}},
-			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -213,20 +201,20 @@ func TestSetup_NoForcePasswd(t *testing.T) {
 		t.Fatal("Setup() should return created=true for new user")
 	}
 
+	// No passwd/chage calls should be made (forcePasswd is ignored)
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "passwd -d ") {
-			t.Fatalf("passwd -d should not be called when forcePasswd=false, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called, calls = %v", mock.calls)
 		}
 	}
 }
 
-func TestSetup_ForcePasswd(t *testing.T) {
+func TestSetup_ForcePasswdIgnored(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG sudo testuser":        {{exitCode: 0}},
-			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -239,18 +227,15 @@ func TestSetup_ForcePasswd(t *testing.T) {
 		t.Fatal("Setup() should return created=true for new user")
 	}
 
-	hasChage := false
+	// forcePasswd=true should be ignored — no passwd/chage/chpasswd calls
 	for _, call := range mock.calls {
-		if call == "passwd -d testuser" {
-			hasChage = true
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called even with forcePasswd=true, calls = %v", mock.calls)
 		}
-	}
-	if !hasChage {
-		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
 	}
 }
 
-func TestSetup_ExistingUser_NoChage(t *testing.T) {
+func TestSetup_ExistingUser_NoPasswdCalls(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser":    {{exitCode: 0}},
@@ -267,9 +252,10 @@ func TestSetup_ExistingUser_NoChage(t *testing.T) {
 		t.Fatal("Setup() should return created=false for existing user")
 	}
 
+	// No passwd/chage calls for existing users
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "passwd -d ") {
-			t.Fatalf("passwd -d should not be called for existing user even with forcePasswd=true, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called for existing users, calls = %v", mock.calls)
 		}
 	}
 }
@@ -283,7 +269,6 @@ func TestSetup_AdminUser(t *testing.T) {
 			"useradd -m -s /bin/bash newuser": {{exitCode: 0}},
 			"usermod -aG sudo newuser":        {{exitCode: 0}},
 			"usermod -aG users newuser":       {{exitCode: 0}},
-			"passwd -d newuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -298,7 +283,6 @@ func TestSetup_AdminUser(t *testing.T) {
 
 	hasSudo := false
 	hasUsers := false
-	hasChage := false
 	for _, call := range mock.calls {
 		if call == "usermod -aG sudo newuser" {
 			hasSudo = true
@@ -306,18 +290,12 @@ func TestSetup_AdminUser(t *testing.T) {
 		if call == "usermod -aG users newuser" {
 			hasUsers = true
 		}
-		if call == "passwd -d newuser" {
-			hasChage = true
-		}
 	}
 	if !hasSudo {
 		t.Fatalf("admin user should be added to sudo group, calls = %v", mock.calls)
 	}
 	if !hasUsers {
 		t.Fatalf("admin user should be added to users group, calls = %v", mock.calls)
-	}
-	if !hasChage {
-		t.Fatalf("passwd -d should be called for new user, calls = %v", mock.calls)
 	}
 }
 
@@ -328,7 +306,6 @@ func TestSetup_NormalUser(t *testing.T) {
 			"useradd -m -s /bin/bash newuser": {{exitCode: 0}},
 			"usermod -aG users newuser":       {{exitCode: 0}},
 			"gpasswd -d newuser sudo":         {{exitCode: 0}},
-			"passwd -d newuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -400,10 +377,10 @@ func TestSetup_Demotion(t *testing.T) {
 		t.Fatalf("demoted user should be removed from sudo group, calls = %v", mock.calls)
 	}
 
-	// Ensure no chage for existing user
+	// Ensure no passwd/chage calls for existing user
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "passwd -d ") {
-			t.Fatalf("passwd -d should not be called for existing user, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd ") || strings.HasPrefix(call, "chage ") || strings.Contains(call, "chpasswd") {
+			t.Fatalf("passwd/chage/chpasswd should not be called for demotion, calls = %v", mock.calls)
 		}
 	}
 }
@@ -416,7 +393,6 @@ func TestSetup_NoSudoRole(t *testing.T) {
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG users testuser":       {{exitCode: 0}},
-			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
