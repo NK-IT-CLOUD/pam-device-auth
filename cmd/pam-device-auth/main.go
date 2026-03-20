@@ -121,12 +121,20 @@ func runEnable() {
 	fmt.Println("PAM config activated")
 
 	// Restart sshd
+	sshRestarted := false
 	cmd := exec.Command("systemctl", "restart", "ssh.service")
 	if err := cmd.Run(); err != nil {
 		cmd2 := exec.Command("systemctl", "restart", "sshd.service")
 		if err := cmd2.Run(); err != nil {
-			fmt.Println("WARNING: Could not restart SSH. Manual restart may be needed.")
+			fmt.Println("WARNING: Could not restart SSH. Run: sudo systemctl restart ssh")
+		} else {
+			sshRestarted = true
 		}
+	} else {
+		sshRestarted = true
+	}
+	if sshRestarted {
+		fmt.Println("SSH service restarted")
 	}
 
 	fmt.Println("\npam-device-auth is now active.")
