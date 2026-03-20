@@ -11,14 +11,22 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.AuthTimeout != 180 {
 		t.Errorf("default AuthTimeout = %d, want 180", cfg.AuthTimeout)
 	}
+	if cfg.CreateUser != true {
+		t.Errorf("default CreateUser = %v, want true", cfg.CreateUser)
+	}
+	if len(cfg.UserGroups) != 1 || cfg.UserGroups[0] != "sudo" {
+		t.Errorf("default UserGroups = %v, want [sudo]", cfg.UserGroups)
+	}
+	if cfg.ForcePasswordChange != true {
+		t.Errorf("default ForcePasswordChange = %v, want true", cfg.ForcePasswordChange)
+	}
 }
 
 func TestLoadValidConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	os.WriteFile(path, []byte(`{
-		"keycloak_url": "https://sso.example.com",
-		"realm": "test",
+		"issuer_url": "https://sso.example.com/realms/test",
 		"client_id": "ssh-server",
 		"required_role": "ssh-access"
 	}`), 0644)
@@ -27,11 +35,8 @@ func TestLoadValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if cfg.KeycloakURL != "https://sso.example.com" {
-		t.Errorf("KeycloakURL = %q", cfg.KeycloakURL)
-	}
-	if cfg.Realm != "test" {
-		t.Errorf("Realm = %q", cfg.Realm)
+	if cfg.IssuerURL != "https://sso.example.com/realms/test" {
+		t.Errorf("IssuerURL = %q", cfg.IssuerURL)
 	}
 	if cfg.ClientID != "ssh-server" {
 		t.Errorf("ClientID = %q", cfg.ClientID)
@@ -48,8 +53,7 @@ func TestLoadWithAuthTimeout(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	os.WriteFile(path, []byte(`{
-		"keycloak_url": "https://sso.example.com",
-		"realm": "test",
+		"issuer_url": "https://sso.example.com/realms/test",
 		"client_id": "ssh-server",
 		"required_role": "ssh-access",
 		"auth_timeout": 300
@@ -64,15 +68,103 @@ func TestLoadWithAuthTimeout(t *testing.T) {
 	}
 }
 
+func TestLoadRoleClaim(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access",
+		"role_claim": "resource_access.ssh.roles"
+	}`), 0644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.RoleClaim != "resource_access.ssh.roles" {
+		t.Errorf("RoleClaim = %q, want resource_access.ssh.roles", cfg.RoleClaim)
+	}
+}
+
+func TestTrailingSlashStripped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test/",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access"
+	}`), 0644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.IssuerURL != "https://sso.example.com/realms/test" {
+		t.Errorf("IssuerURL = %q, trailing slash should be stripped", cfg.IssuerURL)
+	}
+}
+
+func TestDefaultUserManagementFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	// Minimal config — user management fields should get defaults
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access"
+	}`), 0644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.CreateUser != true {
+		t.Errorf("CreateUser = %v, want true (default)", cfg.CreateUser)
+	}
+	if len(cfg.UserGroups) != 1 || cfg.UserGroups[0] != "sudo" {
+		t.Errorf("UserGroups = %v, want [sudo] (default)", cfg.UserGroups)
+	}
+	if cfg.ForcePasswordChange != true {
+		t.Errorf("ForcePasswordChange = %v, want true (default)", cfg.ForcePasswordChange)
+	}
+}
+
+func TestUserManagementFieldsOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access",
+		"create_user": false,
+		"user_groups": ["wheel", "docker"],
+		"force_password_change": false
+	}`), 0644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.CreateUser != false {
+		t.Errorf("CreateUser = %v, want false", cfg.CreateUser)
+	}
+	if len(cfg.UserGroups) != 2 || cfg.UserGroups[0] != "wheel" || cfg.UserGroups[1] != "docker" {
+		t.Errorf("UserGroups = %v, want [wheel docker]", cfg.UserGroups)
+	}
+	if cfg.ForcePasswordChange != false {
+		t.Errorf("ForcePasswordChange = %v, want false", cfg.ForcePasswordChange)
+	}
+}
+
 func TestValidateMissingFields(t *testing.T) {
 	tests := []struct {
 		name string
 		cfg  Config
 	}{
-		{"missing keycloak_url", Config{Realm: "r", ClientID: "c", RequiredRole: "r", AuthTimeout: 180}},
-		{"missing realm", Config{KeycloakURL: "https://x", ClientID: "c", RequiredRole: "r", AuthTimeout: 180}},
-		{"missing client_id", Config{KeycloakURL: "https://x", Realm: "r", RequiredRole: "r", AuthTimeout: 180}},
-		{"missing required_role", Config{KeycloakURL: "https://x", Realm: "r", ClientID: "c", AuthTimeout: 180}},
+		{"missing issuer_url", Config{ClientID: "c", RequiredRole: "r", AuthTimeout: 180}},
+		{"missing client_id", Config{IssuerURL: "https://x", RequiredRole: "r", AuthTimeout: 180}},
+		{"missing required_role", Config{IssuerURL: "https://x", ClientID: "c", AuthTimeout: 180}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -83,10 +175,17 @@ func TestValidateMissingFields(t *testing.T) {
 	}
 }
 
+func TestValidateErrorMessages(t *testing.T) {
+	cfg := Config{AuthTimeout: 180}
+	err := cfg.Validate()
+	if err == nil || err.Error() != "issuer_url is required" {
+		t.Errorf("expected 'issuer_url is required', got %v", err)
+	}
+}
+
 func TestValidateTimeoutRange(t *testing.T) {
 	base := Config{
-		KeycloakURL:  "https://sso.example.com",
-		Realm:        "test",
+		IssuerURL:    "https://sso.example.com/realms/test",
 		ClientID:     "ssh-server",
 		RequiredRole: "ssh-access",
 	}
@@ -116,34 +215,28 @@ func TestEnvOverrides(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	os.WriteFile(path, []byte(`{
-		"keycloak_url": "https://original.com",
-		"realm": "original",
+		"issuer_url": "https://original.com/realms/test",
 		"client_id": "original",
 		"required_role": "original"
 	}`), 0644)
 
-	os.Setenv("KEYCLOAK_URL", "https://override.com")
-	os.Setenv("KEYCLOAK_REALM", "override-realm")
-	os.Setenv("KEYCLOAK_CLIENT_ID", "override-client")
-	os.Setenv("KEYCLOAK_REQUIRED_ROLE", "override-role")
-	os.Setenv("KEYCLOAK_AUTH_TIMEOUT", "60")
+	os.Setenv("PAM_DEVICE_AUTH_ISSUER", "https://override.com/realms/prod")
+	os.Setenv("PAM_DEVICE_AUTH_CLIENT_ID", "override-client")
+	os.Setenv("PAM_DEVICE_AUTH_REQUIRED_ROLE", "override-role")
+	os.Setenv("PAM_DEVICE_AUTH_TIMEOUT", "60")
 	defer func() {
-		os.Unsetenv("KEYCLOAK_URL")
-		os.Unsetenv("KEYCLOAK_REALM")
-		os.Unsetenv("KEYCLOAK_CLIENT_ID")
-		os.Unsetenv("KEYCLOAK_REQUIRED_ROLE")
-		os.Unsetenv("KEYCLOAK_AUTH_TIMEOUT")
+		os.Unsetenv("PAM_DEVICE_AUTH_ISSUER")
+		os.Unsetenv("PAM_DEVICE_AUTH_CLIENT_ID")
+		os.Unsetenv("PAM_DEVICE_AUTH_REQUIRED_ROLE")
+		os.Unsetenv("PAM_DEVICE_AUTH_TIMEOUT")
 	}()
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if cfg.KeycloakURL != "https://override.com" {
-		t.Errorf("KeycloakURL = %q, want override", cfg.KeycloakURL)
-	}
-	if cfg.Realm != "override-realm" {
-		t.Errorf("Realm = %q", cfg.Realm)
+	if cfg.IssuerURL != "https://override.com/realms/prod" {
+		t.Errorf("IssuerURL = %q, want override", cfg.IssuerURL)
 	}
 	if cfg.ClientID != "override-client" {
 		t.Errorf("ClientID = %q", cfg.ClientID)
@@ -153,6 +246,27 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if cfg.AuthTimeout != 60 {
 		t.Errorf("AuthTimeout = %d, want 60", cfg.AuthTimeout)
+	}
+}
+
+func TestEnvOverrideRoleClaim(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access"
+	}`), 0644)
+
+	os.Setenv("PAM_DEVICE_AUTH_ROLE_CLAIM", "realm_access.roles")
+	defer os.Unsetenv("PAM_DEVICE_AUTH_ROLE_CLAIM")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.RoleClaim != "realm_access.roles" {
+		t.Errorf("RoleClaim = %q, want realm_access.roles", cfg.RoleClaim)
 	}
 }
 
