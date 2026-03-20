@@ -1,13 +1,10 @@
 package user
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
-	"strings"
 
 	"github.com/nk-dev/pam-device-auth/internal/logger"
 )
@@ -17,7 +14,6 @@ var executor commandExecutor = systemCommandExecutor{}
 
 type commandExecutor interface {
 	Run(name string, args ...string) ([]byte, int, error)
-	RunWithStdin(name string, stdin string, args ...string) ([]byte, int, error)
 }
 
 type systemCommandExecutor struct{}
@@ -34,18 +30,6 @@ func (systemCommandExecutor) Run(name string, args ...string) ([]byte, int, erro
 	return out, -1, err
 }
 
-func (systemCommandExecutor) RunWithStdin(name string, stdin string, args ...string) ([]byte, int, error) {
-	cmd := exec.Command(findBin(name), args...)
-	cmd.Stdin = strings.NewReader(stdin)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return out, 0, nil
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		return out, exitErr.ExitCode(), err
-	}
-	return out, -1, err
-}
 
 func findBin(name string) string {
 	for _, dir := range []string{"/usr/bin", "/usr/sbin", "/bin", "/sbin"} {
@@ -106,38 +90,14 @@ func Setup(username string, userGroups, adminGroups []string, isAdmin bool, forc
 		}
 	}
 
-	// Set temporary password + force change on first login
-	var tempPassword string
+	// Unlock account so user can set password via 'passwd' command
 	if created && forcePasswd {
-		tempPassword, err = setTempPassword(username, log)
-		if err != nil {
-			log.Warn("Failed to set temp password: %v", err)
+		if out, _, err := executor.Run("passwd", "-d", username); err != nil {
+			log.Warn("Failed to unlock account: %s", string(out))
 		}
 	}
 
-	return created, tempPassword, nil
-}
-
-// setTempPassword generates a random password, sets it via chpasswd, and expires it.
-func setTempPassword(username string, log *logger.Logger) (string, error) {
-	b := make([]byte, 12)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("generate random password: %w", err)
-	}
-	tempPwd := base64.RawURLEncoding.EncodeToString(b)[:16]
-
-	// Set password via chpasswd
-	input := fmt.Sprintf("%s:%s", username, tempPwd)
-	if out, _, err := executor.RunWithStdin("chpasswd", input); err != nil {
-		return "", fmt.Errorf("chpasswd failed: %s: %w", string(out), err)
-	}
-
-	// Force password change on next login
-	if out, _, err := executor.Run("chage", "-d", "0", username); err != nil {
-		log.Warn("chage failed: %s", string(out))
-	}
-
-	return tempPwd, nil
+	return created, "", nil
 }
 
 // groupDiff returns elements in a that are NOT in b.

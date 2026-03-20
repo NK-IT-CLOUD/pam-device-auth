@@ -32,18 +32,6 @@ func (m *mockExecutor) Run(name string, args ...string) ([]byte, int, error) {
 	return result.out, result.exitCode, result.err
 }
 
-func (m *mockExecutor) RunWithStdin(name string, stdin string, args ...string) ([]byte, int, error) {
-	call := strings.Join(append([]string{name}, args...), " ")
-	m.calls = append(m.calls, call)
-
-	if len(m.results[call]) == 0 {
-		return nil, 0, nil
-	}
-
-	result := m.results[call][0]
-	m.results[call] = m.results[call][1:]
-	return result.out, result.exitCode, result.err
-}
 
 func testLogger(t *testing.T) *logger.Logger {
 	t.Helper()
@@ -103,8 +91,8 @@ func TestSetupExistingUser(t *testing.T) {
 		if strings.HasPrefix(call, "useradd ") {
 			t.Fatalf("useradd should not be called for existing users, calls = %v", mock.calls)
 		}
-		if strings.HasPrefix(call, "chage ") {
-			t.Fatalf("chage should not be called for existing users, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd -d ") {
+			t.Fatalf("passwd -d should not be called for existing users, calls = %v", mock.calls)
 		}
 	}
 }
@@ -115,7 +103,7 @@ func TestSetupCreatesUser(t *testing.T) {
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG sudo testuser":        {{exitCode: 0}},
-			"chage -d 0 testuser":              {{exitCode: 0}},
+			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 
@@ -135,7 +123,7 @@ func TestSetupCreatesUser(t *testing.T) {
 		if call == "useradd -m -s /bin/bash testuser" {
 			hasUseradd = true
 		}
-		if call == "chage -d 0 testuser" {
+		if call == "passwd -d testuser" {
 			hasChage = true
 		}
 	}
@@ -143,7 +131,7 @@ func TestSetupCreatesUser(t *testing.T) {
 		t.Fatalf("useradd should be called for new user, calls = %v", mock.calls)
 	}
 	if !hasChage {
-		t.Fatalf("chage should be called for new user with forcePasswd=true, calls = %v", mock.calls)
+		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
 	}
 }
 
@@ -176,7 +164,7 @@ func TestSetup_CustomGroups(t *testing.T) {
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG docker testuser":      {{exitCode: 0}},
 			"usermod -aG adm testuser":         {{exitCode: 0}},
-			"chage -d 0 testuser":              {{exitCode: 0}},
+			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -226,8 +214,8 @@ func TestSetup_NoForcePasswd(t *testing.T) {
 	}
 
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "chage ") {
-			t.Fatalf("chage should not be called when forcePasswd=false, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd -d ") {
+			t.Fatalf("passwd -d should not be called when forcePasswd=false, calls = %v", mock.calls)
 		}
 	}
 }
@@ -238,7 +226,7 @@ func TestSetup_ForcePasswd(t *testing.T) {
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG sudo testuser":        {{exitCode: 0}},
-			"chage -d 0 testuser":              {{exitCode: 0}},
+			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -253,12 +241,12 @@ func TestSetup_ForcePasswd(t *testing.T) {
 
 	hasChage := false
 	for _, call := range mock.calls {
-		if call == "chage -d 0 testuser" {
+		if call == "passwd -d testuser" {
 			hasChage = true
 		}
 	}
 	if !hasChage {
-		t.Fatalf("chage -d 0 should be called for new user with forcePasswd=true, calls = %v", mock.calls)
+		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
 	}
 }
 
@@ -280,8 +268,8 @@ func TestSetup_ExistingUser_NoChage(t *testing.T) {
 	}
 
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "chage ") {
-			t.Fatalf("chage should not be called for existing user even with forcePasswd=true, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd -d ") {
+			t.Fatalf("passwd -d should not be called for existing user even with forcePasswd=true, calls = %v", mock.calls)
 		}
 	}
 }
@@ -295,7 +283,7 @@ func TestSetup_AdminUser(t *testing.T) {
 			"useradd -m -s /bin/bash newuser": {{exitCode: 0}},
 			"usermod -aG sudo newuser":        {{exitCode: 0}},
 			"usermod -aG users newuser":       {{exitCode: 0}},
-			"chage -d 0 newuser":              {{exitCode: 0}},
+			"passwd -d newuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -318,7 +306,7 @@ func TestSetup_AdminUser(t *testing.T) {
 		if call == "usermod -aG users newuser" {
 			hasUsers = true
 		}
-		if call == "chage -d 0 newuser" {
+		if call == "passwd -d newuser" {
 			hasChage = true
 		}
 	}
@@ -329,7 +317,7 @@ func TestSetup_AdminUser(t *testing.T) {
 		t.Fatalf("admin user should be added to users group, calls = %v", mock.calls)
 	}
 	if !hasChage {
-		t.Fatalf("chage should be called for new user, calls = %v", mock.calls)
+		t.Fatalf("passwd -d should be called for new user, calls = %v", mock.calls)
 	}
 }
 
@@ -340,7 +328,7 @@ func TestSetup_NormalUser(t *testing.T) {
 			"useradd -m -s /bin/bash newuser": {{exitCode: 0}},
 			"usermod -aG users newuser":       {{exitCode: 0}},
 			"gpasswd -d newuser sudo":         {{exitCode: 0}},
-			"chage -d 0 newuser":              {{exitCode: 0}},
+			"passwd -d newuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
@@ -414,8 +402,8 @@ func TestSetup_Demotion(t *testing.T) {
 
 	// Ensure no chage for existing user
 	for _, call := range mock.calls {
-		if strings.HasPrefix(call, "chage ") {
-			t.Fatalf("chage should not be called for existing user, calls = %v", mock.calls)
+		if strings.HasPrefix(call, "passwd -d ") {
+			t.Fatalf("passwd -d should not be called for existing user, calls = %v", mock.calls)
 		}
 	}
 }
@@ -428,7 +416,7 @@ func TestSetup_NoSudoRole(t *testing.T) {
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG users testuser":       {{exitCode: 0}},
-			"chage -d 0 testuser":              {{exitCode: 0}},
+			"passwd -d testuser":              {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
