@@ -65,7 +65,7 @@ func main() {
 
 	// OIDC Discovery (fail-fast if Keycloak unreachable)
 	discoveryCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	endpoints, err := discovery.Fetch(discoveryCtx, httpClient, cfg.KeycloakURL, cfg.Realm)
+	endpoints, err := discovery.Fetch(discoveryCtx, httpClient, cfg.IssuerURL)
 	cancel()
 	if err != nil {
 		log.Error("OIDC Discovery failed: %v", err)
@@ -119,7 +119,7 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		return false
 	}
 
-	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID)
+	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID, cfg.RoleClaim)
 	if err != nil {
 		log.Info("Token validation failed after refresh: %v", err)
 		cache.Delete(sshUser)
@@ -206,7 +206,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		os.Exit(1)
 	}
 
-	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID)
+	result, err := token.Validate(tokenResp.AccessToken, keys, endpoints.Issuer, cfg.ClientID, cfg.RoleClaim)
 	if err != nil {
 		log.Error("Token validation failed: %v", err)
 		os.Exit(1)

@@ -22,7 +22,7 @@ type TokenResult struct {
 
 // Validate verifies a JWT access token and extracts claims.
 // clientID is enforced against azp or aud and used for role extraction from resource_access.
-func Validate(accessToken string, keys map[string]crypto.PublicKey, issuer, clientID string) (*TokenResult, error) {
+func Validate(accessToken string, keys map[string]crypto.PublicKey, issuer, clientID, roleClaim string) (*TokenResult, error) {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid JWT: expected 3 parts, got %d", len(parts))
@@ -97,7 +97,7 @@ func Validate(accessToken string, keys map[string]crypto.PublicKey, issuer, clie
 		Username: getStringClaim(claims, "preferred_username"),
 		Email:    getStringClaim(claims, "email"),
 		Name:     getStringClaim(claims, "name"),
-		Roles:    ExtractRoles(claims, clientID),
+		Roles:    ExtractRoles(claims, clientID, roleClaim),
 	}
 
 	if result.Username == "" {
