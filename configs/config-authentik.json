@@ -1,0 +1,6 @@
+{
+    "issuer_url": "https://auth.example.com/application/o/ssh-server",
+    "client_id": "ssh-server",
+    "required_role": "ssh-access",
+    "role_claim": "groups"
+}

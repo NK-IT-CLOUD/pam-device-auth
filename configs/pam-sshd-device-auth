@@ -1,8 +1,6 @@
 # PAM configuration for the Secure Shell service
-# Keycloak SSO Authentication
-# Review this template before first install if the host already uses
-# custom PAM modules for sshd.
-auth       required     pam_keycloak.so
+# OIDC Device Authorization Grant Authentication
+auth       required     pam_device_auth.so
 auth       required     pam_env.so
 account    required     pam_nologin.so
 @include common-account
