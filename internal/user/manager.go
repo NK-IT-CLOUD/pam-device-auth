@@ -107,13 +107,13 @@ const passwordPromptScript = `# pam-device-auth: force local password setup on f
 if [ ! -f "$HOME/.password_set" ]; then
     echo ""
     echo "========================================"
-    echo "  Please set a local password for sudo."
+    echo "  Please set your local password."
     echo "========================================"
     echo ""
     if passwd; then
         touch "$HOME/.password_set"
         echo ""
-        echo "Password set. You can now use sudo."
+        echo "Password set successfully."
     else
         echo "Password not set. You will be asked again on next login."
         exit 1
