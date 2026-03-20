@@ -10,7 +10,7 @@ import (
 
 // CacheDir is the directory for cached sessions.
 // Exported as a variable so tests can override it.
-var CacheDir = "/run/keycloak-ssh-auth"
+var CacheDir = "/run/pam-device-auth"
 
 var validUsername = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
