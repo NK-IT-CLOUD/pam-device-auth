@@ -87,23 +87,16 @@ case "$1" in
         setup_logrotate
         setup_tmpfiles
 
-        # --- Configs: install on first setup, preserve on upgrade ---
-
+        # Install sshd config (for Match User root)
         if [ ! -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf ]; then
             cp "${SHARE_DIR}/config/10-pam-device-auth.conf" /etc/ssh/sshd_config.d/
             log "Installed SSH config"
         fi
 
-        if [ ! -f /etc/pam.d/sshd.original ]; then
-            [ -f /etc/pam.d/sshd ] && cp /etc/pam.d/sshd /etc/pam.d/sshd.original
-            cp "${SHARE_DIR}/config/pam-sshd-device-auth" /etc/pam.d/sshd
-            log "Installed PAM config (original backed up)"
-            log "WARNING: Review /etc/pam.d/sshd if this host uses a custom PAM stack"
-        fi
-
+        # Install default config template (does NOT activate PAM)
         if [ ! -f "${CONFIG_FILE}" ]; then
             cp "${SHARE_DIR}/config/config.json" "${CONFIG_FILE}"
-            log "Installed default config"
+            log "Installed default config template"
         fi
 
         # --- Permissions ---
@@ -113,8 +106,21 @@ case "$1" in
         touch "${LOG_FILE}"
         chmod 644 "${LOG_FILE}"
 
-        restart_ssh
-        log "${PKG} ${PKG_VERSION} configured successfully."
+        # Check if PAM is already activated (upgrade scenario)
+        if [ -f /etc/pam.d/sshd.original ]; then
+            # PAM was previously activated — restart sshd for binary update
+            restart_ssh
+            log "${PKG} ${PKG_VERSION} upgraded successfully."
+        else
+            # Fresh install — do NOT activate PAM automatically
+            log "${PKG} ${PKG_VERSION} installed."
+            log ""
+            log "Next steps:"
+            log "  1. Edit ${CONFIG_FILE} with your OIDC provider settings"
+            log "  2. Run: pam-device-auth --check"
+            log "  3. Run: sudo pam-device-auth --enable"
+            log ""
+        fi
         ;;
 esac
 

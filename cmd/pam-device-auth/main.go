@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/nk-dev/pam-device-auth/internal/cache"
@@ -24,6 +26,114 @@ const (
 	httpTimeout = 10 * time.Second
 )
 
+func runCheck() {
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: config error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Check for default/example config
+	if strings.Contains(cfg.IssuerURL, "example.com") {
+		fmt.Fprintf(os.Stderr, "FAIL: default config detected. Edit /etc/pam-device-auth/config.json first.\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Config OK: issuer=%s client=%s role=%s\n", cfg.IssuerURL, cfg.ClientID, cfg.RequiredRole)
+
+	// Test OIDC Discovery
+	httpClient := &http.Client{Timeout: httpTimeout}
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	defer cancel()
+	endpoints, err := discovery.Fetch(ctx, httpClient, cfg.IssuerURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: OIDC discovery failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("OIDC OK: issuer=%s\n", endpoints.Issuer)
+	fmt.Printf("  device_endpoint=%s\n", endpoints.DeviceAuthorizationEndpoint)
+	fmt.Printf("  token_endpoint=%s\n", endpoints.TokenEndpoint)
+	fmt.Printf("  jwks_uri=%s\n", endpoints.JwksURI)
+	fmt.Println("\nAll checks passed. Run 'pam-device-auth --enable' to activate.")
+}
+
+func runEnable() {
+	// Run check first
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: config error: %v\n", err)
+		os.Exit(1)
+	}
+	if strings.Contains(cfg.IssuerURL, "example.com") {
+		fmt.Fprintf(os.Stderr, "FAIL: default config detected. Edit /etc/pam-device-auth/config.json first.\n")
+		os.Exit(1)
+	}
+
+	// Test OIDC
+	httpClient := &http.Client{Timeout: httpTimeout}
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	defer cancel()
+	if _, err := discovery.Fetch(ctx, httpClient, cfg.IssuerURL); err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: OIDC discovery failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Activate PAM config
+	shareDir := "/usr/share/pam-device-auth/config"
+
+	// Install sshd config if not present
+	sshdConf := "/etc/ssh/sshd_config.d/10-pam-device-auth.conf"
+	if _, err := os.Stat(sshdConf); os.IsNotExist(err) {
+		src := shareDir + "/10-pam-device-auth.conf"
+		data, err := os.ReadFile(src)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAIL: cannot read %s: %v\n", src, err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(sshdConf, data, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "FAIL: cannot write %s: %v\n", sshdConf, err)
+			os.Exit(1)
+		}
+		fmt.Println("Installed SSH config")
+	}
+
+	// Install PAM config (backup original)
+	pamConf := "/etc/pam.d/sshd"
+	pamBackup := "/etc/pam.d/sshd.original"
+	pamSrc := shareDir + "/pam-sshd-device-auth"
+	if _, err := os.Stat(pamBackup); os.IsNotExist(err) {
+		// Backup current
+		if data, err := os.ReadFile(pamConf); err == nil {
+			os.WriteFile(pamBackup, data, 0644)
+			fmt.Println("Backed up original PAM config")
+		}
+	}
+	data, err := os.ReadFile(pamSrc)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: cannot read %s: %v\n", pamSrc, err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(pamConf, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: cannot write %s: %v\n", pamConf, err)
+		os.Exit(1)
+	}
+	fmt.Println("PAM config activated")
+
+	// Restart sshd
+	cmd := exec.Command("systemctl", "restart", "ssh.service")
+	if err := cmd.Run(); err != nil {
+		cmd2 := exec.Command("systemctl", "restart", "sshd.service")
+		if err := cmd2.Run(); err != nil {
+			fmt.Println("WARNING: Could not restart SSH. Manual restart may be needed.")
+		}
+	}
+
+	fmt.Println("\npam-device-auth is now active.")
+	fmt.Println("Root: SSH key only (no OIDC)")
+	fmt.Println("Other users: SSH key + OIDC Device Authorization")
+}
+
 func main() {
 	debug := false
 	for _, arg := range os.Args[1:] {
@@ -32,8 +142,19 @@ func main() {
 			fmt.Printf("pam-device-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--help]")
+			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--check] [--enable] [--help]")
 			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
+			fmt.Println("")
+			fmt.Println("  --check    Validate config and test OIDC connectivity")
+			fmt.Println("  --enable   Activate PAM authentication (runs --check first)")
+			fmt.Println("  --debug    Run with debug logging")
+			fmt.Println("  --version  Show version")
+			os.Exit(0)
+		case "--check":
+			runCheck()
+			os.Exit(0)
+		case "--enable":
+			runEnable()
 			os.Exit(0)
 		case "--debug":
 			debug = true
