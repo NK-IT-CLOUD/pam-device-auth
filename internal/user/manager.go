@@ -90,14 +90,49 @@ func Setup(username string, userGroups, adminGroups []string, isAdmin bool, forc
 		}
 	}
 
-	// Unlock account so user can set password via 'passwd' command
-	if created && forcePasswd {
-		if out, _, err := executor.Run("passwd", "-d", username); err != nil {
-			log.Warn("Failed to unlock account: %s", string(out))
+	// Force password setup on first shell login via .bash_profile
+	if created {
+		if err := installPasswordPrompt(username, log); err != nil {
+			log.Warn("Failed to install password prompt: %v", err)
 		}
 	}
 
 	return created, "", nil
+}
+
+const passwordPromptScript = `# pam-device-auth: force local password setup on first login
+if [ ! -f "$HOME/.password_set" ]; then
+    echo ""
+    echo "========================================"
+    echo "  Please set a local password for sudo."
+    echo "========================================"
+    echo ""
+    if passwd; then
+        touch "$HOME/.password_set"
+        echo ""
+        echo "Password set. You can now use sudo."
+    else
+        echo "Password not set. You will be asked again on next login."
+        exit 1
+    fi
+fi
+`
+
+func installPasswordPrompt(username string, log *logger.Logger) error {
+	homeDir := "/home/" + username
+	profilePath := homeDir + "/.bash_profile"
+
+	if err := os.WriteFile(profilePath, []byte(passwordPromptScript), 0644); err != nil {
+		return fmt.Errorf("write .bash_profile: %w", err)
+	}
+
+	// Ensure owned by user
+	if out, _, err := executor.Run("chown", username+":"+username, profilePath); err != nil {
+		return fmt.Errorf("chown .bash_profile: %s: %w", string(out), err)
+	}
+
+	log.Info("Password prompt installed for %s", username)
+	return nil
 }
 
 // groupDiff returns elements in a that are NOT in b.
