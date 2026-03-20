@@ -1,5 +1,4 @@
 # Binaries
-keycloak-auth
 pam-device-auth
 *.exe
 *.dll
@@ -37,6 +36,6 @@ Thumbs.db
 # Test artifacts
 test_results/
 
-# Config with secrets (keep template)
-**/keycloak-pam.json
-!configs/keycloak-pam.json
+# Config with secrets (keep examples in configs/)
+/config.json
+!/configs/config.json
