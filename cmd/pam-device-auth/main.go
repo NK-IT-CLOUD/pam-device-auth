@@ -16,10 +16,10 @@ import (
 	"github.com/nk-dev/pam-device-auth/internal/user"
 )
 
-var VERSION = "0.6.0"
+var VERSION = "1.0.0"
 
 const (
-	logFile     = "/var/log/keycloak-ssh-auth.log"
+	logFile     = "/var/log/pam-device-auth.log"
 	httpTimeout = 10 * time.Second
 )
 
@@ -28,11 +28,11 @@ func main() {
 	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "--version":
-			fmt.Printf("keycloak-auth %s\n", VERSION)
+			fmt.Printf("pam-device-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			fmt.Println("Usage: keycloak-auth [--debug] [--version] [--help]")
-			fmt.Println("  SSH authentication via Keycloak Device Authorization Grant")
+			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--help]")
+			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
 			os.Exit(0)
 		case "--debug":
 			debug = true
@@ -46,7 +46,7 @@ func main() {
 	}
 	defer log.Close()
 
-	log.Info("keycloak-auth %s starting", VERSION)
+	log.Info("pam-device-auth %s starting", VERSION)
 
 	cfg, err := config.Load("")
 	if err != nil {
@@ -63,7 +63,7 @@ func main() {
 
 	httpClient := &http.Client{Timeout: httpTimeout}
 
-	// OIDC Discovery (fail-fast if Keycloak unreachable)
+	// OIDC Discovery (fail-fast if OIDC provider unreachable)
 	discoveryCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	endpoints, err := discovery.Fetch(discoveryCtx, httpClient, cfg.IssuerURL)
 	cancel()
@@ -135,7 +135,7 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		log.Error("User %s lacks required role: %s", sshUser, cfg.RequiredRole)
 		cache.Delete(sshUser)
-		fmt.Println("Zugriff verweigert.")
+		fmt.Println("Access denied.")
 		return false
 	}
 
@@ -155,13 +155,13 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 			return false
 		}
 		if created {
-			fmt.Printf("User %s wurde erstellt. Bitte erneut anmelden.\n", sshUser)
+			fmt.Printf("User %s created. Please reconnect.\n", sshUser)
 			log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
 			return true
 		}
 	}
 
-	fmt.Println("SSO-Session aktiv.")
+	fmt.Println("SSO session active.")
 	return true
 }
 
@@ -195,7 +195,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	tokenResp, err := device.PollToken(ctx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, dc.DeviceCode, dc.Interval)
 	if err != nil {
 		log.Error("Token polling failed: %v", err)
-		fmt.Println("Anmeldung fehlgeschlagen.")
+		fmt.Println("Authentication failed.")
 		os.Exit(1)
 	}
 
@@ -220,7 +220,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		log.Error("User %s lacks required role: %s", sshUser, cfg.RequiredRole)
-		fmt.Println("Zugriff verweigert.")
+		fmt.Println("Access denied.")
 		os.Exit(1)
 	}
 
@@ -240,12 +240,12 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 			os.Exit(1)
 		}
 		if created {
-			fmt.Printf("Login erfolgreich! User %s wurde erstellt.\n", sshUser)
-			fmt.Println("Verbindung wird getrennt — bitte erneut anmelden.")
+			fmt.Printf("Login successful! User %s created.\n", sshUser)
+			fmt.Println("Disconnecting — please reconnect.")
 		} else {
-			fmt.Println("Login erfolgreich!")
+			fmt.Println("Login successful!")
 		}
 	} else {
-		fmt.Println("Login erfolgreich!")
+		fmt.Println("Login successful!")
 	}
 }
