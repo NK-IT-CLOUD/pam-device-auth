@@ -1,5 +1,6 @@
 # Binaries
 keycloak-auth
+pam-device-auth
 *.exe
 *.dll
 *.so
