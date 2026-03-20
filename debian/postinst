@@ -2,7 +2,7 @@
 set -e
 
 PKG="pam-device-auth"
-PKG_VERSION="1.0.0"
+PKG_VERSION=$(dpkg-query -W -f='${Version}' "$PKG" 2>/dev/null || echo "unknown")
 SHARE_DIR="/usr/share/${PKG}"
 CONFIG_DIR="/etc/${PKG}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
