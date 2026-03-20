@@ -68,6 +68,9 @@ case "$1" in
     configure)
         check_os
 
+        mkdir -p /etc/ssh/sshd_config.d
+        mkdir -p "${CONFIG_DIR}"
+
         # Migrate from keycloak-ssh-auth if present
         if [ -d /etc/keycloak-ssh-auth ]; then
             log "Migrating from keycloak-ssh-auth..."
@@ -83,9 +86,6 @@ case "$1" in
 
         setup_logrotate
         setup_tmpfiles
-
-        mkdir -p /etc/ssh/sshd_config.d
-        mkdir -p "${CONFIG_DIR}"
 
         # --- Configs: install on first setup, preserve on upgrade ---
 
