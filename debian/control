@@ -1,5 +1,5 @@
 Package: pam-device-auth
-Version: 1.0.0
+Version: 0.1.0
 Architecture: amd64
 Depends: libc6, openssh-server (>= 1:9.6p1)
 Conflicts: keycloak-ssh-auth
