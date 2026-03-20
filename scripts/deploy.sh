@@ -14,7 +14,7 @@ cd "$APP_DIR"
 
 VERSION=$(cat VERSION)
 DEB_FILE="build/packages/pam-device-auth_${VERSION}_amd64.deb"
-TARGET="kc-ssh-test"
+TARGET="pam-device-auth-test"
 BUILD=true
 DEPLOY=true
 
