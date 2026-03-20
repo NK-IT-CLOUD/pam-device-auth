@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-PKG="keycloak-ssh-auth"
+PKG="pam-device-auth"
 
 log() { echo "[${PKG}] $*"; }
 
@@ -18,7 +18,7 @@ case "$1" in
         log "Removing ${PKG}"
 
         # Remove SSH daemon config
-        rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf
+        rm -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf
 
         # Restore original PAM config
         if [ -f /etc/pam.d/sshd.original ]; then
@@ -38,7 +38,7 @@ case "$1" in
         log "Purging ${PKG}"
 
         # Remove SSH daemon config (if remove didn't run)
-        rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf
+        rm -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf
 
         # Restore original PAM config
         if [ -f /etc/pam.d/sshd.original ]; then
