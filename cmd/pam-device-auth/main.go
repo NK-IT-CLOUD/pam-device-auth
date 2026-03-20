@@ -148,16 +148,17 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		}
 	}
 
-	created, err := user.Setup(sshUser, log)
-	if err != nil {
-		log.Error("User setup failed: %v", err)
-		return false
-	}
-
-	if created {
-		fmt.Printf("User %s wurde erstellt. Bitte erneut anmelden.\n", sshUser)
-		log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
-		return true
+	if cfg.CreateUser {
+		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.ForcePasswordChange, log)
+		if err != nil {
+			log.Error("User setup failed: %v", err)
+			return false
+		}
+		if created {
+			fmt.Printf("User %s wurde erstellt. Bitte erneut anmelden.\n", sshUser)
+			log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
+			return true
+		}
 	}
 
 	fmt.Println("SSO-Session aktiv.")
@@ -232,15 +233,18 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		}
 	}
 
-	created, err := user.Setup(sshUser, log)
-	if err != nil {
-		log.Error("User setup failed: %v", err)
-		os.Exit(1)
-	}
-
-	if created {
-		fmt.Printf("Login erfolgreich! User %s wurde erstellt.\n", sshUser)
-		fmt.Println("Verbindung wird getrennt — bitte erneut anmelden.")
+	if cfg.CreateUser {
+		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.ForcePasswordChange, log)
+		if err != nil {
+			log.Error("User setup failed: %v", err)
+			os.Exit(1)
+		}
+		if created {
+			fmt.Printf("Login erfolgreich! User %s wurde erstellt.\n", sshUser)
+			fmt.Println("Verbindung wird getrennt — bitte erneut anmelden.")
+		} else {
+			fmt.Println("Login erfolgreich!")
+		}
 	} else {
 		fmt.Println("Login erfolgreich!")
 	}

@@ -10,10 +10,6 @@ import (
 )
 
 var validUsername = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
-
-const sudoersContent = "%sudo ALL=(ALL) NOPASSWD:ALL\n"
-
-var sudoersFile = "/etc/sudoers.d/keycloak-ssh-auth"
 var executor commandExecutor = systemCommandExecutor{}
 
 type commandExecutor interface {
@@ -34,8 +30,6 @@ func (systemCommandExecutor) Run(name string, args ...string) ([]byte, int, erro
 	return out, -1, err
 }
 
-// findBin resolves a command to its absolute path.
-// PAM sets a minimal PATH, so exec.Command("getent") fails.
 func findBin(name string) string {
 	for _, dir := range []string{"/usr/bin", "/usr/sbin", "/bin", "/sbin"} {
 		path := dir + "/" + name
@@ -43,13 +37,12 @@ func findBin(name string) string {
 			return path
 		}
 	}
-	return name // fallback to bare name
+	return name
 }
 
-// Setup creates a Linux user with sudo access if they don't exist.
-// Always adds to sudo group and ensures NOPASSWD sudoers drop-in.
+// Setup creates a Linux user with group memberships if they don't exist.
 // Returns (true, nil) if the user was newly created.
-func Setup(username string, log *logger.Logger) (bool, error) {
+func Setup(username string, groups []string, forcePasswd bool, log *logger.Logger) (bool, error) {
 	if !validUsername.MatchString(username) {
 		return false, fmt.Errorf("invalid username: %q", username)
 	}
@@ -62,21 +55,25 @@ func Setup(username string, log *logger.Logger) (bool, error) {
 	created := false
 	if !exists {
 		log.Info("Creating user: %s", username)
-		if out, _, err := executor.Run("useradd", "-m", "-s", "/bin/bash", "-G", "sudo", username); err != nil {
+		if out, _, err := executor.Run("useradd", "-m", "-s", "/bin/bash", username); err != nil {
 			return false, fmt.Errorf("useradd failed: %s: %w", string(out), err)
 		}
 		log.Info("User %s created", username)
 		created = true
 	}
 
-	// Ensure sudo group membership (idempotent)
-	if out, _, err := executor.Run("usermod", "-aG", "sudo", username); err != nil {
-		return false, fmt.Errorf("add to sudo group: %s: %w", string(out), err)
+	// Add to configured groups
+	for _, g := range groups {
+		if out, _, err := executor.Run("usermod", "-aG", g, username); err != nil {
+			log.Warn("Failed to add %s to group %s: %s", username, g, string(out))
+		}
 	}
 
-	// Ensure sudoers drop-in
-	if err := ensureSudoers(log); err != nil {
-		return false, fmt.Errorf("sudoers setup: %w", err)
+	// Force password change on first login
+	if created && forcePasswd {
+		if out, _, err := executor.Run("chage", "-d", "0", username); err != nil {
+			log.Warn("Failed to force password change: %s", string(out))
+		}
 	}
 
 	return created, nil
@@ -91,31 +88,4 @@ func userExists(username string) (bool, error) {
 		return false, nil
 	}
 	return false, err
-}
-
-func ensureSudoers(log *logger.Logger) error {
-	if _, err := os.Stat(sudoersFile); err == nil {
-		return nil // already exists
-	}
-
-	// Write to temp file
-	tmpFile := sudoersFile + ".tmp"
-	if err := os.WriteFile(tmpFile, []byte(sudoersContent), 0440); err != nil {
-		return fmt.Errorf("write temp sudoers: %w", err)
-	}
-
-	// Validate syntax
-	if out, _, err := executor.Run("visudo", "-cf", tmpFile); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("visudo validation failed: %s: %w", string(out), err)
-	}
-
-	// Move into place
-	if err := os.Rename(tmpFile, sudoersFile); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("install sudoers: %w", err)
-	}
-
-	log.Info("Sudoers drop-in installed: %s", sudoersFile)
-	return nil
 }
