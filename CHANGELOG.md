@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.1] - 2026-03-20
+
+### Changed
+- Root user authenticates via SSH key only (no OIDC required)
+- `Match User root` added to default sshd config
+
 ## [0.1.0] - 2026-03-20
 
 First public release. Generic OIDC Device Authorization Grant for SSH PAM authentication.

@@ -17,7 +17,7 @@ import (
 	"github.com/nk-dev/pam-device-auth/internal/user"
 )
 
-var VERSION = "0.1.0"
+var VERSION = "0.1.1"
 
 const (
 	logFile     = "/var/log/pam-device-auth.log"
