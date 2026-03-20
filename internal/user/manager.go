@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"regexp"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/logger"
 )
 
 var validUsername = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
@@ -48,35 +48,38 @@ func findBin(name string) string {
 
 // Setup creates a Linux user with sudo access if they don't exist.
 // Always adds to sudo group and ensures NOPASSWD sudoers drop-in.
-func Setup(username string, log *logger.Logger) error {
+// Returns (true, nil) if the user was newly created.
+func Setup(username string, log *logger.Logger) (bool, error) {
 	if !validUsername.MatchString(username) {
-		return fmt.Errorf("invalid username: %q", username)
+		return false, fmt.Errorf("invalid username: %q", username)
 	}
 
 	exists, err := userExists(username)
 	if err != nil {
-		return fmt.Errorf("check user exists: %w", err)
+		return false, fmt.Errorf("check user exists: %w", err)
 	}
 
+	created := false
 	if !exists {
 		log.Info("Creating user: %s", username)
 		if out, _, err := executor.Run("useradd", "-m", "-s", "/bin/bash", "-G", "sudo", username); err != nil {
-			return fmt.Errorf("useradd failed: %s: %w", string(out), err)
+			return false, fmt.Errorf("useradd failed: %s: %w", string(out), err)
 		}
 		log.Info("User %s created", username)
+		created = true
 	}
 
 	// Ensure sudo group membership (idempotent)
 	if out, _, err := executor.Run("usermod", "-aG", "sudo", username); err != nil {
-		return fmt.Errorf("add to sudo group: %s: %w", string(out), err)
+		return false, fmt.Errorf("add to sudo group: %s: %w", string(out), err)
 	}
 
 	// Ensure sudoers drop-in
 	if err := ensureSudoers(log); err != nil {
-		return fmt.Errorf("sudoers setup: %w", err)
+		return false, fmt.Errorf("sudoers setup: %w", err)
 	}
 
-	return nil
+	return created, nil
 }
 
 func userExists(username string) (bool, error) {

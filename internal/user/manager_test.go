@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/logger"
 )
 
 type mockResult struct {
@@ -91,8 +91,12 @@ func TestSetupExistingUserWithExistingSudoers(t *testing.T) {
 		t.Fatalf("WriteFile() error: %v", err)
 	}
 
-	if err := Setup("testuser", testLogger(t)); err != nil {
+	created, err := Setup("testuser", testLogger(t))
+	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
+	}
+	if created {
+		t.Fatal("Setup() should return created=false for existing user")
 	}
 
 	for _, call := range mock.calls {
@@ -114,8 +118,12 @@ func TestSetupCreatesUserAndSudoers(t *testing.T) {
 	setupTestEnvironment(t, mock)
 	mock.results["visudo -cf "+sudoersFile+".tmp"] = []mockResult{{exitCode: 0}}
 
-	if err := Setup("testuser", testLogger(t)); err != nil {
+	created, err := Setup("testuser", testLogger(t))
+	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Setup() should return created=true for new user")
 	}
 
 	content, err := os.ReadFile(sudoersFile)
@@ -140,7 +148,7 @@ func TestSetupUserAddFailure(t *testing.T) {
 	}
 	setupTestEnvironment(t, mock)
 
-	err := Setup("testuser", testLogger(t))
+	_, err := Setup("testuser", testLogger(t))
 	if err == nil {
 		t.Fatal("Setup() should fail when useradd fails")
 	}
@@ -163,7 +171,7 @@ func TestSetupVisudoFailureCleansTempFile(t *testing.T) {
 		err:      errors.New("exit status 1"),
 	}}
 
-	err := Setup("testuser", testLogger(t))
+	_, err := Setup("testuser", testLogger(t))
 	if err == nil {
 		t.Fatal("Setup() should fail when visudo validation fails")
 	}

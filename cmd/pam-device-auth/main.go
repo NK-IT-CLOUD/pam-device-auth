@@ -7,13 +7,13 @@ import (
 	"os"
 	"time"
 
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/cache"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/config"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/device"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/discovery"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/logger"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/token"
-	"git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth/internal/user"
+	"github.com/nk-dev/pam-device-auth/internal/cache"
+	"github.com/nk-dev/pam-device-auth/internal/config"
+	"github.com/nk-dev/pam-device-auth/internal/device"
+	"github.com/nk-dev/pam-device-auth/internal/discovery"
+	"github.com/nk-dev/pam-device-auth/internal/logger"
+	"github.com/nk-dev/pam-device-auth/internal/token"
+	"github.com/nk-dev/pam-device-auth/internal/user"
 )
 
 var VERSION = "0.6.0"
@@ -148,9 +148,16 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		}
 	}
 
-	if err := user.Setup(sshUser, log); err != nil {
+	created, err := user.Setup(sshUser, log)
+	if err != nil {
 		log.Error("User setup failed: %v", err)
 		return false
+	}
+
+	if created {
+		fmt.Printf("User %s wurde erstellt. Bitte erneut anmelden.\n", sshUser)
+		log.Info("First login: user %s created, session will close (sshd invalid-user constraint)", sshUser)
+		return true
 	}
 
 	fmt.Println("SSO-Session aktiv.")
@@ -225,10 +232,16 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		}
 	}
 
-	if err := user.Setup(sshUser, log); err != nil {
+	created, err := user.Setup(sshUser, log)
+	if err != nil {
 		log.Error("User setup failed: %v", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Login erfolgreich!")
+	if created {
+		fmt.Printf("Login erfolgreich! User %s wurde erstellt.\n", sshUser)
+		fmt.Println("Verbindung wird getrennt — bitte erneut anmelden.")
+	} else {
+		fmt.Println("Login erfolgreich!")
+	}
 }

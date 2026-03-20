@@ -1,3 +1,3 @@
-module git.server.nk-it.cloud/nk-dev/keycloak-ssh-auth
+module github.com/nk-dev/pam-device-auth
 
 go 1.22
