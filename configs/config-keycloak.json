@@ -1,5 +1,6 @@
 {
     "issuer_url": "https://sso.example.com/realms/myrealm",
     "client_id": "ssh-server",
-    "required_role": "ssh-access"
+    "required_role": "ssh-access",
+    "sudo_role": "ssh-admin"
 }

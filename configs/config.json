@@ -2,8 +2,10 @@
     "issuer_url": "https://sso.example.com/realms/myrealm",
     "client_id": "ssh-server",
     "required_role": "ssh-access",
+    "sudo_role": "ssh-admin",
     "auth_timeout": 180,
     "create_user": true,
-    "user_groups": ["sudo"],
+    "user_groups": ["users"],
+    "admin_groups": ["sudo", "users"],
     "force_password_change": true
 }

@@ -15,10 +15,12 @@ type Config struct {
 	IssuerURL           string   `json:"issuer_url"`
 	ClientID            string   `json:"client_id"`
 	RequiredRole        string   `json:"required_role"`
+	SudoRole            string   `json:"sudo_role"`
 	RoleClaim           string   `json:"role_claim"`
 	AuthTimeout         int      `json:"auth_timeout"`
 	CreateUser          bool     `json:"create_user"`
 	UserGroups          []string `json:"user_groups"`
+	AdminGroups         []string `json:"admin_groups"`
 	ForcePasswordChange bool     `json:"force_password_change"`
 }
 
@@ -65,6 +67,9 @@ func (c *Config) loadFromEnvironment() {
 	}
 	if v := os.Getenv("PAM_DEVICE_AUTH_REQUIRED_ROLE"); v != "" {
 		c.RequiredRole = v
+	}
+	if v := os.Getenv("PAM_DEVICE_AUTH_SUDO_ROLE"); v != "" {
+		c.SudoRole = v
 	}
 	if v := os.Getenv("PAM_DEVICE_AUTH_ROLE_CLAIM"); v != "" {
 		c.RoleClaim = v

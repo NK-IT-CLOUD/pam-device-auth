@@ -41,8 +41,10 @@ func findBin(name string) string {
 }
 
 // Setup creates a Linux user with group memberships if they don't exist.
+// If isAdmin is true, uses adminGroups; otherwise uses userGroups.
+// When adminGroups is configured and user is NOT admin, actively removes from admin-only groups.
 // Returns (true, nil) if the user was newly created.
-func Setup(username string, groups []string, forcePasswd bool, log *logger.Logger) (bool, error) {
+func Setup(username string, userGroups, adminGroups []string, isAdmin bool, forcePasswd bool, log *logger.Logger) (bool, error) {
 	if !validUsername.MatchString(username) {
 		return false, fmt.Errorf("invalid username: %q", username)
 	}
@@ -62,10 +64,30 @@ func Setup(username string, groups []string, forcePasswd bool, log *logger.Logge
 		created = true
 	}
 
-	// Add to configured groups
-	for _, g := range groups {
-		if out, _, err := executor.Run("usermod", "-aG", g, username); err != nil {
-			log.Warn("Failed to add %s to group %s: %s", username, g, string(out))
+	// Determine groups based on admin status
+	if isAdmin && len(adminGroups) > 0 {
+		// Admin: add to admin groups
+		for _, g := range adminGroups {
+			if out, _, err := executor.Run("usermod", "-aG", g, username); err != nil {
+				log.Warn("Failed to add %s to group %s: %s", username, g, string(out))
+			}
+		}
+		log.Info("Admin groups applied for %s: %v", username, adminGroups)
+	} else {
+		// Normal user: add to user groups
+		for _, g := range userGroups {
+			if out, _, err := executor.Run("usermod", "-aG", g, username); err != nil {
+				log.Warn("Failed to add %s to group %s: %s", username, g, string(out))
+			}
+		}
+
+		// If admin groups configured, remove from admin-only groups (demotion)
+		if len(adminGroups) > 0 {
+			adminOnly := groupDiff(adminGroups, userGroups)
+			for _, g := range adminOnly {
+				executor.Run("gpasswd", "-d", username, g) // ignore errors
+				log.Info("Removed %s from group %s (admin role revoked)", username, g)
+			}
 		}
 	}
 
@@ -77,6 +99,21 @@ func Setup(username string, groups []string, forcePasswd bool, log *logger.Logge
 	}
 
 	return created, nil
+}
+
+// groupDiff returns elements in a that are NOT in b.
+func groupDiff(a, b []string) []string {
+	bSet := make(map[string]bool)
+	for _, g := range b {
+		bSet[g] = true
+	}
+	var diff []string
+	for _, g := range a {
+		if !bSet[g] {
+			diff = append(diff, g)
+		}
+	}
+	return diff
 }
 
 func userExists(username string) (bool, error) {

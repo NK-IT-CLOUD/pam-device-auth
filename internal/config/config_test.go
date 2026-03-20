@@ -270,6 +270,61 @@ func TestEnvOverrideRoleClaim(t *testing.T) {
 	}
 }
 
+func TestDefaultSudoRoleAndAdminGroups(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.SudoRole != "" {
+		t.Errorf("default SudoRole = %q, want empty", cfg.SudoRole)
+	}
+	if cfg.AdminGroups != nil {
+		t.Errorf("default AdminGroups = %v, want nil", cfg.AdminGroups)
+	}
+}
+
+func TestLoadSudoRoleAndAdminGroups(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access",
+		"sudo_role": "ssh-admin",
+		"admin_groups": ["sudo", "users"]
+	}`), 0644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.SudoRole != "ssh-admin" {
+		t.Errorf("SudoRole = %q, want ssh-admin", cfg.SudoRole)
+	}
+	if len(cfg.AdminGroups) != 2 || cfg.AdminGroups[0] != "sudo" || cfg.AdminGroups[1] != "users" {
+		t.Errorf("AdminGroups = %v, want [sudo users]", cfg.AdminGroups)
+	}
+}
+
+func TestEnvOverrideSudoRole(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	os.WriteFile(path, []byte(`{
+		"issuer_url": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access",
+		"sudo_role": "original-role"
+	}`), 0644)
+
+	os.Setenv("PAM_DEVICE_AUTH_SUDO_ROLE", "override-admin")
+	defer os.Unsetenv("PAM_DEVICE_AUTH_SUDO_ROLE")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.SudoRole != "override-admin" {
+		t.Errorf("SudoRole = %q, want override-admin", cfg.SudoRole)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	_, err := Load("/nonexistent/config.json")
 	if err == nil {

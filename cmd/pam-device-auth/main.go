@@ -149,7 +149,9 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 	}
 
 	if cfg.CreateUser {
-		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.ForcePasswordChange, log)
+		// Determine admin status based on sudo_role
+		isAdmin := cfg.SudoRole == "" || token.HasRole(result.Roles, cfg.SudoRole)
+		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
 		if err != nil {
 			log.Error("User setup failed: %v", err)
 			return false
@@ -234,7 +236,9 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	}
 
 	if cfg.CreateUser {
-		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.ForcePasswordChange, log)
+		// Determine admin status based on sudo_role
+		isAdmin := cfg.SudoRole == "" || token.HasRole(result.Roles, cfg.SudoRole)
+		created, err := user.Setup(sshUser, cfg.UserGroups, cfg.AdminGroups, isAdmin, cfg.ForcePasswordChange, log)
 		if err != nil {
 			log.Error("User setup failed: %v", err)
 			os.Exit(1)
