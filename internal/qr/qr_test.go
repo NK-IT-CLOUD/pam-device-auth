@@ -171,7 +171,7 @@ func TestRender_ProducesOutput(t *testing.T) {
 		t.Fatal("Render produced empty output")
 	}
 
-	// Should contain block characters
+	// Should contain Unicode block characters
 	hasBlock := strings.ContainsAny(output, "\u2588\u2580\u2584")
 	if !hasBlock {
 		t.Error("Render output should contain Unicode block characters")

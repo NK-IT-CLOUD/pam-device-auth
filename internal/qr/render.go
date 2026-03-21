@@ -4,7 +4,9 @@ import "strings"
 
 // Render generates a terminal-friendly QR code string for the given URL.
 // Uses Unicode half-block characters for compact display (2 rows per line).
-// Returns empty string and error if encoding fails.
+// Scannable by phone cameras in all major terminals (PuTTY, Linux, macOS).
+// Note: PowerShell's built-in SSH may not render Unicode correctly —
+// users can use the Link + Code text displayed alongside the QR.
 func Render(url string) (string, error) {
 	matrix, err := Encode(url)
 	if err != nil {
