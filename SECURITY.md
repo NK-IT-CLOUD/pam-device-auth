@@ -5,8 +5,7 @@
 | Version | Supported |
 |---------|-----------|
 | 0.3.x   | Yes       |
-| 0.2.x   | Security fixes only |
-| 0.1.x   | No        |
+| < 0.3    | No -- please upgrade |
 
 ## Reporting a Vulnerability
 
