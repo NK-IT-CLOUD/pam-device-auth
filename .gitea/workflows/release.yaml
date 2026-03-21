@@ -1,0 +1,29 @@
+name: Release to APT Repository
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: linux_amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        run: echo "VERSION=$(cat VERSION)" >> $GITHUB_ENV
+
+      - name: Build .deb package
+        run: make clean && make deb
+
+      - name: Deploy to APT repository
+        run: |
+          scp -i /root/.ssh/nkit-01-deploy \
+            build/packages/pam-device-auth_${VERSION}_amd64.deb \
+            nkit-01-deploy:/tmp/
+          ssh -i /root/.ssh/nkit-01-deploy nkit-01-deploy \
+            "reprepro -b /var/www/apt.nk-it.cloud/apt includedeb stable /tmp/pam-device-auth_${VERSION}_amd64.deb && rm /tmp/pam-device-auth_${VERSION}_amd64.deb"
+
+      - name: Verify
+        run: |
+          ssh -i /root/.ssh/nkit-01-deploy nkit-01-deploy \
+            "reprepro -b /var/www/apt.nk-it.cloud/apt list stable"
