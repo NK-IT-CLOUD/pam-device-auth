@@ -111,9 +111,40 @@ static void get_client_ip(pam_handle_t *pamh, char *ip_buf, size_t ip_buf_size) 
     }
 }
 
+// Detect SSH client software from journald for the sshd connection PID.
+// Requires LogLevel DEBUG1 in sshd_config. Returns "unknown" if unavailable.
+static void get_ssh_client_version(char *version_buf, size_t buf_size) {
+    strncpy(version_buf, "unknown", buf_size - 1);
+    version_buf[buf_size - 1] = '\0';
+
+    // PAM runs in sshd's privsep child. The parent PID handled key exchange.
+    // Brief wait for journal flush before querying.
+    usleep(150000);
+    pid_t ppid = getppid();
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "/usr/bin/journalctl _PID=%d -o cat --no-pager 2>/dev/null"
+        " | grep -oi 'remote software version [^ ]*' | head -1"
+        " | sed 's/[Rr]emote software version //'", ppid);
+
+    FILE *fp = popen(cmd, "r");
+    if (fp == NULL) return;
+
+    char line[256];
+    if (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        if (strlen(line) > 0) {
+            strncpy(version_buf, line, buf_size - 1);
+            version_buf[buf_size - 1] = '\0';
+        }
+    }
+    pclose(fp);
+}
+
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     const char *username;
     char client_ip[INET6_ADDRSTRLEN];
+    char ssh_client_version[256];
     char buffer[BUFFER_SIZE];
     int result = PAM_AUTH_ERR;
 
@@ -127,10 +158,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     }
 
     get_client_ip(pamh, client_ip, sizeof(client_ip));
-    log_message(LOG_INFO, "Authentication attempt for user %s from IP %s", username, client_ip);
+    get_ssh_client_version(ssh_client_version, sizeof(ssh_client_version));
+    log_message(LOG_INFO, "Authentication attempt for user %s from IP %s (client: %s)", username, client_ip, ssh_client_version);
 
     setenv("PAM_USER", username, 1);
     setenv("PAM_RHOST", client_ip, 1);
+    setenv("SSH_CLIENT_VERSION", ssh_client_version, 1);
 
     // Bidirectional pipes: parent ↔ child
     int to_child[2];   // parent writes, child reads (stdin)
@@ -266,6 +299,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 
     unsetenv("PAM_USER");
     unsetenv("PAM_RHOST");
+    unsetenv("SSH_CLIENT_VERSION");
 
     return result;
 }

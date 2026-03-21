@@ -22,6 +22,7 @@ type Config struct {
 	UserGroups          []string `json:"user_groups"`
 	AdminGroups         []string `json:"admin_groups"`
 	ForcePasswordChange bool     `json:"force_password_change"`
+	ShowQR              *bool    `json:"show_qr,omitempty"`
 }
 
 func DefaultConfig() *Config {
@@ -30,6 +31,7 @@ func DefaultConfig() *Config {
 		CreateUser:          true,
 		UserGroups:          []string{"sudo"},
 		ForcePasswordChange: true,
+		// ShowQR: nil = auto-detect (skip for Win32-OpenSSH, show for others)
 	}
 }
 

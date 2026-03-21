@@ -182,6 +182,23 @@ Config file: `/etc/pam-device-auth/config.json`
 | `user_groups` | No | `["sudo"]` | Groups for normal users |
 | `admin_groups` | No | -- | Groups for users with `sudo_role` (overrides `user_groups`) |
 | `force_password_change` | No | `true` | Set temp password and force change on first login |
+| `show_qr` | No | auto | QR code display: `true` = always, `false` = never, omit = auto-detect |
+
+### QR code and Windows/PowerShell
+
+The QR code uses Unicode half-block characters for compact, scannable output. This works in PuTTY, Linux terminals, macOS Terminal, and Windows Terminal.
+
+**Win32-OpenSSH** (PowerShell's `ssh.exe`) has a [known bug](https://github.com/PowerShell/Win32-OpenSSH/issues/1623) where `strnvis()` escapes all UTF-8 bytes >= 0x80 as octal sequences, making the QR code unreadable.
+
+By default, pam-device-auth **auto-detects Win32-OpenSSH** clients (via `LogLevel DEBUG1` in sshd_config) and skips the QR code for them. The Link + Code text is always displayed as a fallback.
+
+| `show_qr` value | Behavior |
+|---|---|
+| omitted (default) | Auto-detect: QR for PuTTY/Linux, no QR for Win32-OpenSSH |
+| `true` | Always show QR (disable auto-detection) |
+| `false` | Never show QR |
+
+To disable auto-detection and reduce sshd logging, change `LogLevel DEBUG1` to `LogLevel VERBOSE` in `/etc/ssh/sshd_config.d/10-pam-device-auth.conf` and set `"show_qr": true` or `"show_qr": false` explicitly.
 
 ### Role-based group assignment
 

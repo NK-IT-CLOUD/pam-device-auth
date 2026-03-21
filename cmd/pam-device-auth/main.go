@@ -20,7 +20,7 @@ import (
 	"github.com/nk-dev/pam-device-auth/internal/user"
 )
 
-var VERSION = "0.3.0"
+var VERSION = "0.3.1"
 
 const (
 	logFile     = "/var/log/pam-device-auth.log"
@@ -226,6 +226,22 @@ func main() {
 	os.Exit(0)
 }
 
+// shouldShowQR determines whether to render the QR code.
+// Priority: config "show_qr" (explicit override) > auto-detect via SSH client version.
+// Auto-detect skips QR for Win32-OpenSSH (broken Unicode in strnvis).
+func shouldShowQR(cfg *config.Config) bool {
+	// Explicit config override takes priority
+	if cfg.ShowQR != nil {
+		return *cfg.ShowQR
+	}
+	// Auto-detect: skip QR for Windows OpenSSH clients
+	v := os.Getenv("SSH_CLIENT_VERSION")
+	if strings.Contains(v, "Windows") {
+		return false
+	}
+	return true
+}
+
 // getPasswordHash reads the user's password hash from /etc/shadow.
 // Returns empty string if user not found, no hash, or shadow unreadable.
 // Runs as root (PAM context), so /etc/shadow is readable.
@@ -420,10 +436,12 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	if dc.VerificationURIComplete != "" {
 		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
 		fmt.Printf("Code:  %s\n", dc.UserCode)
-		fmt.Println()
-		qrStr, err := qr.Render(dc.VerificationURIComplete)
-		if err == nil {
-			fmt.Print(qrStr)
+		if shouldShowQR(cfg) {
+			fmt.Println()
+			qrStr, err := qr.Render(dc.VerificationURIComplete)
+			if err == nil {
+				fmt.Print(qrStr)
+			}
 		}
 	} else {
 		fmt.Printf("Open:  %s\n", dc.VerificationURI)
