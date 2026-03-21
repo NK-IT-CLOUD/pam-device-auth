@@ -82,13 +82,26 @@ Each client IP must be independently authorized via device auth. Once authorized
 
 ### 1. Install
 
+**Via APT (recommended):**
+
 ```bash
-sudo dpkg -i pam-device-auth_0.3.0_amd64.deb
+curl -fsSL https://apt.nk-it.cloud/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nk-it-cloud.gpg
+echo "deb [signed-by=/etc/apt/keyrings/nk-it-cloud.gpg] https://apt.nk-it.cloud/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/nk-it-cloud.list
+sudo apt update && sudo apt install pam-device-auth
+```
+
+Updates come automatically via `apt upgrade`.
+
+**Manual install:**
+
+```bash
+sudo dpkg -i pam-device-auth_0.3.1_amd64.deb
 ```
 
 > PAM is **not activated** on install. Root SSH key access continues to work.
 
-Upgrade: `sudo dpkg -i pam-device-auth_<version>_amd64.deb` (config preserved, sshd restarted).
+Upgrade: `sudo apt upgrade pam-device-auth` or `sudo dpkg -i pam-device-auth_<version>_amd64.deb` (config preserved, sshd restarted).
 Uninstall: `sudo dpkg -P pam-device-auth` (restores original PAM config, restarts sshd). See [INSTALL.md](INSTALL.md).
 
 ### 2. Configure
