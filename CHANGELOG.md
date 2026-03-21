@@ -3,12 +3,50 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.1] - 2026-03-21
+
+### Added
+- Auto-detect Win32-OpenSSH clients and skip QR code (broken Unicode in ssh.exe strnvis)
+- `show_qr` config option: `true` (always), `false` (never), omit (auto-detect)
+- SSH client version detection via journald (requires LogLevel DEBUG1)
+
+### Changed
+- Replace Unicode separators with ASCII for PowerShell compatibility
+- sshd config uses LogLevel DEBUG1 by default (for client auto-detection)
+
+## [0.3.0] - 2026-03-21
+
+### Added
+- IP-bound sessions: new client IPs require full device auth (browser confirmation)
+- Known IPs stored per-user in cache (tmpfs, wiped on reboot)
+- User lock/unlock: account locked on OIDC role revocation, unlocked on re-grant
+- Temp password on user creation (eliminates double device auth on first setup)
+- Password verification via crypt_r(3)/libxcrypt (replaces unix_chkpwd)
+- Clear error messages for username mismatch and missing OIDC roles
+- Detect locked accounts (! prefix in shadow hash)
+- OIDC issuer cross-validation (MITM protection)
+
+### Changed
+- C PAM module rewritten: popen() replaced with fork/exec + bidirectional pipes
+- PROMPT: protocol for secure password input via PAM conversation (echo off)
+- Single PROMPT: per session (prevents social engineering)
+- Password zeroed in memory after use
+- Close inherited fds (3..1023) in child process
+- pam_sm_acct_mgmt returns PAM_IGNORE (delegates to pam_unix)
+- Thread-safe get_client_ip() with caller-supplied buffer
+- CGO enabled for libxcrypt/crypt_r integration
+
+### Fixed
+- Authentication bypass: cached refresh tokens no longer accepted without local password
+- unix_chkpwd broken on glibc 2.38+ (setgid fd sanitization) -- replaced with crypt_r
+- User-writable ~/.password_set flag replaced with /etc/shadow hash check
+
 ## [0.2.0] - 2026-03-20
 
 ### Added
 - `--check` command: validates config and tests OIDC provider connectivity before activation
 - `--enable` command: activates PAM authentication after successful config check, restarts SSH
-- Safe installation: fresh installs no longer auto-activate PAM — prevents lockout with default config
+- Safe installation: fresh installs no longer auto-activate PAM -- prevents lockout with default config
 
 ### Changed
 - Upgrade installs preserve existing PAM activation and restart SSH automatically
