@@ -11,37 +11,79 @@ A PAM module and Go binary that lets users log in to SSH using any OIDC provider
 - **PAM module** (`pam_device_auth.so`) -- C shared library that integrates with sshd
 - **Go binary** (`pam-device-auth`) -- handles OIDC discovery, device flow, JWT validation, and user provisioning
 - **RFC 8628** -- Device Authorization Grant, designed for input-constrained devices
-- **Zero external Go dependencies** -- stdlib only, single static binary
+- **Zero external Go dependencies** -- stdlib + CGO (libxcrypt) only
 
 ## How it works
 
+### Authentication flow
+
 ```
-SSH Client --> sshd (PAM) --> pam_device_auth.so --> pam-device-auth binary
-                                                      |
-                                         OIDC Discovery (.well-known)
-                                                      |
-                                         Device Authorization Request
-                                                      |
-                                   User sees URL + Code + QR code in terminal
-                                   --> Opens browser or scans QR --> Logs in at OIDC provider
-                                                      |
-                                         Token Polling (RFC 8628)
-                                                      |
-                                         JWKS Fetch + JWT Validation
-                                                      |
-                                         Role Check --> User Setup --> Shell
+First login (new user or new IP):
+
+  SSH Client → sshd (PAM) → pam_device_auth.so → pam-device-auth binary
+                                                    │
+                                       OIDC Discovery (.well-known)
+                                                    │
+                                       Device Authorization Request
+                                                    │
+                                 User sees URL + Code + QR in terminal
+                                 → Opens browser → Authorizes at OIDC provider
+                                                    │
+                                       Token Polling (RFC 8628)
+                                                    │
+                                       JWKS Fetch + JWT Validation
+                                                    │
+                              Role Check → User Setup → Local Password → Shell
+
+
+Returning user (known IP, cached session):
+
+  SSH Client → sshd (PAM) → pam_device_auth.so → pam-device-auth binary
+                                                    │
+                                       Cache found, IP in known list
+                                                    │
+                                       PROMPT: Password (PAM echo-off)
+                                                    │
+                                       crypt_r(3) verification vs /etc/shadow
+                                                    │
+                                       OIDC Token Refresh + Role Check
+                                                    │
+                                       Access granted → Shell
 ```
 
-On repeat logins, a cached refresh token is used instead. The token is refreshed against the OIDC provider on every login, so user deactivation or role removal takes effect immediately.
+### First-time setup (single device auth)
 
-On first login, new users are automatically prompted to set a local password (used for `sudo`). A QR code is displayed alongside the verification URL for convenient scanning on mobile devices.
+1. SSH as new user → device auth (QR code + browser) → user created
+2. Temporary password is displayed → session disconnects (sshd constraint)
+3. SSH again → enter temp password → OIDC refresh → login
+4. Shell prompts to set a permanent password → done
+5. All subsequent logins from the same IP: password + OIDC refresh (no browser)
+
+### IP-bound sessions
+
+Each client IP must be independently authorized via device auth. Once authorized, the IP is stored in the user's session cache. Subsequent logins from the same IP only require the local password + OIDC token refresh.
+
+- New IP → full device auth (browser confirmation required)
+- Known IP → local password + OIDC refresh (fast path)
+- Reboot → tmpfs cache cleared, all IPs require fresh device auth
+
+### User lifecycle
+
+| Event | Action |
+|-------|--------|
+| First OIDC login | User created, temp password set, groups assigned |
+| Role revoked in OIDC | Account locked (`usermod --lock`), cache deleted |
+| Role re-granted | Device auth succeeds → account unlocked |
+| Admin role added/removed | Group memberships updated on every login |
+| Username mismatch | Clear error: "authorized as X, but SSH user is Y" |
+| Missing required role | Clear error: "lacks required role" |
 
 ## Quick Start
 
 ### 1. Install
 
 ```bash
-sudo dpkg -i pam-device-auth_0.2.0_amd64.deb
+sudo dpkg -i pam-device-auth_0.3.0_amd64.deb
 ```
 
 > PAM is **not activated** on install. Root SSH key access continues to work.
@@ -108,7 +150,7 @@ Config file: `/etc/pam-device-auth/config.json`
 | `create_user` | No | `true` | Create local Linux user on first login |
 | `user_groups` | No | `["sudo"]` | Groups for normal users |
 | `admin_groups` | No | -- | Groups for users with `sudo_role` (overrides `user_groups`) |
-| `force_password_change` | No | `true` | Force password change on first login |
+| `force_password_change` | No | `true` | Set temp password and force change on first login |
 
 ### Role-based group assignment
 
@@ -119,7 +161,8 @@ When `sudo_role` is configured, users are assigned to different groups based on 
 | `required_role` only | `user_groups` | No |
 | `required_role` + `sudo_role` | `admin_groups` | Yes |
 | Loses `sudo_role` | Demoted to `user_groups`, removed from admin-only groups | No |
-| Loses `required_role` | SSH access denied | -- |
+| Loses `required_role` | Account locked, SSH access denied | -- |
+| Role re-granted | Device auth → account unlocked | Restored |
 
 When `sudo_role` is not set, all users get `user_groups` (backward compatible).
 
@@ -203,12 +246,12 @@ Create an OAuth2/OIDC provider in Authentik with Device Code flow enabled. Authe
 ### Prerequisites
 
 - Go 1.22 or later
-- GCC
+- GCC + libcrypt-dev (for crypt_r)
 - libpam0g-dev
 
 ```bash
 # Ubuntu/Debian
-sudo apt install build-essential libpam0g-dev
+sudo apt install build-essential libpam0g-dev libcrypt-dev
 
 # Verify Go version
 go version  # must be >= 1.22
@@ -217,7 +260,7 @@ go version  # must be >= 1.22
 ### Make targets
 
 ```bash
-make build       # Build Go binary only
+make build       # Build Go binary only (CGO_ENABLED=1)
 make pam         # Build PAM module only
 make build-all   # Build binary + PAM module
 make test        # Run all tests (with race detector)
@@ -233,18 +276,36 @@ make clean       # Remove build artifacts
 
 ## Security
 
+### Authentication hardening
+
+- **IP-bound sessions** -- cached sessions are tied to the client IP; new IPs require full device auth
+- **Local password + OIDC** -- returning users must verify both local password and OIDC session
+- **Password verification via crypt_r(3)** -- direct shadow hash verification using libxcrypt (no setgid unix_chkpwd dependency)
+- **Account locking** -- accounts are locked when OIDC roles are explicitly revoked
+- **OIDC issuer cross-validation** -- discovery issuer must match config (MITM protection)
+- **Single PROMPT: per session** -- C module limits password prompts to prevent social engineering
+
+### Token and cache security
+
 - **JWT signature verification** via JWKS endpoint (RS256, RS384, RS512, ES256, ES384, ES512)
 - **OIDC Discovery** -- fail-fast if the identity provider is unreachable
 - **Issuer, expiry, and not-before** validation on every token
 - **Audience/authorized party** validation against configured `client_id`
 - **Username matching** -- SSO username must match SSH username
-- **Role-based access control** -- configurable required role
 - **Token refresh validates at provider** -- user deactivation takes effect immediately
 - **Cache in tmpfs** -- refresh tokens stored in `/run/pam-device-auth/`, cleared on reboot
 - **Cache isolation** -- directory `0700 root:root`, files `0600 root:root`
 - **Atomic cache writes** -- temp file + rename prevents partial reads
 - **Path traversal protection** -- username validation before file path construction
-- **Public client** -- no client secret to manage or rotate
+- **Public client** -- no client secret to manage or rotate (RFC 8628 design)
+
+### C module hardening
+
+- **Fork/exec with bidirectional pipes** -- replaces popen() for secure Go binary communication
+- **PROMPT: protocol** -- password input via PAM conversation (echo-off), limited to 1 per session
+- **Password zeroing** -- memory cleared after use regardless of conversation result
+- **File descriptor cleanup** -- inherited fds (3..1023) closed in child process
+- **Thread-safe IP extraction** -- caller-supplied buffer, no static state
 
 See [SECURITY.md](SECURITY.md) for the security policy and vulnerability reporting.
 
