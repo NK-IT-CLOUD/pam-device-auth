@@ -189,9 +189,9 @@ Config file: `/etc/pam-device-auth/config.json`
 
 ### QR code and Windows/PowerShell
 
-The QR code uses Unicode half-block characters for compact, scannable output. This works in PuTTY, Linux terminals, macOS Terminal, and Windows Terminal.
+The QR code uses Unicode half-block characters for compact, scannable output. This works in PuTTY, Linux terminals, and macOS Terminal.
 
-**Win32-OpenSSH** (PowerShell's `ssh.exe`) has a [known bug](https://github.com/PowerShell/Win32-OpenSSH/issues/1623) where `strnvis()` escapes all UTF-8 bytes >= 0x80 as octal sequences, making the QR code unreadable.
+**Windows** ships with Win32-OpenSSH (`ssh.exe`), used by PowerShell, cmd, and Windows Terminal. This SSH client has a [known bug](https://github.com/PowerShell/Win32-OpenSSH/issues/1623) where `strnvis()` escapes all UTF-8 bytes >= 0x80 as octal sequences, making the QR code unreadable. On Windows, use **PuTTY** for correct QR code rendering.
 
 By default, pam-device-auth **auto-detects Win32-OpenSSH** clients (via `LogLevel DEBUG1` in sshd_config) and skips the QR code for them. The Link + Code text is always displayed as a fallback.
 

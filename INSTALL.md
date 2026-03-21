@@ -215,7 +215,7 @@ Match User root
     AuthenticationMethods publickey
 ```
 
-`LogLevel DEBUG1` is required for auto-detection of Win32-OpenSSH clients (QR code is automatically hidden for PowerShell users). To disable this, set `LogLevel VERBOSE` and configure `"show_qr": true` or `"show_qr": false` explicitly in `config.json`.
+`LogLevel DEBUG1` is required for auto-detection of Win32-OpenSSH clients (QR code is automatically hidden for Windows users connecting via `ssh.exe`). To disable auto-detection, set `LogLevel VERBOSE` and configure `"show_qr": true` or `"show_qr": false` explicitly in `config.json`.
 
 Restart sshd after making changes:
 
@@ -303,9 +303,9 @@ The binary must be invoked by the PAM module, not run directly. It reads `PAM_US
 
 - Verify `AuthenticationMethods publickey keyboard-interactive` is set (not `keyboard-interactive` alone)
 
-### QR code shows garbage in PowerShell
+### QR code shows garbage on Windows (PowerShell, cmd, Windows Terminal)
 
-Win32-OpenSSH has a [known bug](https://github.com/PowerShell/Win32-OpenSSH/issues/1623) with Unicode rendering. With `LogLevel DEBUG1`, pam-device-auth auto-detects Win32-OpenSSH and hides the QR code. The Link + Code text always works. Alternatively, use PuTTY which renders the QR code correctly.
+Windows ships with Win32-OpenSSH (`ssh.exe`) which has a [known bug](https://github.com/PowerShell/Win32-OpenSSH/issues/1623) that breaks Unicode rendering in SSH keyboard-interactive output. With `LogLevel DEBUG1`, pam-device-auth auto-detects this and hides the QR code. The Link + Code text always works as fallback. On Windows, use **PuTTY** for correct QR code rendering.
 
 ### Log file location
 
