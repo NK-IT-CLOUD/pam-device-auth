@@ -5,7 +5,7 @@ Contributions are welcome. This document covers the development workflow.
 ## Development Setup
 
 ```bash
-git clone https://github.com/nk-dev/pam-device-auth.git
+git clone https://github.com/NK-IT-CLOUD/pam-device-auth
 cd pam-device-auth
 
 # Prerequisites

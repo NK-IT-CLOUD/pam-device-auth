@@ -32,6 +32,19 @@ func (m *mockExecutor) Run(name string, args ...string) ([]byte, int, error) {
 	return result.out, result.exitCode, result.err
 }
 
+func (m *mockExecutor) RunWithStdin(stdin string, name string, args ...string) ([]byte, int, error) {
+	call := strings.Join(append([]string{name}, args...), " ")
+	m.calls = append(m.calls, call)
+
+	if len(m.results[call]) == 0 {
+		return nil, 0, nil
+	}
+
+	result := m.results[call][0]
+	m.results[call] = m.results[call][1:]
+	return result.out, result.exitCode, result.err
+}
+
 
 func testLogger(t *testing.T) *logger.Logger {
 	t.Helper()
@@ -209,34 +222,40 @@ func TestSetup_NoForcePasswd(t *testing.T) {
 	}
 }
 
-func TestSetup_ForcePasswdUnlocksAccount(t *testing.T) {
+func TestSetup_ForcePasswdSetsTempPassword(t *testing.T) {
 	mock := &mockExecutor{
 		results: map[string][]mockResult{
 			"getent passwd testuser":           {{exitCode: 2, err: errors.New("not found")}},
 			"useradd -m -s /bin/bash testuser": {{exitCode: 0}},
 			"usermod -aG sudo testuser":        {{exitCode: 0}},
-			"passwd -d testuser":               {{exitCode: 0}},
+			"chpasswd":                         {{exitCode: 0}},
 			"chown testuser:testuser /home/testuser/.bash_profile": {{exitCode: 0}},
 		},
 	}
 	setupTestEnvironment(t, mock)
 
-	created, _, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
+	created, tempPwd, err := Setup("testuser", []string{"sudo"}, nil, true, true, testLogger(t))
 	if err != nil {
 		t.Fatalf("Setup() error: %v", err)
 	}
 	if !created {
 		t.Fatal("Setup() should return created=true for new user")
 	}
+	if tempPwd == "" {
+		t.Fatal("Setup() should return a temp password for new user with forcePasswd=true")
+	}
+	if len(tempPwd) != 12 {
+		t.Errorf("temp password length = %d, want 12", len(tempPwd))
+	}
 
-	hasPasswdD := false
+	hasChpasswd := false
 	for _, call := range mock.calls {
-		if call == "passwd -d testuser" {
-			hasPasswdD = true
+		if call == "chpasswd" {
+			hasChpasswd = true
 		}
 	}
-	if !hasPasswdD {
-		t.Fatalf("passwd -d should be called for new user with forcePasswd=true, calls = %v", mock.calls)
+	if !hasChpasswd {
+		t.Fatalf("chpasswd should be called for new user with forcePasswd=true, calls = %v", mock.calls)
 	}
 }
 
@@ -422,6 +441,72 @@ func TestSetup_NoSudoRole(t *testing.T) {
 	}
 	if !hasUsersGroup {
 		t.Fatalf("user should be added to users group, calls = %v", mock.calls)
+	}
+}
+
+// --- Lock/Unlock tests ---
+
+func TestLock(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"usermod --lock testuser": {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	if err := Lock("testuser", testLogger(t)); err != nil {
+		t.Fatalf("Lock() error: %v", err)
+	}
+
+	hasLock := false
+	for _, call := range mock.calls {
+		if call == "usermod --lock testuser" {
+			hasLock = true
+		}
+	}
+	if !hasLock {
+		t.Fatalf("usermod --lock should be called, calls = %v", mock.calls)
+	}
+}
+
+func TestUnlock(t *testing.T) {
+	mock := &mockExecutor{
+		results: map[string][]mockResult{
+			"usermod --unlock testuser": {{exitCode: 0}},
+		},
+	}
+	setupTestEnvironment(t, mock)
+
+	if err := Unlock("testuser", testLogger(t)); err != nil {
+		t.Fatalf("Unlock() error: %v", err)
+	}
+
+	hasUnlock := false
+	for _, call := range mock.calls {
+		if call == "usermod --unlock testuser" {
+			hasUnlock = true
+		}
+	}
+	if !hasUnlock {
+		t.Fatalf("usermod --unlock should be called, calls = %v", mock.calls)
+	}
+}
+
+func TestLock_InvalidUsername(t *testing.T) {
+	mock := &mockExecutor{}
+	setupTestEnvironment(t, mock)
+
+	if err := Lock("../evil", testLogger(t)); err == nil {
+		t.Fatal("Lock() should fail for invalid username")
+	}
+}
+
+func TestUnlock_InvalidUsername(t *testing.T) {
+	mock := &mockExecutor{}
+	setupTestEnvironment(t, mock)
+
+	if err := Unlock("../evil", testLogger(t)); err == nil {
+		t.Fatal("Unlock() should fail for invalid username")
 	}
 }
 

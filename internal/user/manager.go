@@ -1,10 +1,13 @@
 package user
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 
 	"github.com/nk-dev/pam-device-auth/internal/logger"
 )
@@ -14,12 +17,26 @@ var executor commandExecutor = systemCommandExecutor{}
 
 type commandExecutor interface {
 	Run(name string, args ...string) ([]byte, int, error)
+	RunWithStdin(stdin string, name string, args ...string) ([]byte, int, error)
 }
 
 type systemCommandExecutor struct{}
 
 func (systemCommandExecutor) Run(name string, args ...string) ([]byte, int, error) {
 	cmd := exec.Command(findBin(name), args...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return out, 0, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return out, exitErr.ExitCode(), err
+	}
+	return out, -1, err
+}
+
+func (systemCommandExecutor) RunWithStdin(stdin string, name string, args ...string) ([]byte, int, error) {
+	cmd := exec.Command(findBin(name), args...)
+	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return out, 0, nil
@@ -91,24 +108,49 @@ func Setup(username string, userGroups, adminGroups []string, isAdmin bool, forc
 	}
 
 	if created && forcePasswd {
-		// Unlock account (remove password lock so passwd doesn't ask for "Current password")
-		executor.Run("passwd", "-d", username)
+		tempPwd, err := generateTempPassword(12)
+		if err != nil {
+			return false, "", fmt.Errorf("generate temp password: %w", err)
+		}
 
-		// Force password setup on first shell login via .bash_profile
+		// Set temp password via chpasswd (reads user:password from stdin)
+		if out, _, err := executor.RunWithStdin(username+":"+tempPwd+"\n", "chpasswd"); err != nil {
+			return false, "", fmt.Errorf("set temp password: %s: %w", string(out), err)
+		}
+		log.Info("Temp password set for %s", username)
+
+		// Force password change on first shell login via .bash_profile
 		if err := installPasswordPrompt(username, log); err != nil {
 			log.Warn("Failed to install password prompt: %v", err)
 		}
+
+		return true, tempPwd, nil
 	}
 
 	return created, "", nil
 }
 
+// generateTempPassword creates a cryptographically random password.
+// Uses an unambiguous charset (no 0/O, 1/l/I).
+func generateTempPassword(length int) (string, error) {
+	const charset = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	result := make([]byte, length)
+	for i := range result {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		result[i] = charset[n.Int64()]
+	}
+	return string(result), nil
+}
+
 const passwordPromptScript = `# pam-device-auth: force local password setup on first login
 if [ ! -f "$HOME/.password_set" ]; then
     echo ""
-    echo "========================================"
+    echo "────────────────────────────────────"
     echo "  Please set your local password."
-    echo "========================================"
+    echo "────────────────────────────────────"
     echo ""
     if passwd; then
         touch "$HOME/.password_set"
@@ -135,6 +177,32 @@ func installPasswordPrompt(username string, log *logger.Logger) error {
 	}
 
 	log.Info("Password prompt installed for %s", username)
+	return nil
+}
+
+// Lock locks the user's local password via usermod --lock.
+// Prepends '!' to the shadow hash, preventing password authentication.
+func Lock(username string, log *logger.Logger) error {
+	if !validUsername.MatchString(username) {
+		return fmt.Errorf("invalid username: %q", username)
+	}
+	if out, _, err := executor.Run("usermod", "--lock", username); err != nil {
+		return fmt.Errorf("lock user %s: %s: %w", username, string(out), err)
+	}
+	log.Info("Locked user account: %s", username)
+	return nil
+}
+
+// Unlock unlocks the user's local password via usermod --unlock.
+// Removes the '!' prefix from the shadow hash.
+func Unlock(username string, log *logger.Logger) error {
+	if !validUsername.MatchString(username) {
+		return fmt.Errorf("invalid username: %q", username)
+	}
+	if out, _, err := executor.Run("usermod", "--unlock", username); err != nil {
+		return fmt.Errorf("unlock user %s: %s: %w", username, string(out), err)
+	}
+	log.Info("Unlocked user account: %s", username)
 	return nil
 }
 

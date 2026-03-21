@@ -1,5 +1,5 @@
 # Binaries
-pam-device-auth
+/pam-device-auth
 *.exe
 *.dll
 *.so
@@ -39,3 +39,4 @@ test_results/
 # Config with secrets (keep examples in configs/)
 /config.json
 !/configs/config.json
+configs/config-nkit.json

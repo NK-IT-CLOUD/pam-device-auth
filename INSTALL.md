@@ -48,7 +48,7 @@ On upgrade, existing configuration files are preserved.
 sudo apt install build-essential libpam0g-dev golang-go
 
 # Clone and build
-git clone https://github.com/nk-dev/pam-device-auth.git
+git clone https://github.com/NK-IT-CLOUD/pam-device-auth
 cd pam-device-auth
 make build-all
 

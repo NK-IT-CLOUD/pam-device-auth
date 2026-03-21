@@ -9,8 +9,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <stdarg.h>
+#include <errno.h>
 
 #define AUTH_BIN "/usr/local/bin/pam-device-auth"
 #define BUFFER_SIZE 4096
@@ -29,7 +31,7 @@ static const char* priority_to_level(int priority) {
 }
 
 // Helper function for logging
-void log_message(int priority, const char *format, ...) {
+static void log_message(int priority, const char *format, ...) {
     va_list args;
     va_start(args, format);
 
@@ -52,30 +54,46 @@ void log_message(int priority, const char *format, ...) {
     va_end(args);
 }
 
-// Function to extract IP address from various sources
-const char* get_client_ip(pam_handle_t *pamh) {
-    static char ip_str[INET6_ADDRSTRLEN] = "unknown";
+// Write all bytes to fd, retrying on partial writes. Returns 0 on success, -1 on error.
+static int write_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+// Extract client IP into caller-supplied buffer
+static void get_client_ip(pam_handle_t *pamh, char *ip_buf, size_t ip_buf_size) {
     const char *rhost = NULL;
 
+    strncpy(ip_buf, "unknown", ip_buf_size - 1);
+    ip_buf[ip_buf_size - 1] = '\0';
+
     // Check PAM_RHOST first
-    if (pam_get_item(pamh, PAM_RHOST, (const void **)&rhost) == PAM_SUCCESS && rhost) {
-        strncpy(ip_str, rhost, sizeof(ip_str) - 1);
-        ip_str[sizeof(ip_str) - 1] = '\0';
-        return ip_str;
+    if (pam_get_item(pamh, PAM_RHOST, (const void **)&rhost) == PAM_SUCCESS && rhost && *rhost) {
+        strncpy(ip_buf, rhost, ip_buf_size - 1);
+        ip_buf[ip_buf_size - 1] = '\0';
+        return;
     }
 
     // Check SSH_CONNECTION environment variable
     const char *ssh_conn = getenv("SSH_CONNECTION");
     if (ssh_conn) {
-        // Copy to local buffer before tokenizing (strtok modifies the string)
         char conn_buf[256];
         strncpy(conn_buf, ssh_conn, sizeof(conn_buf) - 1);
         conn_buf[sizeof(conn_buf) - 1] = '\0';
         char *token = strtok(conn_buf, " ");
         if (token) {
-            strncpy(ip_str, token, sizeof(ip_str) - 1);
-            ip_str[sizeof(ip_str) - 1] = '\0';
-            return ip_str;
+            strncpy(ip_buf, token, ip_buf_size - 1);
+            ip_buf[ip_buf_size - 1] = '\0';
+            return;
         }
     }
 
@@ -87,71 +105,158 @@ const char* get_client_ip(pam_handle_t *pamh) {
         client_buf[sizeof(client_buf) - 1] = '\0';
         char *token = strtok(client_buf, " ");
         if (token) {
-            strncpy(ip_str, token, sizeof(ip_str) - 1);
-            ip_str[sizeof(ip_str) - 1] = '\0';
-            return ip_str;
+            strncpy(ip_buf, token, ip_buf_size - 1);
+            ip_buf[ip_buf_size - 1] = '\0';
         }
     }
-
-    return ip_str;
 }
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     const char *username;
-    const char *client_ip;
-    FILE *fp;
+    char client_ip[INET6_ADDRSTRLEN];
     char buffer[BUFFER_SIZE];
     int result = PAM_AUTH_ERR;
 
-    // Suppress unused parameter warnings
     (void)flags;
     (void)argc;
     (void)argv;
 
-    // Get username for logging
     if (pam_get_user(pamh, &username, NULL) != PAM_SUCCESS) {
         log_message(LOG_ERR, "Could not get username");
         return PAM_USER_UNKNOWN;
     }
 
-    // Get client IP address
-    client_ip = get_client_ip(pamh);
+    get_client_ip(pamh, client_ip, sizeof(client_ip));
+    log_message(LOG_INFO, "Authentication attempt for user %s from IP %s", username, client_ip);
 
-    log_message(LOG_INFO, "Authentication attempt for user %s from IP %s",
-           username, client_ip);
-
-    // Set environment variables for the Go program
     setenv("PAM_USER", username, 1);
     setenv("PAM_RHOST", client_ip, 1);
 
-    // Execute the Go helper program
-    fp = popen(AUTH_BIN, "r");
-    if (fp == NULL) {
-        log_message(LOG_ERR, "Failed to execute %s", AUTH_BIN);
+    // Bidirectional pipes: parent ↔ child
+    int to_child[2];   // parent writes, child reads (stdin)
+    int from_child[2]; // child writes, parent reads (stdout)
+
+    if (pipe(to_child) != 0 || pipe(from_child) != 0) {
+        log_message(LOG_ERR, "Failed to create pipes");
         unsetenv("PAM_USER");
         unsetenv("PAM_RHOST");
         return PAM_SYSTEM_ERR;
     }
 
-    // Read and display output to user
-    while (fgets(buffer, sizeof(buffer)-1, fp) != NULL) {
-        buffer[strcspn(buffer, "\n")] = 0;  // Remove newline
-        if (strlen(buffer) > 0) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_message(LOG_ERR, "Fork failed");
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        unsetenv("PAM_USER");
+        unsetenv("PAM_RHOST");
+        return PAM_SYSTEM_ERR;
+    }
+
+    if (pid == 0) {
+        // Child: wire up stdin/stdout, close everything else
+        close(to_child[1]);
+        close(from_child[0]);
+
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+
+        close(to_child[0]);
+        close(from_child[1]);
+
+        // Close leaked fds (syslog, etc.) — keep only 0,1,2
+        for (int fd = 3; fd < 1024; fd++) {
+            close(fd);
+        }
+
+        execl(AUTH_BIN, AUTH_BIN, NULL);
+        _exit(127);
+    }
+
+    // Parent: read child stdout, handle PROMPT: lines via PAM conversation
+    close(to_child[0]);
+    close(from_child[1]);
+
+    FILE *fp = fdopen(from_child[0], "r");
+    if (fp == NULL) {
+        log_message(LOG_ERR, "fdopen failed");
+        close(to_child[1]);
+        close(from_child[0]);
+        waitpid(pid, NULL, 0);
+        unsetenv("PAM_USER");
+        unsetenv("PAM_RHOST");
+        return PAM_SYSTEM_ERR;
+    }
+
+    int prompt_used = 0; // Only allow one PROMPT: per session
+
+    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+        buffer[strcspn(buffer, "\n")] = 0;
+
+        if (strncmp(buffer, "PROMPT:", 7) == 0) {
+            // Only one password prompt allowed per authentication
+            if (prompt_used) {
+                log_message(LOG_ERR, "Multiple PROMPT: requests rejected");
+                write_all(to_child[1], "\n", 1);
+                continue;
+            }
+            prompt_used = 1;
+
+            const char *prompt_text = buffer + 7;
+            const struct pam_conv *conv = NULL;
+
+            if (pam_get_item(pamh, PAM_CONV, (const void **)&conv) != PAM_SUCCESS || conv == NULL) {
+                log_message(LOG_ERR, "Failed to get PAM conversation function");
+                write_all(to_child[1], "\n", 1);
+                continue;
+            }
+
+            struct pam_message msg;
+            const struct pam_message *msgp = &msg;
+            struct pam_response *resp = NULL;
+
+            msg.msg_style = PAM_PROMPT_ECHO_OFF;
+            msg.msg = prompt_text;
+
+            int conv_result = conv->conv(1, &msgp, &resp, conv->appdata_ptr);
+
+            // Always zero and free resp->resp if allocated, regardless of conv result
+            if (resp) {
+                if (resp->resp) {
+                    size_t len = strlen(resp->resp);
+                    if (conv_result == PAM_SUCCESS && len > 0) {
+                        write_all(to_child[1], resp->resp, len);
+                        write_all(to_child[1], "\n", 1);
+                    } else {
+                        write_all(to_child[1], "\n", 1);
+                    }
+                    memset(resp->resp, 0, len);
+                    free(resp->resp);
+                } else {
+                    write_all(to_child[1], "\n", 1);
+                }
+                free(resp);
+            } else {
+                write_all(to_child[1], "\n", 1);
+            }
+        } else if (strlen(buffer) > 0) {
             pam_info(pamh, "%s", buffer);
         }
     }
 
-    // Get exit status
-    int status = pclose(fp);
+    fclose(fp);
+    close(to_child[1]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
     if (WIFEXITED(status)) {
         int exit_status = WEXITSTATUS(status);
         if (exit_status == 0) {
-            log_message(LOG_INFO, "Authentication successful for user %s from IP %s",
-                   username, client_ip);
+            log_message(LOG_INFO, "Authentication successful for user %s from IP %s", username, client_ip);
             result = PAM_SUCCESS;
         } else {
-            log_message(LOG_WARNING, "Authentication failed for user %s from IP %s (exit code: %d)",
-                   username, client_ip, exit_status);
+            log_message(LOG_WARNING, "Authentication failed for user %s from IP %s (exit code: %d)", username, client_ip, exit_status);
             result = PAM_AUTH_ERR;
         }
     } else {
@@ -159,7 +264,6 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         result = PAM_SYSTEM_ERR;
     }
 
-    // Clean up environment variables
     unsetenv("PAM_USER");
     unsetenv("PAM_RHOST");
 
@@ -167,7 +271,6 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 }
 
 PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
-    // Suppress unused parameter warnings
     (void)pamh;
     (void)flags;
     (void)argc;
@@ -177,13 +280,12 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const cha
 }
 
 PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
-    // Suppress unused parameter warnings
     (void)pamh;
     (void)flags;
     (void)argc;
     (void)argv;
 
-    return PAM_SUCCESS;
+    return PAM_IGNORE; // Let pam_unix handle account management
 }
 
 #ifdef PAM_STATIC

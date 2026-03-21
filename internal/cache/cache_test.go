@@ -18,7 +18,7 @@ func setupTestDir(t *testing.T) string {
 func TestSaveAndLoad(t *testing.T) {
 	setupTestDir(t)
 
-	if err := Save("nk", "refresh-token-abc"); err != nil {
+	if err := Save(&CachedSession{Username: "nk", RefreshToken: "refresh-token-abc"}); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
 
@@ -52,7 +52,7 @@ func TestLoad_NotFound(t *testing.T) {
 func TestDelete(t *testing.T) {
 	setupTestDir(t)
 
-	Save("nk", "token")
+	Save(&CachedSession{Username: "nk", RefreshToken: "token"})
 	if err := Delete("nk"); err != nil {
 		t.Fatalf("Delete() error: %v", err)
 	}
@@ -75,8 +75,8 @@ func TestDelete_NotFound(t *testing.T) {
 func TestSave_OverwritesExisting(t *testing.T) {
 	setupTestDir(t)
 
-	Save("nk", "old-token")
-	Save("nk", "new-token")
+	Save(&CachedSession{Username: "nk", RefreshToken: "old-token"})
+	Save(&CachedSession{Username: "nk", RefreshToken: "new-token"})
 
 	session, _ := Load("nk")
 	if session.RefreshToken != "new-token" {
@@ -91,7 +91,7 @@ func TestSave_CreatesDirectory(t *testing.T) {
 	CacheDir = subdir
 	defer func() { CacheDir = origDir }()
 
-	if err := Save("nk", "token"); err != nil {
+	if err := Save(&CachedSession{Username: "nk", RefreshToken: "token"}); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestSave_CreatesDirectory(t *testing.T) {
 func TestSave_FilePermissions(t *testing.T) {
 	setupTestDir(t)
 
-	Save("nk", "token")
+	Save(&CachedSession{Username: "nk", RefreshToken: "token"})
 
 	info, err := os.Stat(filepath.Join(CacheDir, "nk.json"))
 	if err != nil {
@@ -122,7 +122,7 @@ func TestInvalidUsername(t *testing.T) {
 	setupTestDir(t)
 
 	for _, name := range []string{"../etc/passwd", "root@domain", "UPPER", "", "a b"} {
-		if err := Save(name, "token"); err == nil {
+		if err := Save(&CachedSession{Username: name, RefreshToken: "token"}); err == nil {
 			t.Errorf("Save(%q) should fail", name)
 		}
 		if _, err := Load(name); err == nil {
@@ -131,5 +131,121 @@ func TestInvalidUsername(t *testing.T) {
 		if err := Delete(name); err == nil {
 			t.Errorf("Delete(%q) should fail", name)
 		}
+	}
+}
+
+// --- IP tracking tests ---
+
+func TestHasIP(t *testing.T) {
+	s := &CachedSession{
+		Username:     "nk",
+		RefreshToken: "token",
+		KnownIPs:     []string{"10.0.1.50", "192.168.1.1"},
+	}
+
+	if !s.HasIP("10.0.1.50") {
+		t.Error("HasIP should return true for known IP")
+	}
+	if !s.HasIP("192.168.1.1") {
+		t.Error("HasIP should return true for known IP")
+	}
+	if s.HasIP("10.0.2.99") {
+		t.Error("HasIP should return false for unknown IP")
+	}
+	if s.HasIP("") {
+		t.Error("HasIP should return false for empty IP")
+	}
+}
+
+func TestAddIP(t *testing.T) {
+	s := &CachedSession{Username: "nk", RefreshToken: "token"}
+
+	s.AddIP("10.0.1.50")
+	if len(s.KnownIPs) != 1 || s.KnownIPs[0] != "10.0.1.50" {
+		t.Errorf("KnownIPs = %v, want [10.0.1.50]", s.KnownIPs)
+	}
+
+	// Adding same IP again should not duplicate
+	s.AddIP("10.0.1.50")
+	if len(s.KnownIPs) != 1 {
+		t.Errorf("KnownIPs should not duplicate, got %v", s.KnownIPs)
+	}
+
+	// Adding a new IP
+	s.AddIP("192.168.1.1")
+	if len(s.KnownIPs) != 2 {
+		t.Errorf("KnownIPs should have 2 entries, got %v", s.KnownIPs)
+	}
+}
+
+func TestSaveAndLoad_WithKnownIPs(t *testing.T) {
+	setupTestDir(t)
+
+	session := &CachedSession{
+		Username:     "nk",
+		RefreshToken: "token",
+		KnownIPs:     []string{"10.0.1.50", "192.168.1.1"},
+	}
+	if err := Save(session); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	loaded, err := Load("nk")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(loaded.KnownIPs) != 2 {
+		t.Fatalf("KnownIPs length = %d, want 2", len(loaded.KnownIPs))
+	}
+	if !loaded.HasIP("10.0.1.50") || !loaded.HasIP("192.168.1.1") {
+		t.Errorf("Loaded KnownIPs = %v, missing expected IPs", loaded.KnownIPs)
+	}
+}
+
+func TestSave_PreservesKnownIPs(t *testing.T) {
+	setupTestDir(t)
+
+	// Save with IPs
+	session := &CachedSession{
+		Username:     "nk",
+		RefreshToken: "old-token",
+		KnownIPs:     []string{"10.0.1.50"},
+	}
+	Save(session)
+
+	// Update token, add IP, save again
+	session.RefreshToken = "new-token"
+	session.AddIP("192.168.1.1")
+	Save(session)
+
+	loaded, _ := Load("nk")
+	if loaded.RefreshToken != "new-token" {
+		t.Errorf("RefreshToken = %q, want %q", loaded.RefreshToken, "new-token")
+	}
+	if len(loaded.KnownIPs) != 2 {
+		t.Errorf("KnownIPs = %v, want 2 entries", loaded.KnownIPs)
+	}
+}
+
+func TestLoad_BackwardCompatible(t *testing.T) {
+	setupTestDir(t)
+
+	// Simulate old cache format without known_ips
+	old := `{"refresh_token":"old-token","username":"nk"}`
+	os.WriteFile(filepath.Join(CacheDir, "nk.json"), []byte(old), 0600)
+
+	session, err := Load("nk")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if session.RefreshToken != "old-token" {
+		t.Errorf("RefreshToken = %q, want %q", session.RefreshToken, "old-token")
+	}
+	if len(session.KnownIPs) != 0 {
+		t.Errorf("KnownIPs should be empty for old format, got %v", session.KnownIPs)
+	}
+	// Old format = no known IPs = every IP is "new" = device auth required
+	if session.HasIP("10.0.1.50") {
+		t.Error("HasIP should return false for old cache format")
 	}
 }
