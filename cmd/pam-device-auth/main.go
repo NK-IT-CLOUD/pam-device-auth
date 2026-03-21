@@ -398,9 +398,9 @@ func tryCachedRefresh(log *logger.Logger, cfg *config.Config, httpClient *http.C
 		}
 	}
 
-	fmt.Println("────────────────────────────────────")
-	fmt.Println("Access granted — password verified, SSO session active.")
-	fmt.Println("────────────────────────────────────")
+	fmt.Println("------------------------------------")
+	fmt.Println("Access granted -- password verified, SSO session active.")
+	fmt.Println("------------------------------------")
 	return true, true
 }
 
@@ -416,7 +416,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	}
 
 	// Print to stdout — PAM pipes to SSH terminal
-	fmt.Println("────────────────────────────────────")
+	fmt.Println("------------------------------------")
 	if dc.VerificationURIComplete != "" {
 		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
 		fmt.Printf("Code:  %s\n", dc.UserCode)
@@ -429,7 +429,7 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 		fmt.Printf("Open:  %s\n", dc.VerificationURI)
 		fmt.Printf("Code:  %s\n", dc.UserCode)
 	}
-	fmt.Println("────────────────────────────────────")
+	fmt.Println("------------------------------------")
 
 	timeout := cfg.AuthTimeout
 	if dc.ExpiresIn > 0 && dc.ExpiresIn < timeout {
@@ -462,19 +462,19 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 
 	if result.Username != sshUser {
 		log.Error("Username mismatch: token=%q ssh=%q", result.Username, sshUser)
-		fmt.Println("────────────────────────────────────")
+		fmt.Println("------------------------------------")
 		fmt.Printf("Error: authorized as '%s', but SSH user is '%s'.\n", result.Username, sshUser)
 		fmt.Println("You must authorize with the matching account.")
-		fmt.Println("────────────────────────────────────")
+		fmt.Println("------------------------------------")
 		os.Exit(1)
 	}
 
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		log.Error("User %s lacks required role: %s", sshUser, cfg.RequiredRole)
-		fmt.Println("────────────────────────────────────")
+		fmt.Println("------------------------------------")
 		fmt.Printf("Access denied: '%s' lacks required role '%s'.\n", result.Username, cfg.RequiredRole)
 		fmt.Println("Contact your administrator.")
-		fmt.Println("────────────────────────────────────")
+		fmt.Println("------------------------------------")
 		os.Exit(1)
 	}
 
@@ -518,13 +518,13 @@ func deviceAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Cli
 	if created {
 		fmt.Printf("Login successful! User %s created.\n", sshUser)
 		if tempPassword != "" {
-			fmt.Println("────────────────────────────────────")
+			fmt.Println("------------------------------------")
 			fmt.Printf("Temporary password: %s\n", tempPassword)
 			fmt.Println("Use this on your next login.")
 			fmt.Println("You will be asked to set a new password.")
-			fmt.Println("────────────────────────────────────")
+			fmt.Println("------------------------------------")
 		}
-		fmt.Println("Disconnecting — please reconnect.")
+		fmt.Println("Disconnecting -- please reconnect.")
 	} else {
 		fmt.Println("Login successful!")
 	}

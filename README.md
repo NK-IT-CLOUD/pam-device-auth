@@ -128,18 +128,18 @@ First login -- device auth + user creation:
 
 ```bash
 ssh youruser@hostname
-# ────────────────────────────────────
+# ------------------------------------
 # Link:  https://sso.example.com/.../device?user_code=ABCD-EFGH
 # Code:  ABCD-EFGH
 # [QR code]
-# ────────────────────────────────────
+# ------------------------------------
 # Login successful! User youruser created.
-# ────────────────────────────────────
+# ------------------------------------
 # Temporary password: Kx7mP2qR4bvN
 # Use this on your next login.
 # You will be asked to set a new password.
-# ────────────────────────────────────
-# Disconnecting — please reconnect.
+# ------------------------------------
+# Disconnecting -- please reconnect.
 ```
 
 Second login -- enter temp password, then set your own:
@@ -147,9 +147,9 @@ Second login -- enter temp password, then set your own:
 ```bash
 ssh youruser@hostname
 # Password: [enter temp password]
-# ────────────────────────────────────
+# ------------------------------------
 #   Please set your local password.
-# ────────────────────────────────────
+# ------------------------------------
 # Current password: [enter temp password]
 # New password: [your chosen password]
 # Retype new password: [confirm]
@@ -161,9 +161,9 @@ All subsequent logins from the same IP -- just your password:
 ```bash
 ssh youruser@hostname
 # Password: [your password]
-# ────────────────────────────────────
-# Access granted — password verified, SSO session active.
-# ────────────────────────────────────
+# ------------------------------------
+# Access granted -- password verified, SSO session active.
+# ------------------------------------
 ```
 
 ## Configuration

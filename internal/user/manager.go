@@ -148,9 +148,9 @@ func generateTempPassword(length int) (string, error) {
 const passwordPromptScript = `# pam-device-auth: force local password setup on first login
 if [ ! -f "$HOME/.password_set" ]; then
     echo ""
-    echo "────────────────────────────────────"
+    echo "------------------------------------"
     echo "  Please set your local password."
-    echo "────────────────────────────────────"
+    echo "------------------------------------"
     echo ""
     if passwd; then
         touch "$HOME/.password_set"
