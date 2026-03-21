@@ -88,6 +88,9 @@ sudo dpkg -i pam-device-auth_0.3.0_amd64.deb
 
 > PAM is **not activated** on install. Root SSH key access continues to work.
 
+Upgrade: `sudo dpkg -i pam-device-auth_<version>_amd64.deb` (config preserved, sshd restarted).
+Uninstall: `sudo dpkg -P pam-device-auth` (restores original PAM config, restarts sshd). See [INSTALL.md](INSTALL.md).
+
 ### 2. Configure
 
 Edit `/etc/pam-device-auth/config.json`:

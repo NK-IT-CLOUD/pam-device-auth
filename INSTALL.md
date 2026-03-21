@@ -40,6 +40,32 @@ On first install, the package:
 
 On upgrade, existing configuration files are preserved and sshd is restarted.
 
+### Upgrade
+
+```bash
+sudo dpkg -i pam-device-auth_0.3.1_amd64.deb
+```
+
+Your `config.json`, PAM config, and SSH config are preserved. sshd is restarted automatically.
+
+### Uninstall
+
+```bash
+# Remove (keeps config files)
+sudo dpkg -r pam-device-auth
+
+# Remove completely (deletes config, logs, cache)
+sudo dpkg -P pam-device-auth
+```
+
+On removal, the package automatically:
+- Restores your original `/etc/pam.d/sshd` from backup
+- Removes the sshd config (`10-pam-device-auth.conf`)
+- Removes logrotate and tmpfiles entries
+- Restarts sshd
+
+OIDC-created local users are **not** deleted. Remove them manually if needed (`userdel -r <username>`).
+
 ### Activate PAM
 
 After configuring your OIDC provider:
