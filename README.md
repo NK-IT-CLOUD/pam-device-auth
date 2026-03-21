@@ -124,6 +124,8 @@ sudo pam-device-auth --enable
 
 ### 5. Test
 
+First login -- device auth + user creation:
+
 ```bash
 ssh youruser@hostname
 # ────────────────────────────────────
@@ -131,9 +133,38 @@ ssh youruser@hostname
 # Code:  ABCD-EFGH
 # [QR code]
 # ────────────────────────────────────
+# Login successful! User youruser created.
+# ────────────────────────────────────
+# Temporary password: Kx7mP2qR4bvN
+# Use this on your next login.
+# You will be asked to set a new password.
+# ────────────────────────────────────
+# Disconnecting — please reconnect.
 ```
 
-Open the URL, enter the code, authorize -- done.
+Second login -- enter temp password, then set your own:
+
+```bash
+ssh youruser@hostname
+# Password: [enter temp password]
+# ────────────────────────────────────
+#   Please set your local password.
+# ────────────────────────────────────
+# Current password: [enter temp password]
+# New password: [your chosen password]
+# Retype new password: [confirm]
+# Password set successfully.
+```
+
+All subsequent logins from the same IP -- just your password:
+
+```bash
+ssh youruser@hostname
+# Password: [your password]
+# ────────────────────────────────────
+# Access granted — password verified, SSO session active.
+# ────────────────────────────────────
+```
 
 ## Configuration
 
