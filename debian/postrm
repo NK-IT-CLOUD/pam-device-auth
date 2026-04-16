@@ -1,0 +1,66 @@
+#!/bin/sh
+set -e
+
+PKG="pam-device-auth"
+
+log() { echo "[${PKG}] $*"; }
+
+restart_ssh() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart ssh.service 2>/dev/null || \
+        systemctl restart sshd.service 2>/dev/null || \
+        log "WARNING: Could not restart SSH (manual restart may be needed)"
+    fi
+}
+
+case "$1" in
+    remove)
+        log "Removing ${PKG}"
+
+        # Remove SSH daemon config
+        rm -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf
+
+        # Restore original PAM config
+        if [ -f /etc/pam.d/sshd.original ]; then
+            mv /etc/pam.d/sshd.original /etc/pam.d/sshd
+            log "Restored original PAM config"
+        fi
+
+        # Remove logrotate + tmpfiles
+        rm -f /etc/logrotate.d/${PKG}
+        rm -f /etc/tmpfiles.d/${PKG}.conf
+
+        restart_ssh
+        log "Removal complete"
+        ;;
+
+    purge)
+        log "Purging ${PKG}"
+
+        # Remove SSH daemon config (if remove didn't run)
+        rm -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf
+
+        # Restore original PAM config
+        if [ -f /etc/pam.d/sshd.original ]; then
+            mv /etc/pam.d/sshd.original /etc/pam.d/sshd
+            log "Restored original PAM config"
+        fi
+
+        # Remove all config, cache, logs
+        rm -rf /etc/${PKG}
+        rm -rf /run/${PKG}
+        rm -f /var/log/${PKG}.log
+        rm -f /var/log/${PKG}-uninstall.log
+        rm -f /etc/logrotate.d/${PKG}
+        rm -f /etc/tmpfiles.d/${PKG}.conf
+
+        restart_ssh
+        log "Purge complete"
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # Nothing to do
+        ;;
+esac
+
+exit 0
