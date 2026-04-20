@@ -1,0 +1,131 @@
+#!/bin/sh
+set -e
+
+PKG="pam-device-auth"
+PKG_VERSION=$(dpkg-query -W -f='${Version}' "$PKG" 2>/dev/null || echo "unknown")
+SHARE_DIR="/usr/share/${PKG}"
+CONFIG_DIR="/etc/${PKG}"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+LOG_FILE="/var/log/${PKG}.log"
+CACHE_DIR="/run/${PKG}"
+
+log() { echo "[${PKG}] $*"; }
+
+setup_logrotate() {
+    cat > /etc/logrotate.d/${PKG} << 'EOF'
+/var/log/pam-device-auth.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+EOF
+}
+
+setup_tmpfiles() {
+    cat > /etc/tmpfiles.d/${PKG}.conf << EOF
+d ${CACHE_DIR} 0700 root root -
+EOF
+    mkdir -p "${CACHE_DIR}"
+    chmod 700 "${CACHE_DIR}"
+}
+
+check_os() {
+    if [ -f /etc/os-release ]; then
+        # Subshell: os-release exports VERSION, ID, etc. — don't pollute our namespace
+        _os_warn=$(
+            . /etc/os-release
+            case "$ID" in
+                ubuntu)
+                    if [ "${VERSION_ID%%.*}" -lt 24 ] 2>/dev/null; then
+                        echo "WARNING: Ubuntu 24.04+ recommended (found ${VERSION_ID})"
+                    fi
+                    ;;
+                debian)
+                    if [ "${VERSION_ID%%.*}" -lt 13 ] 2>/dev/null; then
+                        echo "WARNING: Debian 13+ required — OpenSSH >= 9.6 needed (found ${VERSION_ID})"
+                    fi
+                    ;;
+            esac
+        )
+        [ -n "$_os_warn" ] && log "$_os_warn"
+    fi
+    return 0
+}
+
+restart_ssh() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart ssh.service 2>/dev/null || \
+        systemctl restart sshd.service 2>/dev/null || \
+        log "WARNING: Could not restart SSH (manual restart may be needed)"
+    fi
+}
+
+case "$1" in
+    configure)
+        check_os
+
+        mkdir -p /etc/ssh/sshd_config.d
+        mkdir -p "${CONFIG_DIR}"
+
+        # Migrate from keycloak-ssh-auth if present
+        if [ -d /etc/keycloak-ssh-auth ]; then
+            log "Migrating from keycloak-ssh-auth..."
+            rm -f /etc/logrotate.d/keycloak-ssh-auth
+            rm -f /usr/lib/tmpfiles.d/keycloak-ssh-auth.conf
+            rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf
+            if [ -f /etc/keycloak-ssh-auth/keycloak-pam.json ]; then
+                cp /etc/keycloak-ssh-auth/keycloak-pam.json "${CONFIG_DIR}/keycloak-pam.json.migrated"
+                log "Old config preserved at ${CONFIG_DIR}/keycloak-pam.json.migrated"
+            fi
+            rm -rf /etc/keycloak-ssh-auth
+        fi
+
+        setup_logrotate
+        setup_tmpfiles
+
+        # Install sshd config (for Match User root)
+        if [ ! -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf ]; then
+            cp "${SHARE_DIR}/config/10-pam-device-auth.conf" /etc/ssh/sshd_config.d/
+            log "Installed SSH config"
+        fi
+
+        # Install default config template (does NOT activate PAM)
+        if [ ! -f "${CONFIG_FILE}" ]; then
+            cp "${SHARE_DIR}/config/config.json" "${CONFIG_FILE}"
+            log "Installed default config template"
+        fi
+
+        # --- Permissions ---
+        chmod 755 /usr/local/bin/pam-device-auth
+        chmod 755 /usr/lib/security/pam_device_auth.so
+        chmod 600 "${CONFIG_FILE}"
+        touch "${LOG_FILE}"
+        # Log contains PII (usernames, emails, IPs, roles) — restrict to root+adm
+        chmod 640 "${LOG_FILE}"
+        if getent group adm >/dev/null 2>&1; then
+            chown root:adm "${LOG_FILE}"
+        fi
+
+        # Check if PAM is already activated (upgrade scenario)
+        if [ -f /etc/pam.d/sshd.original ]; then
+            # PAM was previously activated — restart sshd for binary update
+            restart_ssh
+            log "${PKG} ${PKG_VERSION} upgraded successfully."
+        else
+            # Fresh install — do NOT activate PAM automatically
+            log "${PKG} ${PKG_VERSION} installed."
+            log ""
+            log "Next steps:"
+            log "  1. Edit ${CONFIG_FILE} with your OIDC provider settings"
+            log "  2. Run: pam-device-auth --check"
+            log "  3. Run: sudo pam-device-auth --enable"
+            log ""
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,128 @@
+.TH PAM-DEVICE-AUTH 8 "2026-03-28" "0.3.4" "System Administration"
+.SH NAME
+pam-device-auth \- SSH authentication via OIDC Device Authorization Grant
+.SH SYNOPSIS
+.B pam-device-auth
+[\fB\-\-check\fR]
+[\fB\-\-enable\fR]
+[\fB\-\-debug\fR]
+[\fB\-\-version\fR]
+[\fB\-\-help\fR]
+.SH DESCRIPTION
+.B pam-device-auth
+is a PAM module and Go binary that authenticates SSH users via the OIDC
+Device Authorization Grant (RFC 8628). Users see a URL and code in their
+terminal, authorize in a browser, and the SSH session is granted.
+.PP
+The Go binary is invoked by the C PAM module
+.RB ( pam_device_auth.so )
+during SSH keyboard-interactive authentication. It is not typically run
+directly by users, except for the
+.B \-\-check
+and
+.B \-\-enable
+commands.
+.SH OPTIONS
+.TP
+.B \-\-check
+Validate the configuration file and test OIDC provider connectivity.
+Exits with 0 on success, 1 on failure.
+.TP
+.B \-\-enable
+Activate PAM authentication. Backs up
+.IR /etc/pam.d/sshd ,
+installs the PAM config, and restarts sshd. Requires root.
+.TP
+.B \-\-debug
+Enable verbose logging to
+.IR /var/log/pam-device-auth.log .
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.B \-\-help
+Print usage and exit.
+.SH CONFIGURATION
+Configuration file:
+.IR /etc/pam-device-auth/config.json .
+.PP
+.TS
+l l l l.
+Field	Required	Default	Description
+_
+issuer_url	Yes	\-	OIDC issuer URL
+client_id	Yes	\-	OAuth2 client ID (public)
+required_role	Yes	\-	Role claim value for SSH access
+sudo_role	No	\-	Role for admin group membership
+role_claim	No	realm_access.roles	JWT claim key for roles
+auth_timeout	No	180	Device flow timeout (30\-600s)
+create_user	No	true	Create local user on first login
+user_groups	No	["sudo"]	Groups for normal users
+admin_groups	No	\-	Groups for sudo_role users
+force_password_change	No	true	Require password change on first login
+show_qr	No	auto	QR display: true/false/auto-detect
+ip_claim	No	\-	JWT claim with allowed IPs/CIDRs
+.TE
+.PP
+Every field can be overridden via environment variables prefixed with
+.BR PAM_DEVICE_AUTH_ .
+.SH FILES
+.TP
+.I /etc/pam-device-auth/config.json
+OIDC provider configuration.
+.TP
+.I /usr/lib/security/pam_device_auth.so
+C PAM shared library.
+.TP
+.I /usr/local/bin/pam-device-auth
+Go binary.
+.TP
+.I /run/pam-device-auth/
+Token cache directory (tmpfs, cleared on reboot). Mode 0700 root:root.
+.TP
+.I /var/log/pam-device-auth.log
+Authentication log file.
+.TP
+.I /etc/ssh/sshd_config.d/10-pam-device-auth.conf
+sshd configuration (LogLevel DEBUG1, KbdInteractiveAuthentication yes).
+.SH AUTHENTICATION FLOW
+.PP
+.B First login
+(new user or new IP): OIDC Device Authorization Grant. User sees URL + code
+(+ QR code if client supports UTF-8). Authorizes in browser. User is created
+with a temporary password. Session disconnects.
+.PP
+.B Second login:
+User enters temporary password. Prompted to set a permanent password.
+.PP
+.B Subsequent logins
+(same IP): Local password + OIDC token refresh (fast path, no browser).
+.PP
+.B New IP:
+Full device authorization required again.
+.SH SECURITY
+.PP
+IP-bound sessions, JWT algorithm/key-type binding, OIDC endpoint HTTPS
+enforcement, KnownIPs capped at 20 (FIFO), shadow TOCTOU elimination,
+crypt_r(3) password verification, fork/exec (no shell), single password
+prompt per session, SIGPIPE handling, waitpid timeout, log sanitization.
+.PP
+See
+.I SECURITY.md
+in the source repository for the full threat model.
+.SH REQUIREMENTS
+.PP
+Ubuntu 24.04+ or Debian 13+. OpenSSH >= 9.6p1.
+.B LogLevel DEBUG1
+in sshd_config is required for SSH client auto-detection (QR code display).
+.SH SEE ALSO
+.BR pam (8),
+.BR sshd (8),
+.BR sshd_config (5),
+.BR pam.conf (5)
+.SH AUTHORS
+Norbert Krucky <nk@dev.nk-it.cloud>
+.SH BUGS
+Report bugs at https://github.com/NK-IT-CLOUD/pam-device-auth/issues.
+.PP
+Security vulnerabilities: email nk@dev.nk-it.cloud (do not open public issues).

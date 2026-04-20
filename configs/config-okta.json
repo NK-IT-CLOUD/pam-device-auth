@@ -1,0 +1,12 @@
+{
+    "issuer_url": "https://your-org.okta.com/oauth2/default",
+    "client_id": "your-client-id",
+    "required_role": "ssh-access",
+    "sudo_role": "ssh-admin",
+    "role_claim": "groups",
+    "auth_timeout": 180,
+    "create_user": true,
+    "user_groups": ["users"],
+    "admin_groups": ["sudo", "users"],
+    "force_password_change": true
+}
