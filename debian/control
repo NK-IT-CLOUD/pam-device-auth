@@ -1,0 +1,15 @@
+Package: pam-device-auth
+Version: 0.5.3
+Architecture: amd64
+Depends: libc6, openssh-server (>= 1:9.6p1)
+Recommends: sssd-ldap, libnss-sss, libpam-sss
+Maintainer: Norbert Krucky <nk@dev.nk-it.cloud>
+Section: admin
+Priority: optional
+Homepage: https://github.com/NK-IT-CLOUD/pam-device-auth
+Description: Two-factor SSH login: directory key + OIDC device grant (RFC 8628)
+ Identity, groups, home directory and the sudo password come from an LDAP
+ directory via SSSD/NSS; pam-device-auth adds the OIDC Device Authorization
+ Grant (Keycloak, Auth0, Okta, Authentik) as a second factor for every SSH
+ login. Works headless and on OpenSSH 10.2+. Statically linked Go helper,
+ zero external dependencies.
