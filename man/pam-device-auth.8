@@ -1,0 +1,189 @@
+.TH PAM-DEVICE-AUTH 8 "2026-06-10" "0.5.3" "System Administration"
+.SH NAME
+pam-device-auth \- two-factor SSH login (directory key + OIDC device grant)
+.SH SYNOPSIS
+.B pam-device-auth
+[\fB\-\-check\fR]
+[\fB\-\-setup\-ldap\fR]
+[\fB\-\-enable\fR]
+[\fB\-\-debug\fR]
+[\fB\-\-version\fR]
+[\fB\-\-help\fR]
+.SH DESCRIPTION
+.B pam-device-auth
+provides two-factor SSH login: an SSH key served from an LDAP directory
+.RB ( publickey )
+plus the OIDC Device Authorization Grant (RFC 8628). Identity, groups, home
+directory and the sudo password come from the directory via SSSD/NSS;
+pam-device-auth is the OIDC layer \(em it validates an access token (signature,
+issuer, client binding, expiry, required role, optional IP allowlist) for the
+SSH user and grants or denies the login. It never reads
+.IR /etc/shadow ,
+prompts for a local password, or creates users.
+.PP
+For the OIDC factor the user sees a URL and code in their terminal, authorizes
+in a browser, and the session is granted. The Go binary is invoked by the C PAM
+module
+.RB ( pam_device_auth.so )
+during SSH keyboard-interactive authentication. It is not typically run
+directly by users, except for the
+.BR \-\-check ,
+.B \-\-setup\-ldap
+and
+.B \-\-enable
+commands.
+.PP
+Works on OpenSSH 10.2+, which refuses PAM for users not resolvable via
+.BR getpwnam (3)
+\(em directory users resolve through NSS, so they always exist.
+.SH OPTIONS
+.TP
+.B \-\-check
+Run the pre-activation preflight: validate the config, test OIDC discovery and
+issuer match, verify the directory path (SSSD running, access group resolves via
+NSS, every access-group member has a valid
+.IR sshPublicKey )
+and the sshd factors (AuthorizedKeysCommand, non-root 2FA, root break-glass).
+Each item is reported as [OK]/[WARN]/[FAIL]; exits non-zero if any blocker is found.
+.TP
+.B \-\-setup\-ldap
+Configure directory identity from the
+.I ldap
+block of the config: write
+.IR /etc/sssd/sssd.conf ,
+add
+.B sss
+to nsswitch, enable
+.BR pam_mkhomedir ,
+install the sudoers rule for the admin group, write the sshd drop-in, and
+migrate any pre-existing local accounts that shadow a directory user.
+Idempotent. Requires root.
+.TP
+.B \-\-enable
+Activate PAM authentication. Backs up
+.IR /etc/pam.d/sshd ,
+installs the PAM config, and restarts sshd. Requires root.
+.TP
+.B \-\-debug
+Enable verbose logging to
+.IR /var/log/pam-device-auth.log .
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.B \-\-help
+Print usage and exit.
+.SH CONFIGURATION
+Configuration file:
+.IR /etc/pam-device-auth/config.json .
+.PP
+.TS
+l l l l.
+Field	Required	Default	Description
+_
+issuer_url	Yes	\-	OIDC issuer URL
+client_id	Yes	\-	OAuth2 client ID (public)
+required_role	Yes	\-	Role claim value for SSH access
+sudo_role	No	\-	Directory group/role for sudo
+role_claim	No	\-	Extra JWT claim path for roles
+auth_timeout	No	180	Device flow timeout (30\-240s)
+allowed_algorithms	No	\-	Pin accepted JWT alg (e.g. ["RS256"])
+show_qr	No	auto	QR display: true/false/auto-detect
+ip_claim	No	\-	JWT claim with allowed IPs/CIDRs
+ldap	setup	\-	Directory block for \-\-setup\-ldap (see below)
+.TE
+.PP
+The
+.I ldap
+block (used only by
+.BR \-\-setup\-ldap )
+holds
+.IR uri ", " base_dn ", " bind_dn ", " bind_password ", " access_group
+and
+.IR admin_group .
+The read-only bind password is written into the root-only
+.I /etc/sssd/sssd.conf
+for SSSD's runtime use and is not read by the auth runtime.
+.PP
+Every field can be overridden via environment variables prefixed with
+.BR PAM_DEVICE_AUTH_ .
+.SH FILES
+.TP
+.I /etc/pam-device-auth/config.json
+OIDC provider configuration.
+.TP
+.I /usr/lib/security/pam_device_auth.so
+C PAM shared library.
+.TP
+.I /usr/local/bin/pam-device-auth
+Go binary.
+.TP
+.I /run/pam-device-auth/
+Token cache directory (tmpfs, cleared on reboot). Mode 0700 root:root.
+.TP
+.I /var/log/pam-device-auth.log
+Authentication log file.
+.TP
+.I /etc/ssh/sshd_config.d/10-pam-device-auth.conf
+sshd configuration (LogLevel DEBUG1, KbdInteractiveAuthentication yes).
+.TP
+.I /etc/sssd/sssd.conf
+Directory wiring written by \-\-setup\-ldap (0600 root). SSSD reads it at runtime.
+.TP
+.I /etc/sudoers.d/pam-device-auth
+sudo rule for the admin group, written by \-\-setup\-ldap.
+.SH AUTHENTICATION FLOW
+.PP
+Non-root logins require both factors:
+.B publickey
+(the user's key, served from the directory by
+.BR sss_ssh_authorizedkeys )
+.B and
+.B keyboard-interactive
+(the OIDC device grant).
+.PP
+.B First login / new IP:
+full OIDC Device Authorization Grant. User sees URL + code (+ QR code if the
+client supports UTF-8), authorizes in a browser. The token is re-validated
+(required role, IP allowlist) and the login is granted.
+.PP
+.B Known IP:
+silent OIDC token refresh, re-validated, no browser round-trip. The SSH key
+factor is always required.
+.PP
+.B Root:
+SSH key only
+.RB ( "AuthenticationMethods publickey" )
+against its local authorized_keys \(em break-glass, independent of
+OIDC/SSSD/LDAP availability.
+.SH SECURITY
+.PP
+Two factors (directory SSH key + OIDC), with full token validation on every
+login: signature, issuer, azp/aud, exp/nbf/iat, required role and IP allowlist;
+JWT algorithm/key-type binding, kid required, no none/HMAC. Directory
+revocation: removing a user from the access group denies new logins and sudo
+within the SSSD cache TTL. sudo re-authenticates against the directory password
+via pam_sss. The C PAM shim uses fork/exec (no shell), clearenv with an env
+whitelist, pipe2(O_CLOEXEC), a per-call timeout, SIGPIPE handling and log
+sanitization. The refresh-token cache lives in tmpfs (0700 root:root, cleared
+on reboot) with the KnownIPs list capped (FIFO).
+.PP
+See
+.I SECURITY.md
+in the source repository for the full threat model.
+.SH REQUIREMENTS
+.PP
+Ubuntu 24.04+ or Debian 13+ (tested on Ubuntu 24.04, Ubuntu 26.04 LTS, Debian 13). OpenSSH >= 9.6p1.
+.B LogLevel DEBUG1
+in sshd_config is required for SSH client auto-detection (QR code display).
+.SH SEE ALSO
+.BR pam (8),
+.BR sshd (8),
+.BR sshd_config (5),
+.BR pam.conf (5)
+.SH AUTHORS
+Norbert Krucky <nk@dev.nk-it.cloud>
+.SH BUGS
+Report bugs at https://github.com/NK-IT-CLOUD/pam-device-auth/issues.
+.PP
+Security vulnerabilities: email nk@dev.nk-it.cloud (do not open public issues).
