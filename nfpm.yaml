@@ -1,0 +1,77 @@
+# pam-device-auth packaging manifest — one source for .deb and .rpm.
+# Version comes from the VERSION env (set by the make targets); never hardcode.
+name: pam-device-auth
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: admin
+priority: optional
+maintainer: Norbert Krucky <nk@dev.nk-it.cloud>
+homepage: https://github.com/NK-IT-CLOUD/pam-device-auth
+description: |
+  Two-factor SSH login: directory key + OIDC device grant (RFC 8628)
+  Identity, groups, home directory and the sudo password come from an LDAP
+  directory via SSSD/NSS; pam-device-auth adds the OIDC Device Authorization
+  Grant (Keycloak, Auth0, Okta, Authentik) as a second factor for every SSH
+  login. Works headless and on OpenSSH 10.2+. Statically linked Go helper,
+  zero external dependencies.
+
+# All contents live in one top-level list. `overrides.<format>.contents` is
+# NOT used: nfpm merges overrides with mergo.WithOverride, which REPLACES the
+# whole top-level contents slice rather than appending to it — any file only
+# listed under an override silently vanishes from the final package. Instead,
+# format-specific files stay here and are scoped with `packager:` (see
+# Config.Get() in nfpm's source, which filters contents by
+# `f.Packager == format || f.Packager == ""`).
+contents:
+  - src: ./build/bin/pam-device-auth
+    dst: /usr/local/bin/pam-device-auth
+    file_info: { mode: 0755 }
+  - src: ./configs/config.json
+    dst: /usr/share/pam-device-auth/config/config.json
+  - src: ./configs/10-pam-device-auth.conf
+    dst: /usr/share/pam-device-auth/config/10-pam-device-auth.conf
+  - src: ./configs/pam-sshd-device-auth
+    dst: /usr/share/pam-device-auth/config/pam-sshd-device-auth
+  - src: ./configs/pam-sshd-device-auth-rhel
+    dst: /usr/share/pam-device-auth/config/pam-sshd-device-auth-rhel
+  - src: ./build/man/pam-device-auth.8.gz
+    dst: /usr/share/man/man8/pam-device-auth.8.gz
+  - src: ./pam_device_auth.so
+    dst: /usr/lib/security/pam_device_auth.so
+    file_info: { mode: 0755 }
+    packager: deb
+  - src: ./pam_device_auth.so
+    dst: /usr/lib64/security/pam_device_auth.so
+    file_info: { mode: 0755 }
+    packager: rpm
+
+scripts:
+  postinstall: ./debian/postinst
+  postremove: ./debian/postrm
+
+overrides:
+  deb:
+    depends:
+      - libc6
+      - openssh-server (>= 1:9.6p1)
+    recommends:
+      - sssd-ldap
+      - libnss-sss
+      - libpam-sss
+      - sssd-dbus
+  rpm:
+    depends:
+      - glibc
+      - openssh-server
+    recommends:
+      - sssd
+      - sssd-ldap
+      - sssd-tools
+
+# Deterministic output for reproducible builds: nfpm v2.47.0 reads
+# SOURCE_DATE_EPOCH from the environment automatically when `mtime` is
+# unset (see internal/modtime.FromEnv() in nfpm's source) — no template
+# value is accepted here (mtime is a time.Time field, not a Go template
+# string), so we rely on the env var alone. The make targets export it.
