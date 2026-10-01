@@ -1,0 +1,17 @@
+{
+    "issuer_url": "https://auth.example.com/application/o/ssh-server",
+    "client_id": "ssh-server",
+    "required_role": "ssh-access",
+    "sudo_role": "ssh-admin",
+    "role_claim": "groups",
+    "allowed_algorithms": ["RS256"],
+    "auth_timeout": 180,
+    "ldap": {
+        "uri": "ldaps://ldap.example.com:636",
+        "base_dn": "dc=example,dc=com",
+        "bind_dn": "uid=nss-ro,ou=people,dc=example,dc=com",
+        "bind_password": "CHANGE_ME_read_only_bind_password",
+        "access_group": "ssh-access",
+        "admin_group": "ssh-admin"
+    }
+}
