@@ -1,0 +1,116 @@
+# CI for pushes and pull requests on GitHub (hosted runners, no secrets). The
+# maintainers' Gitea runs its own release-candidate pipeline (deploy to test hosts,
+# integration tests) from a separate workflow; this file is the public check.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded pull-request runs are cancelled; every push to main runs to the end.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # go.mod pins the toolchain (security-patched stdlib); setup-go honours it.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc libpam0g-dev
+
+      - name: Format
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "Unformatted Go files:"
+            echo "$UNFORMATTED"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Version consistency
+        run: |
+          V_FILE=$(tr -d '[:space:]' < VERSION)
+          V_MAKE=$(grep '^VERSION' makefile | sed 's/.*=\s*//' | tr -d '[:space:]')
+          V_MAIN=$(grep -E '^var VERSION = "' cmd/pam-device-auth/main.go | grep -o '"[^"]*"' | tr -d '"')
+          V_DEB=$(grep '^Version:' debian/control | cut -d' ' -f2 | tr -d '[:space:]' | sed 's/~rc/-rc/')
+          # .TH NAME SECTION "date" "version" "manual": the version is the 4th field
+          V_MAN=$(grep -m1 '^\.TH ' man/pam-device-auth.8 | awk -F'"' '{print $4}')
+          for v in "$V_MAKE" "$V_MAIN" "$V_DEB" "$V_MAN"; do
+            if [ "$v" != "$V_FILE" ]; then
+              echo "Version mismatch: VERSION=$V_FILE makefile=$V_MAKE main.go=$V_MAIN debian/control=$V_DEB man=$V_MAN"
+              exit 1
+            fi
+          done
+          echo "Version check OK: $V_FILE"
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      # Every relative link and image in the public documentation must resolve in
+      # this tree, including heading anchors (GitHub slug rules).
+      - name: Documentation links
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          files = ["README.md", "INSTALL.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md"] + sorted(glob.glob("docs/*.md"))
+          def slugs(path):
+              out = set()
+              for line in open(path, encoding="utf-8"):
+                  m = re.match(r"^#{1,6}\s+(.*?)\s*#*\s*$", line)
+                  if m:
+                      t = re.sub(r"[`*]", "", m.group(1)).lower()
+                      t = re.sub(r"[^\w\- ]", "", t).replace(" ", "-")
+                      out.add(t)
+              return out
+          bad = []
+          for f in files:
+              text = open(f, encoding="utf-8").read()
+              text = re.sub(r"```.*?```", "", text, flags=re.S)
+              refs = re.findall(r"\]\(([^)\s]+)\)", text) + re.findall(r'(?:src|srcset)="([^"]+)"', text)
+              for ref in refs:
+                  if re.match(r"^(https?:|mailto:)", ref):
+                      continue
+                  path, _, frag = ref.partition("#")
+                  target = os.path.normpath(os.path.join(os.path.dirname(f), path)) if path else f
+                  if not os.path.exists(target):
+                      bad.append(f"{f}: {ref} (missing {target})")
+                  elif frag and target.endswith(".md") and frag not in slugs(target):
+                      bad.append(f"{f}: {ref} (no heading #{frag} in {target})")
+          if bad:
+              print("Broken documentation links:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print(f"Documentation links OK ({len(files)} files)")
+          PY
+
+      - name: Build
+        run: |
+          make build
+          make pam
+
+      - name: Test
+        run: make test
+
+      - name: Vet
+        run: make lint
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

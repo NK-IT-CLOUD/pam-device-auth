@@ -1,0 +1,21 @@
+#%PAM-1.0
+# pam-device-auth (RHEL/Rocky family): OIDC Device Authorization Grant as 2nd
+# factor. Identity, home creation and account/session come from SSSD via the
+# authselect-managed password-auth stack. Auth stack is device-auth + env only
+# (no password prompt) — the SSH first factor is the directory key.
+auth       required     pam_device_auth.so
+auth       required     pam_env.so
+account    required     pam_sepermit.so
+account    required     pam_nologin.so
+account    required     pam_device_auth.so
+account    include      password-auth
+password   include      password-auth
+session    required     pam_selinux.so close
+session    required     pam_loginuid.so
+session    required     pam_selinux.so open env_params
+session    required     pam_namespace.so
+session    optional     pam_keyinit.so force revoke
+session    optional     pam_motd.so
+session    required     pam_limits.so
+session    include      password-auth
+session    include      postlogin
