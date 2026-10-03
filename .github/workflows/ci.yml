@@ -1,6 +1,7 @@
-# CI for pushes and pull requests on GitHub (hosted runners, no secrets). Release
-# candidates are additionally tested on real hosts (integration tests) before a
-# release; this file is the public check.
+# CI for pushes and pull requests. The same file runs on GitHub (hosted runners, no
+# secrets) and on the maintainer's own runner (repository variable CI_RUNNER selects
+# it there). Release candidates are additionally tested on real hosts (integration
+# tests) before a release.
 name: CI
 on:
   push:
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,7 +31,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The self-hosted runner has the build dependencies installed.
       - name: Build dependencies
+        if: vars.CI_RUNNER == ''
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q gcc libpam0g-dev
@@ -114,3 +117,31 @@ jobs:
 
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  # Self-test of the leak gate; then, where the patterns exist (secrets), nothing
+  # private in the tree.
+  leak-gate:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Self-test
+        run: packaging/leak-gate-test.sh
+
+      - name: Tree
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          LEAK_ALLOW: ${{ secrets.LEAK_ALLOW }}
+          SELF_HOSTED: ${{ vars.CI_RUNNER }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LEAK_PATTERNS" ]; then
+            # The maintainer's CI must scan; elsewhere there are no patterns.
+            [ -z "$SELF_HOSTED" ] || { echo "FAIL: secret LEAK_PATTERNS missing"; exit 1; }
+            echo "no leak patterns here: self-test only"; exit 0
+          fi
+          packaging/leak-gate.sh HEAD
