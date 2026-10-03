@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 500" width="1000" height="500" role="img" aria-labelledby="t d">
+<title id="t">pam-device-auth: layer 2, the OIDC sign-in</title>
+<desc id="d">After the SSH key is accepted, pam-device-auth first checks that the user resolves through SSSD. With a cached session for the same source IP it refreshes the token at the identity provider; otherwise it runs the device flow, where the user approves a code in the browser. A rejected refresh clears the cache, a network error keeps it. The token is validated locally against the cached JWKS: signature, issuer, azp or aud, exp, nbf, iat, kid, the username and the required role. Layer 3 follows.</desc>
+<defs>
+<marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1L9 5L0 9z" fill="#818b98"/></marker>
+<marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1L9 5L0 9z" fill="#0969da"/></marker>
+</defs>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Helvetica,Arial,sans-serif;font-size:12.5px;fill:#59636e}
+.h{font-size:14px;font-weight:600;fill:#1f2328}
+.p{font-size:15px;font-weight:600;fill:#0969da}
+.c{text-anchor:middle}
+.r{text-anchor:end}
+.n{font-style:italic}
+.e{font-size:12px}
+.box{fill:#f6f8fa;stroke:#d1d9e0;stroke-width:1}
+.in{fill:#ffffff;stroke:#54aeff;stroke-width:1}
+.l{fill:none;stroke:#818b98;stroke-width:1.25;marker-end:url(#a)}
+.k{fill:none;stroke:#0969da;stroke-width:1.25;stroke-dasharray:5 4;marker-end:url(#b)}
+</style>
+<rect class="box" x="440" y="16" width="360" height="52" rx="8"/>
+<text class="h c" x="620" y="40">Identity provider</text>
+<text class="c" x="620" y="60">e.g. Keycloak</text>
+<rect class="box" x="16" y="200" width="110" height="88" rx="8"/>
+<text class="h c" x="71" y="226">SSH client</text>
+<text class="c" x="71" y="246">key accepted,</text>
+<text class="c" x="71" y="262">OIDC prompt</text>
+<path class="l" d="M126 244H168"/>
+<rect x="170" y="100" width="700" height="300" rx="14" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+<text class="p" x="188" y="126">Layer 2: pam_device_auth</text>
+<rect class="in" x="206" y="208" width="120" height="72" rx="8"/>
+<text class="h c" x="266" y="234">Identity gate</text>
+<text class="c" x="266" y="254">user resolves via</text>
+<text class="c" x="266" y="270">SSSD, else deny</text>
+<path class="l" d="M326 244H348"/>
+<path d="M372 222L394 244L372 266L350 244z" fill="#0969da"/>
+<text class="h" x="404" y="240">Cached session</text>
+<text class="e" x="404" y="257">for this source IP?</text>
+<path class="l" d="M372 222V176H430"/>
+<path class="l" d="M372 266V332H430"/>
+<text class="e" x="382" y="207">yes</text>
+<text class="e" x="382" y="296">no</text>
+<rect class="in" x="432" y="140" width="170" height="72" rx="8"/>
+<text class="h c" x="517" y="166">Refresh token</text>
+<text class="c" x="517" y="186">at the token endpoint</text>
+<text class="c" x="517" y="202">known IP only</text>
+<rect class="in" x="432" y="296" width="170" height="72" rx="8"/>
+<text class="h c" x="517" y="322">Device flow</text>
+<text class="c" x="517" y="342">URL, code and QR code,</text>
+<text class="c" x="517" y="358">poll until approved</text>
+<rect class="in" x="652" y="150" width="198" height="196" rx="8"/>
+<text class="h c" x="751" y="222">Validate token</text>
+<text class="c" x="751" y="242">signature via cached JWKS</text>
+<text class="c" x="751" y="258">iss, azp/aud, exp/nbf/iat</text>
+<text class="c" x="751" y="274">kid, username = SSH user</text>
+<text class="c" x="751" y="290">required role present</text>
+<path class="l" d="M602 176H650"/>
+<path class="l" d="M602 332H650"/>
+<path class="l" d="M850 248H898"/>
+<rect class="box" x="900" y="204" width="90" height="88" rx="8"/>
+<text class="h c" x="945" y="230">Layer 3</text>
+<text class="c" x="945" y="250">account</text>
+<text class="c" x="945" y="266">phase</text>
+<text class="n e" x="206" y="324">Refresh rejected:</text>
+<text class="n e" x="206" y="340">cache cleared.</text>
+<text class="n e" x="206" y="360">Network error:</text>
+<text class="n e" x="206" y="376">cache kept.</text>
+<path class="k" d="M517 68V138"/>
+<text class="e" x="527" y="90">token endpoint</text>
+<path class="k" d="M751 68V148"/>
+<text class="e" x="761" y="90">JWKS, 10 min cache</text>
+<rect class="box" x="452" y="430" width="130" height="56" rx="8"/>
+<text class="h c" x="517" y="454">User's browser</text>
+<text class="c" x="517" y="474">approves the code</text>
+<path class="k" d="M517 368V428"/>
+<text class="e" x="527" y="420">opens the link</text>
+</svg>
