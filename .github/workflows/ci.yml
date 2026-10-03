@@ -1,6 +1,8 @@
 # CI for pushes and pull requests. The same file runs on GitHub (hosted runners, no
 # secrets) and on the maintainer's own runner (repository variable CI_RUNNER selects
-# it there). Release candidates are additionally tested on real hosts (integration
+# it there). The own runner only takes pushes and pull requests from this repository;
+# pull requests from forks always run on a hosted runner, so code from outside never
+# reaches it. Release candidates are additionally tested on real hosts (integration
 # tests) before a release.
 name: CI
 on:
@@ -19,7 +21,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_RUNNER != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,7 +35,7 @@ jobs:
 
       # The self-hosted runner has the build dependencies installed.
       - name: Build dependencies
-        if: vars.CI_RUNNER == ''
+        if: ${{ !(vars.CI_RUNNER != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q gcc libpam0g-dev
@@ -121,7 +123,7 @@ jobs:
   # Self-test of the leak gate; then, where the patterns exist (secrets), nothing
   # private in the tree.
   leak-gate:
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_RUNNER != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_RUNNER || 'ubuntu-latest' }}
     if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 10
     steps:
@@ -132,11 +134,20 @@ jobs:
       - name: Self-test
         run: packaging/leak-gate-test.sh
 
+      # The own runner must never take a pull request from a fork: every runs-on that
+      # can select it carries the same-repository condition.
+      - name: Runner guard
+        run: |
+          set -euo pipefail
+          bad=$(grep -nE '^[[:space:]]*runs-on:.*CI_RUNNER' .github/workflows/*.yml | grep -v 'github.event.pull_request.head.repo.full_name == github.repository' || true)
+          [ -z "$bad" ] || { echo "runs-on selects CI_RUNNER without the fork guard:"; echo "$bad"; exit 1; }
+          echo "runner guard OK: $(grep -hE '^[[:space:]]*runs-on:.*CI_RUNNER' .github/workflows/*.yml | wc -l) runs-on line(s)"
+
       - name: Tree
         env:
           LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
           LEAK_ALLOW: ${{ secrets.LEAK_ALLOW }}
-          SELF_HOSTED: ${{ vars.CI_RUNNER }}
+          SELF_HOSTED: ${{ (vars.CI_RUNNER != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_RUNNER || '' }}
         run: |
           set -euo pipefail
           if [ -z "$LEAK_PATTERNS" ]; then
