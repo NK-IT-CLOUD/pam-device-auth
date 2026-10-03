@@ -1,5 +1,5 @@
 Package: pam-device-auth
-Version: 0.5.14
+Version: 0.5.15~rc1
 Architecture: amd64
 Depends: libc6, openssh-server (>= 1:9.6p1)
 Recommends: sssd-ldap, libnss-sss, libpam-sss, sssd-dbus

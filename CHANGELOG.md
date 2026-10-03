@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 0.5.15
+
+### Changed
+- The repository CI also checks every file for private data (a leak gate with
+  patterns kept outside the repository; on forks and GitHub it runs its
+  self-test only) and can run on a self-hosted runner.
+
 ## [0.5.14] - 2026-10-03
 
 ### Changed
