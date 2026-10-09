@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased] - 0.5.15
 
+### Security
+- **Toolchain bumped to Go 1.26.9.** govulncheck flagged nine standard
+  library advisories on the OIDC/JWKS fetch path in 1.26.8 (GO-2026-6603,
+  GO-2026-6605, GO-2026-6610, GO-2026-6611, GO-2026-6612, GO-2026-6613,
+  GO-2026-6617 net/http, GO-2026-6608 net/textproto, GO-2026-6607
+  crypto/tls), all fixed in 1.26.9.
+
 ### Changed
 - The repository CI also checks every file for private data (a leak gate with
   patterns kept outside the repository; on forks and GitHub it runs its
