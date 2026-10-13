@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - 0.6.0
+## [0.6.0] - 2026-10-13
 
 ### Added
 - Active Directory profile (`ldap.profile = "ad"`): `--setup-ldap` writes an
