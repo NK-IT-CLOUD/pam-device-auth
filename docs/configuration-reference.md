@@ -138,20 +138,33 @@ InfoPipe lookup. A config that still carries
 | `false` | Never render; show link + code only |
 | omitted / `null` | Auto-detect (see `internal/sshclient/detect.go`) |
 
-Auto-detect disables QR for Win32-OpenSSH (broken Unicode rendering) and
-Termux (busybox `less`). On OpenSSH 10+ servers the QR is always shown and
-no detection runs. On older servers the detection reads the client version
-line from sshd's journal; if it finds none, it hides the QR. Detection walks the
-parent processes with `journalctl` under one 2 s deadline per login; an
-explicit `true`/`false` skips it entirely and is the faster choice on hosts
-where the client type is known.
+Auto-detect decides per SSH client, on every OpenSSH version of the server:
+whether the QR survives depends on the client, which may escape the UTF-8 block
+characters. The detection reads the client version line from sshd's journal:
+
+| Client version | QR |
+|---|---|
+| Distribution build (contains `Ubuntu`, `Debian`, `Fedora`, `Red Hat` or `RHEL`) | shown |
+| PuTTY | shown |
+| Plain `OpenSSH_<major>` with major 10 or later | shown |
+| `OpenSSH_for_Windows_*` (Win32-OpenSSH, any version) | hidden |
+| Plain OpenSSH < 10 (for example Termux) | hidden |
+| Any other client, or no version line found | hidden |
+
+Link and code are always shown. The device flow logs the detected client and
+the decision at INFO, for example
+`Directory: SSH client "OpenSSH_for_Windows_9.5", QR hidden (client)`; with an
+explicit `show_qr` no client is detected and the line ends in `(configured)`.
+Detection walks the parent processes with `journalctl` under one 2 s deadline
+per login; an explicit `true`/`false` skips it entirely and is the faster
+choice on hosts where the client type is known.
 
 > **sshd logging:** sshd logs the client version line at debug1 only. The
 > managed `10-pam-device-auth.conf` therefore sets
 > `LogVerbose kex.c:kex_exchange_identification():*`, which forces this one
-> line without raising `LogLevel` to DEBUG1 (the drop-in sets `VERBOSE`).
-> Without it, auto-detection on OpenSSH < 10 hides the QR for every client; an
-> explicit `show_qr` does not need it.
+> line without raising `LogLevel` to DEBUG1 (the drop-in sets `VERBOSE`). On
+> OpenSSH 10, `sshd-session` logs it. Without the line, auto-detection hides the
+> QR for every client; an explicit `show_qr` does not need it.
 
 ### `root_login`
 
@@ -171,7 +184,9 @@ rewritten yet is one.
 `--check` compares the effective sshd policy with the setting. With `"disabled"`,
 a root that sshd still lets in is a blocker. With `"key"`, a root that sshd
 refuses is a warning, because the emergency path is gone without the config
-saying so. sshd takes the first value it reads for `PermitRootLogin`, so a file in
+saying so, and so is a root whose effective `AuthorizedKeysFile` is `none`
+(`root has no key source (AuthorizedKeysFile none); the emergency path does not
+work`). sshd takes the first value it reads for `PermitRootLogin`, so a file in
 `/etc/ssh/sshd_config.d/` that sorts before `10-pam-device-auth.conf` overrides
 the drop-in, and one that sorts after it has no effect.
 
@@ -225,11 +240,17 @@ For each address, `--check` evaluates root's effective policy with
 address:
 
 - With `root_login` `"key"` and a global `PermitRootLogin no`, an address from
-  which sshd allows root with `prohibit-password` and `AuthenticationMethods
-  publickey` is the emergency path: `--check` reports
-  `root: publickey only from <addresses> (break-glass via Match Address)`. If no
-  address reaches root that way, it warns that there is no emergency path. When
-  sshd does not refuse root globally, the addresses do not change the result.
+  which sshd allows root with `prohibit-password`, `AuthenticationMethods
+  publickey` and an `AuthorizedKeysFile` other than `none` is the emergency
+  path: `--check` reports
+  `root: publickey only from <addresses> (break-glass via Match Address)`. An
+  address that allows root while its `AuthorizedKeysFile` is `none` is a
+  warning: `root is allowed from <addresses> but AuthorizedKeysFile is none
+  there; add AuthorizedKeysFile .ssh/authorized_keys to the Match block`,
+  followed by `; the emergency path works from <addresses> (publickey)` when
+  other addresses do reach root by key. If no address reaches root by key, it
+  warns that there is no emergency path. When sshd does not refuse root
+  globally, the addresses do not change the result.
 - With `root_login` `"disabled"`, an address from which sshd still allows root
   is a blocker.
 
@@ -244,9 +265,14 @@ PermitRootLogin no
 Match User root Address 192.0.2.10
     PermitRootLogin prohibit-password
     AuthenticationMethods publickey
+    AuthorizedKeysFile .ssh/authorized_keys
 ```
 
-with `"root_login_sources": ["192.0.2.10"]` in `config.json`.
+with `"root_login_sources": ["192.0.2.10"]` in `config.json`. Keep the
+`AuthorizedKeysFile` line: the drop-in sets `AuthorizedKeysFile none` for
+everyone else, and only its own `Match User root` block (with `root_login`
+`"key"`) gives root its key file back. With the line, the address keeps root's
+`~/.ssh/authorized_keys` whatever the drop-in contains.
 
 ### `ldap`
 
@@ -259,7 +285,7 @@ For an Active Directory, set `profile` to `"ad"`; see
 
 | Key | Description |
 |---|---|
-| `uri` | Directory URL: one `ldaps://<host>[:port]` or `ldap://<host>[:port]` (for example `ldaps://ldap.example.com:636`). `ldap://` means StartTLS: the generated `sssd.conf` sets `ldap_id_use_start_tls = true`, and SSSD does not talk to the server without TLS. With `kerberos.keytab`, `uri` must be `ldap://`: the bind uses GSSAPI with SASL sealing (`ldap_sasl_minssf = 56`) instead of TLS, and `sssd.conf` sets `ldap_id_use_start_tls = false`; `--setup-ldap` and `--check` reject a keytab with `ldaps://`. There is no cleartext option. LLDAP does not offer StartTLS, so use `ldaps://` with LLDAP. A comma- or whitespace-separated URI list is rejected, because SSSD would treat it as a failover list. `--setup-ldap` and `--check` both enforce this. |
+| `uri` | Directory URL: one `ldaps://<host>[:port]` or `ldap://<host>[:port]` (for example `ldaps://ldap.example.com:636`). `ldap://` means StartTLS: the generated `sssd.conf` sets `ldap_id_use_start_tls = true`, and SSSD does not talk to the server without TLS. With `kerberos.keytab`, `uri` must be `ldap://`: the bind uses GSSAPI with SASL sealing (`ldap_sasl_minssf = 56`) instead of TLS, and `sssd.conf` sets `ldap_id_use_start_tls = false`; `--setup-ldap` and `--check` reject a keytab with `ldaps://` or with an IP address as the host (GSSAPI uses the `ldap/<host>` service principal). There is no cleartext option. LLDAP does not offer StartTLS, so use `ldaps://` with LLDAP. A comma- or whitespace-separated URI list is rejected, because SSSD would treat it as a failover list. `--setup-ldap` and `--check` both enforce this. |
 | `base_dn` | Directory base DN, e.g. `dc=example,dc=com`. |
 | `bind_dn` | Read-only bind identity for SSSD lookups: a DN, a UPN (`svc-sssd@example.com`) or a down-level logon name (`EXAMPLE\svc-sssd`). With `kerberos.keytab` the Kerberos principal, for example `svc-sssd@EXAMPLE.COM`. |
 | `bind_password` | Read-only bind password. Set exactly one of `bind_password` and `bind_password_file` for a password bind, neither with `kerberos.keytab`. Read only at setup time; written into root-only `sssd.conf`. |
@@ -284,10 +310,10 @@ Optional keys for the directory layout, the password file and Kerberos:
 | `id_range` | (none: SSSD maps from 200000) | `ad` only, needs `id_mapping`. `{"min": 10000, "max": 60000}` with `1000 <= min < max` sets `ldap_idmap_range_min`, `ldap_idmap_range_max` and `ldap_idmap_range_size = max - min` (one ID slice, one domain). Needed in unprivileged containers. |
 | `home` | `/home/%u` | Home directory (`override_homedir`). `%u`, `%d` and `%f` are passed to SSSD. |
 | `shell` | `/bin/bash` | Login shell (`default_shell`). |
-| `kerberos.realm` | (none) | Upper-case realm, e.g. `EXAMPLE.COM`. A `kerberos` block switches `auth_provider` and `chpass_provider` to `krb5`: sudo and `passwd` talk to the KDC, the user password never goes over LDAP. With it, `--setup-ldap` also installs the SSSD Kerberos provider and the SASL GSSAPI plugin. Without it, the `ad` profile sets `chpass_provider = none` (AD does not implement the LDAP password modify operation). Applies to both profiles. |
+| `kerberos.realm` | (none) | Upper-case realm, e.g. `EXAMPLE.COM`. A `kerberos` block switches `auth_provider` and `chpass_provider` to `krb5`: sudo and `passwd` talk to the KDC, the user password never goes over LDAP. With it, `--setup-ldap` also installs the SSSD Kerberos provider and the SASL GSSAPI plugin. Without it, the `ad` profile sets `chpass_provider = none` (AD does not implement the LDAP password modify operation). Applies to both profiles. With the `ad` profile it also sets `krb5_use_enterprise_principal = true` and `ldap_force_upper_case_realm = true`, as SSSD's own ad provider does: SSSD treats the UPN as an enterprise principal and upper-cases its realm, so users whose UPN suffix is the lower-case DNS domain (`alice@example.com`) authenticate for sudo and `passwd`. |
 | `kerberos.kdc` | (none) | KDC host name or address, optionally with a port (`krb5_server`). Required in a `kerberos` block. `--check` warns when it does not resolve. |
 | `kerberos.kpasswd` | (none) | Optional password-change server (`krb5_kpasswd`). |
-| `kerberos.keytab` | (none) | Absolute path of a keytab for `bind_dn`: a regular file owned by root, mode 0600. Switches the identity bind to GSSAPI (`ldap_sasl_mech = GSSAPI`) and replaces the bind password. Needs an `ldap://` `uri`: the bind is protected by SASL sealing, not TLS. `--setup-ldap` and `--check` fail when it is missing, a symlink, not owned by root or accessible to group or others. |
+| `kerberos.keytab` | (none) | Absolute path of a keytab for `bind_dn`: a regular file owned by root, mode 0600. Switches the identity bind to GSSAPI (`ldap_sasl_mech = GSSAPI`) and replaces the bind password. Needs an `ldap://` `uri`: the bind is protected by SASL sealing, not TLS. The `uri` must name the DC by host name, the name in its `ldap/` service principal (`ldap://dc1.example.com` for `ldap/dc1.example.com`), and that name must resolve on the host (an `/etc/hosts` entry is enough); `--setup-ldap` and `--check` reject an IP address. The keytab becomes invalid when the service account's password changes. `--setup-ldap` and `--check` fail when it is missing, a symlink, not owned by root or accessible to group or others. Building a keytab with `ktutil` without changing AD: [active-directory-setup.md](active-directory-setup.md#building-a-keytab-without-changing-ad). |
 
 `--setup-ldap` validates every value before it is written into `sssd.conf` /
 `sudoers` (injection guard). Every value, including the bind password and the

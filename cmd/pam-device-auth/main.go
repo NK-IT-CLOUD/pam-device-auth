@@ -161,7 +161,7 @@ func runPreflight() (fails, warns int) {
 		if cfg.LDAP.AccessGroup != "" {
 			members, gerr := getentGroup(cfg.LDAP.AccessGroup)
 			chk(gerr == nil, true,
-				fmt.Sprintf("access group %q resolves via NSS (%d member(s)); SSSD↔LDAP↔CA path OK", cfg.LDAP.AccessGroup, len(members)),
+				fmt.Sprintf("access group %q resolves via NSS (%d member(s)); %s", cfg.LDAP.AccessGroup, len(members), directoryPathOK(cfg.LDAP)),
 				accessGroupFailMessage(cfg.LDAP.AccessGroup))
 			// Every access-group member needs a VALID sshPublicKey, or they cannot
 			// satisfy the publickey factor and are locked out of non-root login after
@@ -310,6 +310,16 @@ func runPreflight() (fails, warns int) {
 				reportPinPosture(g, members, true)
 			}
 		}
+
+		// Migration preview: what --setup-ldap would do with local accounts
+		// that shadow a directory user. A warning, never a blocker.
+		preview, perr := shadowingPreview("/proc")
+		if perr != nil {
+			chk(false, false, "", "local accounts that shadow directory users were NOT checked: "+perr.Error())
+		}
+		for _, line := range preview {
+			chk(false, false, "", line)
+		}
 	}
 
 	// --- SSH daemon (factors + break-glass) ---
@@ -329,14 +339,16 @@ func runPreflight() (fails, warns int) {
 			"non-root AuthenticationMethods not 2FA (got "+am+"); expected publickey,keyboard-interactive:pam")
 		rootAm, _ := sshdParam("authenticationmethods", "root")
 		rootPermit, _ := sshdParam("permitrootlogin", "root")
+		rootKeys, _ := sshdParam("authorizedkeysfile", "root")
 		var sources []rootSourcePolicy
 		for _, src := range cfg.RootLoginSources {
 			spec := "user=root,addr=" + src
 			p, _ := sshdParamFor("permitrootlogin", spec)
 			m, _ := sshdParamFor("authenticationmethods", spec)
-			sources = append(sources, rootSourcePolicy{Source: src, Permit: p, Methods: m})
+			k, _ := sshdParamFor("authorizedkeysfile", spec)
+			sources = append(sources, rootSourcePolicy{Source: src, Permit: p, Methods: m, KeysFile: k})
 		}
-		rok, rfatal, rokMsg, rbadMsg := rootLoginWithSources(cfg.RootLogin, rootPermit, rootAm, sources)
+		rok, rfatal, rokMsg, rbadMsg := rootLoginWithSources(cfg.RootLogin, rootPermit, rootAm, rootKeys, sources)
 		chk(rok, rfatal, rokMsg, rbadMsg)
 		if akf, ok := sshdParam("authorizedkeysfile", "nobody"); ok {
 			chk(akf == "none", false,
@@ -398,12 +410,15 @@ func ldapTransportDescription(l *config.LDAPConfig) string {
 
 // ldapURICheck is the --check result for ldap.uri and the transport derived
 // from it, with the URI rules --setup-ldap enforces (validateLDAPURI,
-// keytabTransportError).
+// keytabTransportError, keytabHostError).
 func ldapURICheck(l *config.LDAPConfig) (ok bool, okMsg, badMsg string) {
 	if err := validateLDAPURI(l.URI); err != nil {
 		return false, "", err.Error()
 	}
 	if err := keytabTransportError(l); err != nil {
+		return false, "", err.Error()
+	}
+	if err := keytabHostError(l); err != nil {
 		return false, "", err.Error()
 	}
 	return true, "ldap.uri is a single URI, transport " + ldapTransportDescription(l) + " (no cleartext bind)", ""
@@ -434,6 +449,15 @@ func kdcHost(kdc string) string {
 		return host
 	}
 	return strings.Trim(kdc, "[]")
+}
+
+// directoryPathOK names the path a resolving access group proves. A keytab
+// bind runs GSSAPI with SASL sealing, so no CA certificate is involved.
+func directoryPathOK(l *config.LDAPConfig) string {
+	if l.Kerberos != nil && l.Kerberos.Keytab != "" {
+		return "SSSD↔LDAP path OK (GSSAPI)"
+	}
+	return "SSSD↔LDAP↔CA path OK"
 }
 
 // accessGroupFailMessage is the --check FAIL for an access group that does not
@@ -731,22 +755,34 @@ func rootLoginCheck(mode, permitRootLogin, rootAuthMethods string) (ok, fatal bo
 		"root AuthenticationMethods is " + rootAuthMethods + "; break-glass should be 'publickey' to avoid OIDC/SSSD lockout"
 }
 
-// rootSourcePolicy is root's effective sshd policy for one root_login_sources address.
-type rootSourcePolicy struct{ Source, Permit, Methods string }
+// rootSourcePolicy is root's effective sshd policy for one root_login_sources
+// address; KeysFile is the effective AuthorizedKeysFile.
+type rootSourcePolicy struct{ Source, Permit, Methods, KeysFile string }
 
-// rootLoginWithSources extends rootLoginCheck with the addresses from
-// root_login_sources. With root_login "key", a global PermitRootLogin no is
-// fine when a configured source still reaches root by key (Match Address);
-// with root_login "disabled", any source that reaches root is a blocker.
-func rootLoginWithSources(mode, permit, methods string, sources []rootSourcePolicy) (ok, fatal bool, okMsg, badMsg string) {
-	var keyFrom, allowFrom []string
+// noKeysFile reports whether an effective AuthorizedKeysFile value is "none",
+// so sshd reads no authorized_keys file for that connection.
+func noKeysFile(v string) bool { return strings.EqualFold(strings.TrimSpace(v), "none") }
+
+// rootLoginWithSources extends rootLoginCheck with root's AuthorizedKeysFile
+// (keysFile) and the addresses from root_login_sources. With root_login "key",
+// a global PermitRootLogin no is fine when a configured source still reaches
+// root by key (Match Address), and a key path needs a key file: the drop-in
+// sets AuthorizedKeysFile none for everyone but root. With root_login
+// "disabled", any source that reaches root is a blocker.
+func rootLoginWithSources(mode, permit, methods, keysFile string, sources []rootSourcePolicy) (ok, fatal bool, okMsg, badMsg string) {
+	var keyFrom, allowFrom, noFileFrom []string
 	for _, s := range sources {
-		if s.Permit != "no" {
-			allowFrom = append(allowFrom, s.Source)
-			// OpenSSH up to 10.0 prints prohibit-password as without-password.
-			if (s.Permit == "prohibit-password" || s.Permit == "without-password") && s.Methods == "publickey" {
-				keyFrom = append(keyFrom, s.Source)
-			}
+		if s.Permit == "no" {
+			continue
+		}
+		allowFrom = append(allowFrom, s.Source)
+		if noKeysFile(s.KeysFile) {
+			noFileFrom = append(noFileFrom, s.Source)
+			continue
+		}
+		// OpenSSH up to 10.0 prints prohibit-password as without-password.
+		if (s.Permit == "prohibit-password" || s.Permit == "without-password") && s.Methods == "publickey" && s.KeysFile != "" {
+			keyFrom = append(keyFrom, s.Source)
 		}
 	}
 	if mode == config.RootLoginDisabled {
@@ -756,10 +792,21 @@ func rootLoginWithSources(mode, permit, methods string, sources []rootSourcePoli
 		return rootLoginCheck(mode, permit, methods)
 	}
 	if permit == "no" && len(sources) > 0 {
+		if len(noFileFrom) > 0 {
+			msg := "root is allowed from " + strings.Join(noFileFrom, ", ") +
+				" but AuthorizedKeysFile is none there; add AuthorizedKeysFile .ssh/authorized_keys to the Match block"
+			if len(keyFrom) > 0 {
+				msg += "; the emergency path works from " + strings.Join(keyFrom, ", ") + " (publickey)"
+			}
+			return false, false, "", msg
+		}
 		if len(keyFrom) > 0 {
 			return true, false, "root: publickey only from " + strings.Join(keyFrom, ", ") + " (break-glass via Match Address)", ""
 		}
 		return false, false, "", "root SSH login is refused globally and from every root_login_sources address; there is no emergency path if LDAP, SSSD or the identity provider fail"
+	}
+	if permit != "no" && noKeysFile(keysFile) {
+		return false, false, "", "root has no key source (AuthorizedKeysFile none); the emergency path does not work"
 	}
 	return rootLoginCheck(mode, permit, methods)
 }
@@ -979,7 +1026,7 @@ func main() {
 			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
 			fmt.Println("")
 			fmt.Println("  --check       Pre-activation preflight: config, OIDC, directory/SSSD, sshd factors")
-			fmt.Println("  --setup-ldap  Configure SSSD/LLDAP directory identity from config (NSS + sudo)")
+			fmt.Println("  --setup-ldap  Configure the SSSD directory identity from config (NSS + sudo)")
 			fmt.Println("  --enable      Activate PAM authentication (runs --check first)")
 			fmt.Println("  --pam-acct    Run the PAM account-phase IP allowlist gate")
 			fmt.Println("  --debug       Run with debug logging")
@@ -1050,7 +1097,7 @@ func main() {
 	log.Debug("Discovery OK: device=%s", endpoints.DeviceAuthorizationEndpoint)
 
 	// Identity, groups, home and the sudo password come from the directory
-	// (LLDAP via SSSD/NSS). pam-device-auth is only the OIDC SSH-login layer:
+	// (via SSSD/NSS). pam-device-auth is only the OIDC SSH-login layer:
 	// it validates the OIDC token (signature/issuer/client/exp/iat, required
 	// role, optional IP allowlist) and grants or denies the login. It never
 	// reads /etc/shadow, prompts for a local password, or manages users.
@@ -1058,10 +1105,14 @@ func main() {
 	os.Exit(0)
 }
 
+// qrMaxURLBytes is the longest verification URL rendered as a QR: QR version 5
+// holds 84 bytes at ECC M.
+const qrMaxURLBytes = 84
+
 // canRenderQR checks if the URL would produce a QR code small enough to scan.
-// Returns false if the URL would require QR version > 5 (84 bytes at ECC M).
+// Returns false if the URL would require QR version > 5.
 func canRenderQR(url string) bool {
-	return len(url) <= 84
+	return len(url) <= qrMaxURLBytes
 }
 
 // logInitFailureMessage is the text reported when the auth log cannot be opened.

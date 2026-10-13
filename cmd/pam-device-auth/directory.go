@@ -24,12 +24,13 @@ import (
 )
 
 // directoryAuthFlow is the auth path for hosts where identity comes from the
-// directory (LLDAP via SSSD/NSS). pam-device-auth here is ONLY the extra OIDC
+// directory (via SSSD/NSS). pam-device-auth here is ONLY the extra OIDC
 // SSH-login layer: it validates an OIDC token (signature/issuer/client/exp/iat,
 // required_role, optional required_acr, optional IP allowlist) for the SSH
 // user, then grants or denies the login. It NEVER reads /etc/shadow, never
 // prompts for a local password, and never creates users or manages groups —
-// SSSD/LLDAP own identity, groups, home dir, and the sudo password (pam_sss).
+// SSSD and the directory own identity, groups, home dir, and the sudo password
+// (pam_sss).
 func directoryAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser, clientIP string) {
 	// Defensive NSS identity gate. In directory mode the SSH user MUST resolve
 	// via NSS (SSSD/LDAP). The deployed sshd config already guarantees this —
@@ -140,11 +141,15 @@ func deviceDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Cl
 	if dc.VerificationURIComplete != "" {
 		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
 		fmt.Printf("Code:  %s\n", dc.UserCode)
-		if sshclient.ShouldShowQR(cfg.ShowQR) && canRenderQR(dc.VerificationURIComplete) {
+		show, client, reason := sshclient.QRDecision(cfg.ShowQR)
+		log.Info("%s", qrDecisionMessage(show, client, reason))
+		if show && canRenderQR(dc.VerificationURIComplete) {
 			fmt.Println()
 			if qrStr, err := qr.Render(dc.VerificationURIComplete); err == nil {
 				fmt.Print(qrStr)
 			}
+		} else if show {
+			log.Info("%s", qrNotRenderedMessage(dc.VerificationURIComplete))
 		}
 	} else {
 		fmt.Printf("Open:  %s\n", dc.VerificationURI)
@@ -185,6 +190,23 @@ func deviceDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Cl
 	log.Info("Directory auth OK: user=%s email=%s roles=%v", result.Username, result.Email, result.Roles)
 
 	rememberDeviceLogin(log, sshUser, tokenResp.RefreshToken, clientIP)
+}
+
+// qrDecisionMessage is the device flow's log line for the QR decision: the
+// detected SSH client (already scrubbed by sshclient, quoted here) and whether
+// the QR is shown, with the reason ("client" or "configured").
+func qrDecisionMessage(show bool, client, reason string) string {
+	state := "hidden"
+	if show {
+		state = "shown"
+	}
+	return fmt.Sprintf("Directory: SSH client %q, QR %s (%s)", client, state, reason)
+}
+
+// qrNotRenderedMessage is the second log line when the client would render the
+// QR but the verification URL is longer than qrMaxURLBytes (canRenderQR).
+func qrNotRenderedMessage(url string) string {
+	return fmt.Sprintf("Directory: QR not rendered, verification URL is %d bytes (limit %d)", len(url), qrMaxURLBytes)
 }
 
 // rememberDeviceLogin stores the refresh token and the client IP for the
@@ -282,9 +304,10 @@ func identityGate(user string, found bool, lookupErr error) (allow bool, logMsg,
 // nssUserExists reports whether the user resolves through SSSD. It queries the
 // sss NSS service explicitly (getent -s sss) so that local-only /etc/passwd
 // accounts do NOT satisfy the directory identity gate: the documented boundary
-// is "SSSD/LLDAP own identity", and a plain `getent passwd` would also accept
-// `files` entries, letting a same-named local account bypass directory
-// revocation (PDA-SEC-001). A short timeout guards against a hung SSSD.
+// is "SSSD and the directory own identity", and a plain `getent passwd` would
+// also accept `files` entries, letting a same-named local account bypass
+// directory revocation (PDA-SEC-001). A short timeout guards against a hung
+// SSSD.
 func nssUserExists(username string) bool {
 	found, err := nssLookup(username)
 	return err == nil && found

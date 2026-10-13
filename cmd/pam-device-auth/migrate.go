@@ -97,6 +97,13 @@ func processCount(procRoot string, uid int) int {
 	return n
 }
 
+// reownedHome returns the cleaned home path and whether the migration may
+// re-own it: only a home below /home is touched.
+func reownedHome(home string) (string, bool) {
+	h := filepath.Clean(home)
+	return h, strings.HasPrefix(h, "/home/")
+}
+
 // migrateShadowedAccount removes the local entry (home kept), puts the
 // directory user back into the recorded local groups and re-owns only the
 // files that belonged to the old IDs: the home below /home, the mail spool and
@@ -112,7 +119,7 @@ func migrateShadowedAccount(a shadowedAccount, run commandRunner, exists func(st
 		}
 	}
 	var paths []string
-	if h := filepath.Clean(a.Home); strings.HasPrefix(h, "/home/") && exists(h) {
+	if h, ok := reownedHome(a.Home); ok && exists(h) {
 		paths = append(paths, h)
 	}
 	for _, p := range []string{"/var/mail/" + a.Name, "/var/spool/cron/crontabs/" + a.Name} {
@@ -133,6 +140,22 @@ func migrateShadowedAccount(a shadowedAccount, run commandRunner, exists func(st
 	return problems
 }
 
+// sssPasswdLookup resolves name through SSSD only (getent -s sss), the
+// directory side of findShadowedAccounts.
+func sssPasswdLookup(name string) (uid, gid int, ok bool) {
+	out, err := exec.Command("getent", "-s", "sss", "passwd", "--", name).Output()
+	if err != nil {
+		return 0, 0, false
+	}
+	f := strings.Split(strings.TrimSpace(string(out)), ":")
+	if len(f) < 4 {
+		return 0, 0, false
+	}
+	uid, err1 := strconv.Atoi(f[2])
+	gid, err2 := strconv.Atoi(f[3])
+	return uid, gid, err1 == nil && err2 == nil
+}
+
 // migrateLocalShadowing migrates every shadowing local account that has no
 // running process; the others stay untouched and are reported as warnings.
 func migrateLocalShadowing() {
@@ -146,20 +169,7 @@ func migrateLocalShadowing() {
 		setupWarnf("cannot read /etc/group, local accounts that shadow directory users were NOT migrated: %v", err)
 		return
 	}
-	lookup := func(name string) (int, int, bool) {
-		out, err := exec.Command("getent", "-s", "sss", "passwd", "--", name).Output()
-		if err != nil {
-			return 0, 0, false
-		}
-		f := strings.Split(strings.TrimSpace(string(out)), ":")
-		if len(f) < 4 {
-			return 0, 0, false
-		}
-		uid, err1 := strconv.Atoi(f[2])
-		gid, err2 := strconv.Atoi(f[3])
-		return uid, gid, err1 == nil && err2 == nil
-	}
-	accounts := findShadowedAccounts(passwd, group, lookup)
+	accounts := findShadowedAccounts(passwd, group, sssPasswdLookup)
 	if len(accounts) == 0 {
 		return
 	}
@@ -169,10 +179,13 @@ func migrateLocalShadowing() {
 		fmt.Printf("  - %s: local uid %d -> directory uid %d, keeps groups %v, home %s\n", a.Name, a.LocalUID, a.DirUID, a.Groups, a.Home)
 	}
 	fmt.Println("------------------------------------------------------------")
-	exists := func(p string) bool { _, err := os.Lstat(p); return err == nil }
-	migrated := migrateShadowedAccounts(accounts, "/proc", execRunner, exists)
+	migrated := migrateShadowedAccounts(accounts, "/proc", execRunner, pathExists)
 	fmt.Printf("Migrated %d of %d local account(s).\n", migrated, len(accounts))
 }
+
+// pathExists reports whether p exists without following a final symlink; the
+// migration and its preview decide with it what they re-own.
+func pathExists(p string) bool { _, err := os.Lstat(p); return err == nil }
 
 // migrateShadowedAccounts migrates each account that has no process under
 // procRoot and returns how many lost their local entry. An account with a
@@ -195,4 +208,53 @@ func migrateShadowedAccounts(accounts []shadowedAccount, procRoot string, run co
 		}
 	}
 	return migrated
+}
+
+// migrationPreview describes, one line per account, what --setup-ldap would do
+// with each local account that shadows a directory user (the decisions of
+// migrateShadowedAccounts and migrateShadowedAccount); running holds the
+// number of running processes and homeExists whether the home below /home
+// exists, both per account name. Pure.
+func migrationPreview(accounts []shadowedAccount, running map[string]int, homeExists map[string]bool) []string {
+	var out []string
+	for _, a := range accounts {
+		head := fmt.Sprintf("local account %s (uid %d) shadows the directory user (uid %d)", a.Name, a.LocalUID, a.DirUID)
+		if n := running[a.Name]; n > 0 {
+			out = append(out, fmt.Sprintf("%s but has %d running process(es); --setup-ldap will skip it", head, n))
+			continue
+		}
+		home := "leave " + a.Home + " as it is (outside /home)"
+		if h, ok := reownedHome(a.Home); ok {
+			home = "re-own " + h
+			if !homeExists[a.Name] {
+				home = "nothing to re-own (" + h + " missing)"
+			}
+		}
+		out = append(out, fmt.Sprintf("%s; --setup-ldap will migrate it, keep groups [%s], %s", head, strings.Join(a.Groups, ", "), home))
+	}
+	return out
+}
+
+// shadowingPreview is migrationPreview for this host: the local accounts from
+// /etc/passwd and /etc/group, the directory users via SSSD, the process counts
+// from procRoot and the homes that exist (checked like the migration does).
+func shadowingPreview(procRoot string) ([]string, error) {
+	passwd, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return nil, err
+	}
+	group, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return nil, err
+	}
+	accounts := findShadowedAccounts(passwd, group, sssPasswdLookup)
+	running := make(map[string]int, len(accounts))
+	homeExists := make(map[string]bool, len(accounts))
+	for _, a := range accounts {
+		running[a.Name] = processCount(procRoot, a.LocalUID)
+		if h, ok := reownedHome(a.Home); ok {
+			homeExists[a.Name] = pathExists(h)
+		}
+	}
+	return migrationPreview(accounts, running, homeExists), nil
 }

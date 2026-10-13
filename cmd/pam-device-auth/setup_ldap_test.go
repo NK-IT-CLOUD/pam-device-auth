@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1172,5 +1173,150 @@ func TestCACertFor(t *testing.T) {
 	l.CAFile = "/usr/local/share/ca-certificates/dir-ca.crt"
 	if got := caCertFor(l, prof); got != l.CAFile {
 		t.Errorf("ca_file ignored: %q", got)
+	}
+}
+
+// SSSD's ldap provider takes the Kerberos principal from userPrincipalName,
+// whose realm part AD delivers as the lower-case DNS domain. With profile ad
+// and kerberos the renderer sets what SSSD's ad provider defaults to, right
+// after the krb5_* lines; lldap and ad without kerberos stay as they are.
+func TestRenderSSSDConf_ADKerberosPrincipal(t *testing.T) {
+	const lines = "krb5_use_enterprise_principal = true\nldap_force_upper_case_realm = true\n"
+	for _, c := range []struct {
+		name string
+		mut  func(*config.LDAPConfig)
+		want string // the krb5_* line the two lines must follow
+	}{
+		{"password bind", func(l *config.LDAPConfig) {
+			l.Kerberos = &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "dc1.example.com"}
+		}, "krb5_server = dc1.example.com\n"},
+		{"password bind with kpasswd", func(l *config.LDAPConfig) {
+			l.Kerberos = &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "dc1.example.com", Kpasswd: "dc2.example.com"}
+		}, "krb5_kpasswd = dc2.example.com\n"},
+		{"keytab bind", func(l *config.LDAPConfig) {
+			l.URI = "ldap://dc1.example.com"
+			l.BindPassword = ""
+			l.BindDN = "svc-sssd@EXAMPLE.COM"
+			l.Kerberos = &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "dc1.example.com", Keytab: "/etc/krb5.sssd.keytab"}
+		}, "krb5_server = dc1.example.com\n"},
+	} {
+		got := adRender(t, c.mut)
+		if !strings.Contains(got, c.want+lines) {
+			t.Errorf("ad, %s: want %q after %q:\n%s", c.name, lines, c.want, got)
+		}
+	}
+
+	noKrb := adRender(t, nil)
+	lldapKrb := renderSSSDConf(ldapRenderData{
+		URI: "ldap://ldap.example.com:389", BaseDN: "dc=example,dc=com",
+		UserBase: "ou=people,dc=example,dc=com", GroupBase: "ou=groups,dc=example,dc=com",
+		BindDN: "uid=ro,ou=people,dc=example,dc=com", BindPassword: "pw", AccessGroup: "ssh-access",
+		KrbRealm: "EXAMPLE.COM", KrbKDC: "kdc.example.com", KrbKpasswd: "kdc.example.com",
+	}, "/etc/ssl/certs/ca-certificates.crt")
+	lldapKeytab := renderSSSDConf(ldapRenderData{
+		URI: "ldap://ldap.example.com", BaseDN: "dc=example,dc=com",
+		UserBase: "ou=people,dc=example,dc=com", GroupBase: "ou=groups,dc=example,dc=com",
+		BindDN: "svc-sssd@EXAMPLE.COM", Keytab: "/etc/krb5.sssd.keytab", AccessGroup: "ssh-access",
+		KrbRealm: "EXAMPLE.COM", KrbKDC: "kdc.example.com",
+	}, "/etc/ssl/certs/ca-certificates.crt")
+	for name, got := range map[string]string{"ad without kerberos": noKrb, "lldap with kerberos": lldapKrb, "lldap with keytab": lldapKeytab} {
+		for _, absent := range []string{"krb5_use_enterprise_principal", "ldap_force_upper_case_realm"} {
+			if strings.Contains(got, absent) {
+				t.Errorf("%s: unexpected %s:\n%s", name, absent, got)
+			}
+		}
+	}
+}
+
+// GSSAPI builds the service principal ldap/<host> from the URI host, so a
+// keytab bind needs the DC's host name; an IP literal in any form is refused
+// by validateLDAPConfig. Without a keytab an IP address stays allowed.
+func TestValidateLDAPConfig_KeytabNeedsHostName(t *testing.T) {
+	const want = "ldap.kerberos.keytab needs the DC's host name in ldap.uri, not an IP address: GSSAPI uses the ldap/<host> service principal"
+	for _, c := range []struct {
+		uri string
+		ok  bool
+	}{
+		{"ldap://192.0.2.10", false},
+		{"ldap://192.0.2.10:389", false},
+		{"LDAP://192.0.2.10", false},
+		{"ldap://[2001:db8::1]", false},
+		{"ldap://[2001:db8::1]:389", false},
+		{"ldap://2001:db8::1", false},
+		{"ldap://dc1.example.com", true},
+		{"ldap://dc1.example.com:389", true},
+		{"ldap://dc1", true},
+	} {
+		l := validADLDAP()
+		l.URI = c.uri
+		l.BindPassword = ""
+		l.BindDN = "svc-sssd@EXAMPLE.COM"
+		l.Kerberos = &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "dc1.example.com", Keytab: "/etc/krb5.sssd.keytab"}
+		err := validateLDAPConfig(l)
+		if c.ok && err != nil {
+			t.Errorf("keytab with %s rejected: %v", c.uri, err)
+		}
+		if !c.ok && (err == nil || err.Error() != want) {
+			t.Errorf("keytab with %s: err = %v, want %q", c.uri, err, want)
+		}
+	}
+	// No keytab: an IP address in the URI is the operator's choice.
+	for _, c := range []struct {
+		uri string
+		krb *config.KerberosConfig
+	}{
+		{"ldaps://192.0.2.10", nil},
+		{"ldap://192.0.2.10:389", nil},
+		{"ldaps://[2001:db8::1]:636", nil},
+		{"ldaps://192.0.2.10", &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "192.0.2.10"}},
+	} {
+		l := validADLDAP()
+		l.URI = c.uri
+		l.Kerberos = c.krb
+		if err := validateLDAPConfig(l); err != nil {
+			t.Errorf("no keytab, %s rejected: %v", c.uri, err)
+		}
+	}
+}
+
+// The 0.6.0 renderings in testdata, as written by --setup-ldap 0.6.0.
+//
+//go:embed testdata/sshd-dropin-0.6.0-*.conf
+var sshdDropin060 embed.FS
+
+// The sshd drop-in is written for every profile, so its comments name no
+// directory product. Against 0.6.0 only comment lines may differ: every
+// directive, its position and every blank line stay identical.
+func TestSshdDropin_ProfileNeutralCommentsOnly(t *testing.T) {
+	for _, c := range []struct {
+		file      string
+		sssCmd    string
+		groups    []string
+		rootLogin string
+	}{
+		{"testdata/sshd-dropin-0.6.0-default.conf", "/usr/bin/sss_ssh_authorizedkeys", nil, ""},
+		{"testdata/sshd-dropin-0.6.0-service-key.conf", "/usr/libexec/sssd/sss_ssh_authorizedkeys", []string{"ssh-service", "ci"}, config.RootLoginKey},
+		{"testdata/sshd-dropin-0.6.0-service-disabled.conf", "/usr/bin/sss_ssh_authorizedkeys", []string{"ssh-service"}, config.RootLoginDisabled},
+	} {
+		old, err := sshdDropin060.ReadFile(c.file)
+		if err != nil || len(old) == 0 {
+			t.Fatalf("%s: embedded fixture missing or empty: %v", c.file, err)
+		}
+		got := renderSshdDropin(c.sssCmd, c.groups, c.rootLogin)
+		if strings.Contains(strings.ToLower(got), "lldap") {
+			t.Errorf("%s: drop-in names LLDAP:\n%s", c.file, got)
+		}
+		if !strings.Contains(got, "\n# Non-root: SSH key (from the directory via SSSD) AND OIDC (keyboard-interactive/PAM).\n") {
+			t.Errorf("%s: non-root comment not profile-neutral:\n%s", c.file, got)
+		}
+		gl, ol := strings.Split(got, "\n"), strings.Split(string(old), "\n")
+		if len(gl) != len(ol) {
+			t.Fatalf("%s: %d lines, 0.6.0 had %d:\n%s", c.file, len(gl), len(ol), got)
+		}
+		for i := range gl {
+			if gl[i] != ol[i] && !(strings.HasPrefix(gl[i], "#") && strings.HasPrefix(ol[i], "#")) {
+				t.Errorf("%s line %d: non-comment change %q -> %q", c.file, i+1, ol[i], gl[i])
+			}
+		}
 	}
 }

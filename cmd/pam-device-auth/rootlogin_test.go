@@ -166,23 +166,40 @@ func TestMarkManualCommand(t *testing.T) {
 }
 
 func TestRootLoginWithSources(t *testing.T) {
-	key := rootSourcePolicy{Source: "192.0.2.10", Permit: "prohibit-password", Methods: "publickey"}
-	none := rootSourcePolicy{Source: "198.51.100.7", Permit: "no", Methods: "publickey"}
+	const keys = ".ssh/authorized_keys"
+	key := rootSourcePolicy{Source: "192.0.2.10", Permit: "prohibit-password", Methods: "publickey", KeysFile: keys}
+	none := rootSourcePolicy{Source: "198.51.100.7", Permit: "no", Methods: "publickey", KeysFile: keys}
+	noFile := rootSourcePolicy{Source: "203.0.113.5", Permit: "prohibit-password", Methods: "publickey", KeysFile: "none"}
+	unknown := rootSourcePolicy{Source: "203.0.113.6"}                                                  // sshd -T could not evaluate the address
+	noAKF := rootSourcePolicy{Source: "203.0.113.7", Permit: "prohibit-password", Methods: "publickey"} // no authorizedkeysfile line
 	for _, c := range []struct {
-		name            string
-		mode, permit    string
-		sources         []rootSourcePolicy
-		wantOK, wantFat bool
-		wantMsg         string
+		name               string
+		mode, permit, akf  string
+		sources            []rootSourcePolicy
+		wantOK, wantFat    bool
+		wantMsg, wantNoMsg string
 	}{
-		{"no sources: unchanged default", "", "prohibit-password", nil, true, false, "publickey only"},
-		{"global no, a source allows the key", "", "no", []rootSourcePolicy{key, none}, true, false, "192.0.2.10"},
-		{"global no, no source allows it", "", "no", []rootSourcePolicy{none}, false, false, "no emergency path"},
-		{"disabled but a source allows root", config.RootLoginDisabled, "no", []rootSourcePolicy{key}, false, true, "192.0.2.10"},
-		{"disabled and every source refuses", config.RootLoginDisabled, "no", []rootSourcePolicy{none}, true, true, "disabled"},
+		{"no sources: unchanged default", "", "prohibit-password", keys, nil, true, false, "publickey only", ""},
+		{"global no, a source allows the key", "", "no", "none", []rootSourcePolicy{key, none}, true, false, "192.0.2.10", ""},
+		{"global no, no source allows it", "", "no", "none", []rootSourcePolicy{none}, false, false, "no emergency path", ""},
+		{"disabled but a source allows root", config.RootLoginDisabled, "no", "none", []rootSourcePolicy{key}, false, true, "192.0.2.10", ""},
+		{"disabled and every source refuses", config.RootLoginDisabled, "no", "none", []rootSourcePolicy{none}, true, true, "disabled", ""},
+		{"disabled: a source without key file still allows root", config.RootLoginDisabled, "no", "none", []rootSourcePolicy{noFile}, false, true, "203.0.113.5", ""},
+		{"global no, the only source has AuthorizedKeysFile none", "", "no", "none", []rootSourcePolicy{noFile, none},
+			false, false, "root is allowed from 203.0.113.5 but AuthorizedKeysFile is none there; add AuthorizedKeysFile .ssh/authorized_keys to the Match block", "198.51.100.7"},
+		{"global no, one source works and one has no key file", "", "no", "none", []rootSourcePolicy{key, noFile},
+			false, false, "root is allowed from 203.0.113.5 but AuthorizedKeysFile is none there; add AuthorizedKeysFile .ssh/authorized_keys to the Match block; the emergency path works from 192.0.2.10 (publickey)", ""},
+		{"global no, an unevaluated source is no key path", "", "no", "none", []rootSourcePolicy{unknown}, false, false, "no emergency path", ""},
+		{"global no, a key source without an AuthorizedKeysFile value is no key path", "", "no", "none", []rootSourcePolicy{noAKF}, false, false, "no emergency path", ""},
+		{"key: root's AuthorizedKeysFile none", "", "prohibit-password", "none", nil,
+			false, false, "root has no key source (AuthorizedKeysFile none); the emergency path does not work", ""},
+		{"key: root's AuthorizedKeysFile none with sources that do not matter", "key", "prohibit-password", "none", []rootSourcePolicy{key},
+			false, false, "root has no key source (AuthorizedKeysFile none)", ""},
+		{"key: global no wins over the missing key file", "", "no", "none", nil, false, false, "although root_login is 'key'", "AuthorizedKeysFile"},
+		{"disabled: AuthorizedKeysFile none is expected", config.RootLoginDisabled, "no", "none", nil, true, true, "SSH login disabled", ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			ok, fatal, okMsg, badMsg := rootLoginWithSources(c.mode, c.permit, "publickey", c.sources)
+			ok, fatal, okMsg, badMsg := rootLoginWithSources(c.mode, c.permit, "publickey", c.akf, c.sources)
 			if ok != c.wantOK || (!ok && fatal != c.wantFat) {
 				t.Fatalf("ok=%v fatal=%v, want ok=%v fatal=%v (ok=%q bad=%q)", ok, fatal, c.wantOK, c.wantFat, okMsg, badMsg)
 			}
@@ -192,6 +209,9 @@ func TestRootLoginWithSources(t *testing.T) {
 			}
 			if !strings.Contains(msg, c.wantMsg) {
 				t.Errorf("message %q does not mention %q", msg, c.wantMsg)
+			}
+			if c.wantNoMsg != "" && strings.Contains(msg, c.wantNoMsg) {
+				t.Errorf("message %q mentions %q", msg, c.wantNoMsg)
 			}
 		})
 	}
@@ -217,8 +237,8 @@ func TestSshdParamForPassesConnectionSpec(t *testing.T) {
 // OpenSSH up to 10.0 prints PermitRootLogin prohibit-password as its alias
 // without-password in `sshd -T`; both spellings are the key-only path.
 func TestRootLoginWithSources_WithoutPasswordAlias(t *testing.T) {
-	src := []rootSourcePolicy{{Source: "192.0.2.10", Permit: "without-password", Methods: "publickey"}}
-	ok, _, okMsg, badMsg := rootLoginWithSources("", "no", "publickey", src)
+	src := []rootSourcePolicy{{Source: "192.0.2.10", Permit: "without-password", Methods: "publickey", KeysFile: ".ssh/authorized_keys"}}
+	ok, _, okMsg, badMsg := rootLoginWithSources("", "no", "publickey", "none", src)
 	if !ok || !strings.Contains(okMsg, "192.0.2.10") {
 		t.Fatalf("ok=%v okMsg=%q badMsg=%q, want the key path from 192.0.2.10", ok, okMsg, badMsg)
 	}

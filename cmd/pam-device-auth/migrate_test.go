@@ -193,3 +193,29 @@ func TestMigrateShadowedAccounts_RunningProcessSkipsAccount(t *testing.T) {
 		t.Fatalf("setupWarnings = %q", setupWarnings)
 	}
 }
+
+func TestMigrationPreview(t *testing.T) {
+	accounts := []shadowedAccount{
+		{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker", "video"}},
+		{Name: "bob", Home: "/srv/bob", LocalUID: 1001, LocalGID: 1001, DirUID: 10002, DirGID: 6000},
+		{Name: "carol", Home: "/home/carol", LocalUID: 1002, LocalGID: 1002, DirUID: 10003, DirGID: 6000, Groups: []string{"docker"}},
+		{Name: "dave", Home: "/home/../srv/dave", LocalUID: 1003, LocalGID: 1003, DirUID: 10004, DirGID: 6000},
+		{Name: "erin", Home: "/home/erin/", LocalUID: 1004, LocalGID: 1004, DirUID: 10005, DirGID: 6000},
+	}
+	// homeExists is keyed by account name: alice's home exists, erin's is
+	// missing; bob's and dave's lie outside /home, so it does not matter.
+	got := migrationPreview(accounts, map[string]int{"carol": 2, "bob": 0}, map[string]bool{"alice": true})
+	want := []string{
+		"local account alice (uid 1000) shadows the directory user (uid 10001); --setup-ldap will migrate it, keep groups [docker, video], re-own /home/alice",
+		"local account bob (uid 1001) shadows the directory user (uid 10002); --setup-ldap will migrate it, keep groups [], leave /srv/bob as it is (outside /home)",
+		"local account carol (uid 1002) shadows the directory user (uid 10003) but has 2 running process(es); --setup-ldap will skip it",
+		"local account dave (uid 1003) shadows the directory user (uid 10004); --setup-ldap will migrate it, keep groups [], leave /home/../srv/dave as it is (outside /home)",
+		"local account erin (uid 1004) shadows the directory user (uid 10005); --setup-ldap will migrate it, keep groups [], nothing to re-own (/home/erin missing)",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if migrationPreview(nil, nil, nil) != nil {
+		t.Error("no shadowing account must give no line")
+	}
+}

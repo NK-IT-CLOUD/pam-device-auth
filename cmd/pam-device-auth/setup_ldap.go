@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -156,6 +157,29 @@ func keytabTransportError(l *config.LDAPConfig) error {
 	return nil
 }
 
+// keytabHostError rejects a keytab bind whose ldap.uri names the DC by IP
+// address. GSSAPI builds the service principal ldap/<host> from the URI host
+// as written (ldap_sasl_canonicalize defaults to false), and the DC's
+// principal carries its host name, not an address. Shared by --setup-ldap and
+// --check, both after validateLDAPURI.
+func keytabHostError(l *config.LDAPConfig) error {
+	if l.Kerberos == nil || l.Kerberos.Keytab == "" {
+		return nil
+	}
+	u, err := url.Parse(l.URI)
+	if err != nil {
+		return nil // reported by validateLDAPURI
+	}
+	// Hostname drops the port and the brackets. u.Host catches an IPv6
+	// address without brackets, which Hostname splits at its last colon.
+	for _, h := range []string{u.Hostname(), u.Host} {
+		if _, perr := netip.ParseAddr(h); perr == nil {
+			return fmt.Errorf("ldap.kerberos.keytab needs the DC's host name in ldap.uri, not an IP address: GSSAPI uses the ldap/<host> service principal")
+		}
+	}
+	return nil
+}
+
 // validateLDAPProfile accepts "lldap" (also when unset) and "ad". Shared by
 // --setup-ldap and --check.
 func validateLDAPProfile(l *config.LDAPConfig) error {
@@ -212,6 +236,9 @@ func validateLDAPConfig(l *config.LDAPConfig) error {
 		return err
 	}
 	if err := keytabTransportError(l); err != nil {
+		return err
+	}
+	if err := keytabHostError(l); err != nil {
 		return err
 	}
 	// Group names must be bare Unix group names: they land in sudoers (%name)
@@ -549,6 +576,13 @@ func renderSSSDConf(d ldapRenderData, caCertPath string) string {
 		kv("krb5_server", d.KrbKDC)
 		if d.KrbKpasswd != "" {
 			kv("krb5_kpasswd", d.KrbKpasswd)
+		}
+		if d.Profile == config.LDAPProfileAD {
+			// The principal comes from userPrincipalName, whose realm part AD
+			// delivers as the lower-case DNS domain; no KDC serves that realm.
+			// SSSD's ad provider sets both; the ldap provider defaults to false.
+			kv("krb5_use_enterprise_principal", "true")
+			kv("ldap_force_upper_case_realm", "true")
 		}
 	}
 	kv("override_homedir", d.Home)
@@ -943,10 +977,10 @@ PasswordAuthentication no
 MaxAuthTries 3
 # VERBOSE logs the key fingerprint of every accepted and rejected key.
 LogLevel VERBOSE
-# QR auto-detection on OpenSSH < 10 needs the client version, which sshd logs
-# at debug1 only; this forces just that line.
+# QR auto-detection needs the client version, which sshd logs at
+# debug1 only; this forces just that line.
 %s
-# Non-root: SSH key (from LLDAP via SSSD) AND OIDC (keyboard-interactive/PAM).
+# Non-root: SSH key (from the directory via SSSD) AND OIDC (keyboard-interactive/PAM).
 # AuthorizedKeysFile none: local ~/.ssh/authorized_keys must NOT work for
 # non-root, otherwise a same-named local account bypasses directory revocation.
 AuthenticationMethods publickey,keyboard-interactive:pam
@@ -960,7 +994,7 @@ AuthorizedKeysCommandUser nobody
 	// their key is still served exclusively by sss_ssh_authorizedkeys.
 	if len(serviceGroups) > 0 {
 		base += fmt.Sprintf(`
-# Service accounts (LLDAP service groups): key-only (no OIDC) for automation.
+# Service accounts (directory service groups): key-only (no OIDC) for automation.
 Match Group %s
     AuthenticationMethods publickey
 `, strings.Join(serviceGroups, ","))

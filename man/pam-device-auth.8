@@ -87,9 +87,13 @@ or
 (StartTLS) URI and which transport it gives, that
 .I ldap.ca_file
 and the Kerberos keytab are in place, that the UIDs and GIDs of directory
-users exist in the host's ID map, root's sshd policy for every
+users exist in the host's ID map, root's sshd policy (including its
+AuthorizedKeysFile) for every
 .I root_login_sources
-address, and that the AuthorizedKeysCommand binary exists.
+address, and that the AuthorizedKeysCommand binary exists. Local accounts that
+shadow a directory user are listed as warnings with what
+.B \-\-setup\-ldap
+will do (migrate or skip).
 Each item is reported as [OK]/[WARN]/[FAIL]; exits non-zero if any blocker is found.
 .TP
 .B \-\-setup\-ldap
@@ -297,7 +301,7 @@ in the source repository for the full threat model.
 .PP
 Ubuntu 24.04+, Debian 13+, or Rocky Linux 9 or 10 (amd64); other RHEL-family
 distributions are generally compatible. OpenSSH >= 9.6p1.
-On OpenSSH < 10, SSH client auto-detection (QR code display) needs the
+SSH client auto-detection (QR code display) needs the
 .B LogVerbose
 line of the managed sshd drop-in, which journals the client version.
 .SH SEE ALSO

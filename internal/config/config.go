@@ -135,7 +135,7 @@ func (c *Config) RootLoginIsDisabled() bool { return c.RootLogin == RootLoginDis
 func DefaultConfig() *Config {
 	return &Config{
 		AuthTimeout: 180,
-		// ShowQR: nil = auto-detect (skip for Win32-OpenSSH, show for others)
+		// ShowQR: nil = auto-detect per SSH client (internal/sshclient)
 	}
 }
 

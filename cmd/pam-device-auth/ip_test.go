@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMatchesAllowedIP_ExactMatch(t *testing.T) {
 	allowed := []string{"198.51.100.2", "192.0.2.202", "192.0.2.12"}
@@ -86,6 +89,41 @@ func TestCanRenderQR(t *testing.T) {
 	long := "https://very-long-sso-provider.example.com/auth/realms/very-long-realm/protocol/openid-connect/auth/device?user_code=VERY-LONG"
 	if canRenderQR(long) {
 		t.Error("long URL should not be renderable")
+	}
+}
+
+// The device flow logs the detected SSH client and the QR decision; the matrix
+// greps the log for `SSH client "OpenSSH_`, so the prefix is fixed.
+func TestQRDecisionMessage(t *testing.T) {
+	for _, c := range []struct {
+		show           bool
+		client, reason string
+		want           string
+	}{
+		{true, "OpenSSH_10.2p1 Ubuntu-2ubuntu3.6", "client", `Directory: SSH client "OpenSSH_10.2p1 Ubuntu-2ubuntu3.6", QR shown (client)`},
+		{false, "OpenSSH_for_Windows_9.5", "client", `Directory: SSH client "OpenSSH_for_Windows_9.5", QR hidden (client)`},
+		{false, "unknown", "client", `Directory: SSH client "unknown", QR hidden (client)`},
+		{true, "", "configured", `Directory: SSH client "", QR shown (configured)`},
+	} {
+		if got := qrDecisionMessage(c.show, c.client, c.reason); got != c.want {
+			t.Errorf("qrDecisionMessage(%v, %q, %q) = %q, want %q", c.show, c.client, c.reason, got, c.want)
+		}
+	}
+}
+
+// A QR the client could render but the URL is too long for: the device flow
+// says so in a second line instead of leaving "QR shown" unexplained.
+func TestQRNotRenderedMessage(t *testing.T) {
+	url := "https://sso.example.com/" + strings.Repeat("a", 96) // 120 bytes
+	if canRenderQR(url) {
+		t.Fatalf("a %d-byte URL must exceed the QR limit", len(url))
+	}
+	want := "Directory: QR not rendered, verification URL is 120 bytes (limit 84)"
+	if got := qrNotRenderedMessage(url); got != want {
+		t.Errorf("qrNotRenderedMessage = %q, want %q", got, want)
+	}
+	if !canRenderQR(strings.Repeat("a", qrMaxURLBytes)) || canRenderQR(strings.Repeat("a", qrMaxURLBytes+1)) {
+		t.Errorf("canRenderQR must allow exactly qrMaxURLBytes (%d) bytes", qrMaxURLBytes)
 	}
 }
 

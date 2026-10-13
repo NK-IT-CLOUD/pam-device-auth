@@ -3,6 +3,65 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 0.6.1
+
+### Fixed
+- Profile `ad` with `ldap.kerberos`: sudo and `passwd` failed for users whose
+  UPN carries the lower-case DNS domain as its realm (`alice@example.com`),
+  which is how AD returns it; SSSD found no KDC for that realm. The generated
+  `sssd.conf` now sets `krb5_use_enterprise_principal = true` and
+  `ldap_force_upper_case_realm = true`, as SSSD's own ad provider does: SSSD
+  treats the UPN as an enterprise principal and upper-cases the realm. The
+  `lldap` profile and `ad` without `kerberos` are unchanged. The package
+  upgrade keeps the existing `sssd.conf`: on a host with `profile` `ad` and
+  `kerberos`, run `pam-device-auth --setup-ldap` once after the upgrade (it
+  rewrites `sssd.conf` and restarts SSSD; `--enable` is not needed again).
+- `--setup-ldap` and `--check` reject `ldap.kerberos.keytab` with an IP
+  address as the host of `ldap.uri` (IPv4 or IPv6, with or without port):
+  GSSAPI uses the `ldap/<host>` service principal, so the bind cannot work.
+  Name the DC by its host name; the name must resolve on the host.
+- `--check` no longer reports an emergency path for root that does not exist:
+  a `root_login_sources` address counts as the key path only if its effective
+  `AuthorizedKeysFile` is not `none` (in addition to `prohibit-password` and
+  `AuthenticationMethods publickey`). An address that allows root while its
+  `AuthorizedKeysFile` is `none` is a warning that names the missing
+  `AuthorizedKeysFile .ssh/authorized_keys` line and the addresses where the
+  key path works, and with `root_login` `key` `--check` warns when root's own
+  `AuthorizedKeysFile` is `none`. The example Match block in
+  `docs/configuration-reference.md` now sets
+  `AuthorizedKeysFile .ssh/authorized_keys`: the drop-in sets
+  `AuthorizedKeysFile none` for everyone else.
+- QR auto-detection decides per SSH client on every server: a client that
+  escapes UTF-8 (for example Win32-OpenSSH) no longer gets an unreadable QR
+  code on OpenSSH 10 servers. Distribution builds (Ubuntu, Debian, Fedora, Red
+  Hat), PuTTY and plain OpenSSH 10 or later get the QR; Win32-OpenSSH, plain
+  OpenSSH < 10 and unknown clients get link and code only. The sshd version is
+  no longer read.
+
+### Changed
+- The comments of the sshd drop-in no longer name LLDAP for every profile
+  ("from the directory via SSSD"), and the QR comment no longer limits the
+  client version line to OpenSSH < 10; the next `--setup-ldap` rewrites the
+  drop-in, its directives are unchanged. `--help` describes `--setup-ldap`
+  without naming a directory product. With a keytab bind the `--check`
+  access group line ends in `SSSD↔LDAP path OK (GSSAPI)` instead of
+  `SSSD↔LDAP↔CA path OK`: no CA certificate is involved.
+- `docs/active-directory-setup.md` and `docs/configuration-reference.md`
+  describe the keytab bind's host name requirement, that a password change of
+  the service account invalidates the keytab, and how to build a keytab with
+  `ktutil` (`addent -password … -f`, key version from
+  `msDS-KeyVersionNumber`) without changing anything in AD.
+- `--check` shows a migration preview: one warning per local account that
+  shadows a directory user, with what `--setup-ldap` will do (migrate it, the
+  local groups it keeps and the home it re-owns, or skip it because of running
+  processes). The warnings do not block `--enable`; the lookup goes through
+  SSSD, so the preview needs an SSSD that already resolves the directory.
+  A home below `/home` that does not exist is shown as nothing to re-own.
+- The device flow logs the detected SSH client and the QR decision at INFO
+  (`Directory: SSH client "<version>", QR shown|hidden (client|configured)`),
+  plus `Directory: QR not rendered, verification URL is <n> bytes (limit 84)`
+  when the URL is too long for the QR.
+
 ## [0.6.0] - 2026-10-13
 
 ### Added

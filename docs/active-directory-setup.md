@@ -75,6 +75,11 @@ sealing inside TLS, so `--setup-ldap` sets `ldap_id_use_start_tls = false` for
 it. `--setup-ldap` and `--check` reject a keytab together with an `ldaps://`
 URI.
 
+GSSAPI builds the DC's service principal from the host in `uri`:
+`ldap://dc1.example.com` means `ldap/dc1.example.com`. With a keytab, name the
+DC in `uri` by that host name; `--setup-ldap` and `--check` reject an IP
+address. The name must resolve on the host; an `/etc/hosts` entry is enough.
+
 Put the DC's CA certificate on the host and name it in `ca_file` if it is not in
 the system bundle. SSSD reads the file itself, so the user SSSD runs as must be
 able to read it: on distributions where `sssd_be` runs as user `sssd`, a file
@@ -95,6 +100,14 @@ password never goes over LDAP. Without `kerberos`, sudo checks the password with
 an LDAP bind over TLS and `passwd` on the host is not available (AD does not
 implement the LDAP password modify operation); users change their password in AD.
 
+SSSD takes the user's Kerberos principal from `userPrincipalName`, and AD
+returns its realm part as the lower-case DNS domain (`alice@example.com`). With
+`kerberos`, `--setup-ldap` therefore sets `krb5_use_enterprise_principal = true`
+and `ldap_force_upper_case_realm = true`, as SSSD's own ad provider does: SSSD
+treats the UPN as an enterprise principal and upper-cases the realm, so users
+whose UPN suffix is the lower-case DNS domain authenticate for sudo and
+`passwd`.
+
 With `kerberos`, `--setup-ldap` also installs the SSSD Kerberos provider and the
 SASL GSSAPI plugin (`sssd-krb5` and `libsasl2-modules-gssapi-mit` on Debian and
 Ubuntu, `sssd-krb5` and `cyrus-sasl-gssapi` on the RHEL family). `--check`
@@ -108,7 +121,37 @@ is then the Kerberos principal with the realm in upper case, for example
 absent. `--check` fails when the keytab is not a root-only regular file.
 Put the keytab outside /etc/pam-device-auth, for example /etc/krb5.sssd.keytab
 (owner root, mode 0600); SSSD's ldap_child reads it also where the SSSD backend
-runs as an unprivileged user.
+runs as an unprivileged user. The keys in a keytab derive from the service
+account's password: when the password changes, the keytab becomes invalid and
+SSSD can no longer bind, so build a new one.
+
+### Building a keytab without changing AD
+
+MIT Kerberos `ktutil` builds the keytab from the service account's password,
+without changing anything in AD. It needs the account's current key version
+number, which AD publishes in `msDS-KeyVersionNumber`:
+
+    LDAPTLS_CACERT=/usr/local/share/ca-certificates/example-ad-ca.crt \
+      ldapsearch -x -H ldaps://dc1.example.com -D svc-sssd@example.com -W \
+      -b DC=example,DC=com '(sAMAccountName=svc-sssd)' msDS-KeyVersionNumber
+
+Without a certificate on the DC, get a ticket with `kinit svc-sssd@EXAMPLE.COM`
+and query with `ldapsearch -Y GSSAPI -H ldap://dc1.example.com` instead of
+`-x -H … -D … -W`. Then, with the key version from the result (here 2):
+
+    ktutil
+    ktutil:  addent -password -p svc-sssd@EXAMPLE.COM -k 2 -e aes256-cts-hmac-sha1-96 -f
+    Password for svc-sssd@EXAMPLE.COM:
+    ktutil:  wkt /etc/krb5.sssd.keytab
+    ktutil:  quit
+    chown root:root /etc/krb5.sssd.keytab
+    chmod 600 /etc/krb5.sssd.keytab
+
+`-p` is the principal from `bind_dn`, `-k` the key version. `-f` fetches the
+salt from the KDC instead of deriving it from the principal name, so the host
+must find the KDC for the realm (through the domain's DNS SRV records or a
+`[realms]` entry in `/etc/krb5.conf`). The usage line of MIT krb5 1.21 is
+`addent (-key | -password) -p principal -k kvno [-e enctype] [-f|-s salt]`.
 
 ## UIDs in containers
 
@@ -184,6 +227,10 @@ Lines of `--check` that belong to this setup, for the example above:
       [OK]   all 2 access-group member(s) have a valid sshPublicKey (publickey factor)
       [OK]   UIDs/GIDs of 2 directory user(s) exist in this host's ID map
 
+With the keytab bind, the transport is `GSSAPI with SASL sealing` and the
+access group line ends in `SSSD↔LDAP path OK (GSSAPI)`: no CA certificate is
+involved.
+
 ## What `--setup-ldap` writes for AD
 
 The SSSD domain is named `nkit`, as with LLDAP. Compared with the LLDAP profile
@@ -192,8 +239,11 @@ it uses `ldap_schema = ad`, `ldap_referrals = false` and
 (`access_provider = simple`, `simple_allow_groups` = `access_group` and every
 group in `service_account_groups`), and maps the attributes from
 `ldap.attributes`. `user_search_base` and `group_search_base` default to
-`base_dn`. The sudoers drop-in, the sshd drop-in and the socket-unit handling
-are the same for both profiles.
+`base_dn`. With `kerberos` it adds `krb5_use_enterprise_principal = true` and
+`ldap_force_upper_case_realm = true` (see
+[Kerberos for sudo and passwd](#kerberos-for-sudo-and-passwd)). The sudoers
+drop-in, the sshd drop-in and the socket-unit handling are the same for both
+profiles.
 
 ## Local accounts with the same name
 
@@ -203,3 +253,7 @@ home directory, re-owns the files that belonged to the old IDs (home below
 `/home`, mail spool, crontab) and puts the user back into its local groups
 except `sudo`, `admin` and `wheel`. An account with running processes is skipped
 with a warning; stop them and run `--setup-ldap` again. No process is killed.
+`--check` lists each such account as a `[WARN]` with what `--setup-ldap` will do
+(migrate, with the groups it keeps and the home it re-owns, or skip because of
+running processes), as long as SSSD already resolves the AD users; see
+[the migration section](ldap-directory-setup.md#migration-on-existing-hosts-important).

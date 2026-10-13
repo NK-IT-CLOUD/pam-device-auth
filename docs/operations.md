@@ -246,6 +246,7 @@ sudo systemctl restart ssh
 ```
 Match User root
     AuthenticationMethods publickey
+    AuthorizedKeysFile .ssh/authorized_keys
 ```
 
 Root SSH-key logins bypass PAM entirely. This is **by design**: an

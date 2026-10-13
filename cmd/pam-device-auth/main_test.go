@@ -155,10 +155,12 @@ func TestLDAPTransportDescription(t *testing.T) {
 	}
 }
 
-// --check fails on a keytab over ldaps:// as --setup-ldap does, and never
-// reports that config as "GSSAPI with SASL sealing".
+// --check fails on a keytab over ldaps:// or with an IP address as the URI
+// host as --setup-ldap does, and never reports that config as "GSSAPI with
+// SASL sealing".
 func TestLDAPURICheck(t *testing.T) {
 	const keytabErr = "ldap.kerberos.keytab requires an ldap:// URI: the GSSAPI bind is protected by SASL sealing, not TLS"
+	const hostErr = "ldap.kerberos.keytab needs the DC's host name in ldap.uri, not an IP address: GSSAPI uses the ldap/<host> service principal"
 	for _, c := range []struct {
 		uri    string
 		keytab bool
@@ -169,6 +171,9 @@ func TestLDAPURICheck(t *testing.T) {
 		{"ldap://dc1.example.com", true, true, "ldap.uri is a single URI, transport GSSAPI with SASL sealing (no cleartext bind)"},
 		{"ldaps://dc1.example.com", true, false, keytabErr},
 		{"LDAPS://dc1.example.com", true, false, keytabErr},
+		{"ldap://192.0.2.10", true, false, hostErr},
+		{"ldap://[2001:db8::1]:389", true, false, hostErr},
+		{"ldap://192.0.2.10", false, true, "ldap.uri is a single URI, transport StartTLS (no cleartext bind)"},
 		{"ldaps://a.example.com,ldap://b.example.com", true, false, `ldap.uri must be a single ldaps:// or ldap:// URI (got "ldaps://a.example.com,ldap://b.example.com"): a comma/space separated list is an SSSD failover list`},
 	} {
 		l := &config.LDAPConfig{URI: c.uri}
@@ -182,6 +187,27 @@ func TestLDAPURICheck(t *testing.T) {
 		}
 		if ok != c.ok || msg != c.msg {
 			t.Errorf("%s keytab=%v: ok=%v msg=%q, want ok=%v msg=%q", c.uri, c.keytab, ok, msg, c.ok, c.msg)
+		}
+	}
+}
+
+// A resolving access group proves the CA path only where TLS carries the
+// directory connection; a keytab bind runs GSSAPI with SASL sealing instead.
+func TestDirectoryPathOK(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		l    *config.LDAPConfig
+		want string
+	}{
+		{"keytab", &config.LDAPConfig{URI: "ldap://dc1.example.com",
+			Kerberos: &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "dc1.example.com", Keytab: "/etc/krb5.sssd.keytab"}}, "SSSD↔LDAP path OK (GSSAPI)"},
+		{"ldaps password", &config.LDAPConfig{URI: "ldaps://dc1.example.com"}, "SSSD↔LDAP↔CA path OK"},
+		{"starttls password", &config.LDAPConfig{URI: "ldap://dc1.example.com"}, "SSSD↔LDAP↔CA path OK"},
+		{"kerberos without keytab", &config.LDAPConfig{URI: "ldaps://dc1.example.com",
+			Kerberos: &config.KerberosConfig{Realm: "EXAMPLE.COM", KDC: "dc1.example.com"}}, "SSSD↔LDAP↔CA path OK"},
+	} {
+		if got := directoryPathOK(c.l); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
 }

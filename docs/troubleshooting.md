@@ -326,19 +326,34 @@ sees up to three device prompts.
 
 ### QR code is a garbled box of `?`
 
-Non-Unicode-capable SSH client rendering the block characters. Known
-affected clients:
+The SSH client escapes the UTF-8 block characters; the OpenSSH version of the
+server does not matter. Known affected clients:
 
-- Win32-OpenSSH (Microsoft Windows): bug in `vis()`/stream decoding
-- Termux default `less`
+- Win32-OpenSSH (Microsoft Windows), every version
+- portable OpenSSH < 10 built without libbsd, for example Termux
+
+With `show_qr` unset, auto-detect hides the QR for these clients. The log
+shows the detected client and the decision:
+
+```bash
+grep -E 'SSH client|QR not rendered' /var/log/pam-device-auth.log | tail -n 3
+# 2026/10/13 09:12:01 [AUTH]   INFO  Directory: SSH client "OpenSSH_for_Windows_9.5", QR hidden (client)
+```
+
+A garbled QR therefore means `show_qr` is `true` (the line ends in
+`(configured)`) or a client whose version auto-detect trusts. `SSH client
+"unknown"` means no version line was found, for example because the drop-in
+lost its `LogVerbose` line; the QR is then hidden for every client. A
+`QR shown` line followed by
+`Directory: QR not rendered, verification URL is <n> bytes (limit 84)` means
+the URL is too long for a QR; only link and code appear.
 
 Fixes, in order of preference:
 
-1. Use PuTTY / iTerm2 / Ubuntu SSH / mosh; they all render fine
-2. Auto-detect does the right thing on OpenSSH 9.x servers as long as
-   `/etc/ssh/sshd_config.d/10-pam-device-auth.conf` keeps its `LogVerbose`
-   line, which journals the client version
-3. OpenSSH 10+ servers (Debian 13+) render QR for all clients regardless
+1. Use PuTTY, a distribution OpenSSH (Ubuntu, Debian, Fedora, RHEL) or
+   OpenSSH 10 or later on the client; they render the QR
+2. Leave `show_qr` unset, so auto-detect decides per client
+3. Never show the QR
 
 Manual override in `config.json`:
 

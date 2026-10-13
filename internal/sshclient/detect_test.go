@@ -5,28 +5,6 @@ import (
 	"testing"
 )
 
-func TestSSHDMajor(t *testing.T) {
-	tests := []struct {
-		version string
-		want    int
-	}{
-		{"OpenSSH_10.0p2 Debian-7+deb13u1, OpenSSL 3.5.5", 10},
-		{"OpenSSH_9.6p1 Ubuntu-3ubuntu13.15, OpenSSL 3.0.13", 9},
-		{"OpenSSH_10.2", 10},
-		{"OpenSSH_8.9p1", 8},
-		{"OpenSSH_11.0p1", 11},
-		{"not openssh at all", 0},
-		{"", 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.version, func(t *testing.T) {
-			if got := sshdMajor(tt.version); got != tt.want {
-				t.Errorf("sshdMajor(%q) = %d, want %d", tt.version, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestParseClientVersion(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -63,40 +41,51 @@ func TestParseClientVersion_LongVersionCapped(t *testing.T) {
 	}
 }
 
-func TestHasUTF8SafeVis(t *testing.T) {
+// The QR decision depends on the client alone: distribution builds, PuTTY
+// and plain OpenSSH 10+ keep UTF-8 intact; Win32-OpenSSH (any version), plain
+// OpenSSH < 10 and unknown clients escape it or may, so they get no QR.
+func TestClientRendersQR(t *testing.T) {
 	tests := []struct {
 		version string
 		want    bool
 	}{
-		{"OpenSSH_9.6p1 Ubuntu-3ubuntu13.15", true},
+		{"OpenSSH_10.2p1 Ubuntu-2ubuntu3.6", true},
+		{"OpenSSH_9.6p1 Ubuntu-3ubuntu13", true},
 		{"OpenSSH_9.7p1 Debian-5", true},
 		{"OpenSSH_9.4p1 Fedora-9.4p1-1.fc39", true},
-		{"PuTTY_Release_0.80", true},
-		{"OpenSSH_for_Windows_9.5", false},
-		{"OpenSSH_10.2", false},
+		{"OpenSSH_8.7p1 Red Hat", true},
+		{"OpenSSH_9.9p1 rhel-9", true},
+		{"OpenSSH_10.0", true},
+		{"OpenSSH_10.2", true},
+		{"OpenSSH_11.0p1", true},
+		{"OpenSSH_9.9", false},
 		{"OpenSSH_9.0", false},
+		{"OpenSSH_for_Windows_9.5", false},
+		{"OpenSSH_for_Windows_10.0", false},
+		{"PuTTY_Release_0.83", true},
+		{"OpenSSH_", false},
+		{"OpenSSH_x10", false},
+		{"MyClient OpenSSH_10.0", false},
 		{"unknown", false},
 		{"", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.version, func(t *testing.T) {
-			if got := hasUTF8SafeVis(tt.version); got != tt.want {
-				t.Errorf("hasUTF8SafeVis(%q) = %v, want %v", tt.version, got, tt.want)
+			if got := clientRendersQR(tt.version); got != tt.want {
+				t.Errorf("clientRendersQR(%q) = %v, want %v", tt.version, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestShouldShowQR_ConfigOverride(t *testing.T) {
-	trueVal := true
-	falseVal := false
-
-	if !ShouldShowQR(&trueVal) {
-		t.Error("ShouldShowQR(true) should return true")
-	}
-	if ShouldShowQR(&falseVal) {
-		t.Error("ShouldShowQR(false) should return false")
+// An explicit show_qr wins and skips the client detection.
+func TestQRDecision_ConfigOverride(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		show, client, reason := QRDecision(&want)
+		if show != want || client != "" || reason != "configured" {
+			t.Errorf("QRDecision(%v) = (%v, %q, %q), want (%v, \"\", \"configured\")", want, show, client, reason, want)
+		}
 	}
 }
 

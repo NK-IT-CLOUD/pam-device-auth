@@ -152,6 +152,16 @@ groups except `sudo`, `admin` and `wheel`. An account with running processes is
 skipped with a warning; stop them and run `--setup-ldap` again. No process is
 killed. Genuine local-only accounts and same-uid entries are left untouched.
 
+`--check` shows this decision beforehand and changes nothing: one `[WARN]` per
+account, `local account <name> (uid <local>) shadows the directory user (uid
+<dir>); --setup-ldap will migrate it, keep groups [<groups>], re-own <home>`
+(`nothing to re-own (<home> missing)` for a home below `/home` that does not
+exist, `leave <home> as it is (outside /home)` for a home elsewhere), or `… but
+has <n> running process(es); --setup-ldap will skip it`. The warnings do
+not block `--enable`. `--check` looks the names up through SSSD, so it finds
+these accounts only where SSSD already resolves the directory: before a re-run
+of `--setup-ldap`, or for an account the last run skipped.
+
 The equivalent manual steps, with the old IDs from `/etc/passwd` and the new
 ones from `getent -s sss passwd <user>`:
 

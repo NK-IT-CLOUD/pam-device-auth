@@ -1,15 +1,18 @@
-// Package sshclient decides whether to show Unicode QR codes based on the
-// SSH client's strnvis() behavior.
+// Package sshclient decides per SSH client whether to show the Unicode QR
+// code.
 //
-// OpenSSH 10+ fixed openbsd-compat/vis.c to preserve UTF-8 — QR works for
-// all clients. On OpenSSH 9.x, only clients connecting through a server
-// with libbsd (Ubuntu, Debian, Fedora) or no vis at all (PuTTY) render
-// QR correctly. Win32-OpenSSH and Termux escape UTF-8 bytes.
+// Whether the block characters survive depends on the client, not on the
+// server: Win32-OpenSSH and portable OpenSSH < 10 built without libbsd (for
+// example Termux) escape UTF-8 bytes, so the QR arrives garbled, also on an
+// OpenSSH 10 server. Distribution builds (Ubuntu, Debian, Fedora, Red Hat),
+// PuTTY (no vis() at all) and OpenSSH 10+ (openbsd-compat/vis.c keeps UTF-8)
+// render it.
 //
-// Detection: the Go binary's parent process (PPID) is the sshd session
-// that handled this connection. Its journalctl logs contain the client
-// version string logged at connection time (debug1; the managed sshd
-// drop-in forces it with LogVerbose).
+// Detection: the Go binary's parent process (PPID) is the sshd session that
+// handled this connection. Its journal entries contain the client version
+// string logged at connection time (debug1; the managed sshd drop-in forces it
+// with LogVerbose kex.c:kex_exchange_identification():*, which OpenSSH 10.2's
+// sshd-session still logs).
 package sshclient
 
 import (
@@ -22,31 +25,30 @@ import (
 	"time"
 )
 
-// ShouldShowQR determines whether to render the Unicode QR code.
+// QRDecision determines whether to render the Unicode QR code and returns the
+// detected client version (scrubbed, "unknown" if none was found; empty when
+// show_qr is set) and the reason for the decision:
 //
-//	Config "show_qr": true  → always show
-//	Config "show_qr": false → never show
-//	Config omitted          → auto: OpenSSH 10+ always, 9.x per client allowlist
-func ShouldShowQR(showQRConfig *bool) bool {
+//	Config "show_qr": true  → always show,  reason "configured"
+//	Config "show_qr": false → never show,   reason "configured"
+//	Config omitted          → per client,   reason "client" (clientRendersQR)
+//
+// An explicit show_qr skips the client detection.
+func QRDecision(showQRConfig *bool) (show bool, client, reason string) {
 	if showQRConfig != nil {
-		return *showQRConfig
+		return *showQRConfig, "", "configured"
 	}
-
-	// OpenSSH 10+ fixed vis() — QR works for all clients
-	if sshdMajor(getSSHDVersion()) >= 10 {
-		return true
-	}
-
-	// OpenSSH 9.x — check client version via parent PID's journal
-	version := detectClient()
-	return hasUTF8SafeVis(version)
+	client = detectClient()
+	return clientRendersQR(client), client, "client"
 }
 
 // detectClient returns the SSH client version string by walking the process
 // tree upward from PPID, querying journalctl at each level until the client
-// version is found.
+// version is found. The walk goes by PID and parent PID (journal field _PID,
+// /proc/<pid>/stat), not by process name, so it covers every sshd layout,
+// including sshd-session on OpenSSH 10.
 //
-// OpenSSH 9.x process tree during PAM auth:
+// Example, the OpenSSH 9.x process tree during PAM auth:
 //
 //	sshd[preauth] (PID A, logs client version)  ← grandparent
 //	  └── sshd[session] (PID B, runs PAM)       ← parent
@@ -103,59 +105,43 @@ func parsePPID(statContent string) (int, error) {
 	return strconv.Atoi(fields[1])
 }
 
-// getSSHDVersion returns the local sshd version string.
-func getSSHDVersion() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "/usr/sbin/sshd", "-V").CombinedOutput()
-	if err != nil {
-		return ""
-	}
-	return string(out)
-}
-
-// sshdMajor extracts the major version number from an sshd version string.
-func sshdMajor(version string) int {
-	idx := strings.Index(version, "OpenSSH_")
-	if idx < 0 {
-		return 0
-	}
-	rest := version[idx+len("OpenSSH_"):]
-	dot := strings.IndexAny(rest, ".p")
-	if dot < 0 {
-		dot = len(rest)
-	}
-	major, err := strconv.Atoi(rest[:dot])
-	if err != nil {
-		return 0
-	}
-	return major
-}
-
-// utf8SafePatterns lists SSH client version substrings that indicate
-// a UTF-8-safe vis() implementation or no vis() at all.
+// utf8SafePatterns lists SSH client version substrings of clients whose
+// vis() keeps UTF-8 intact (libbsd-linked distribution builds) or that have no
+// vis() at all (PuTTY).
 var utf8SafePatterns = []string{
-	"Ubuntu",  // libbsd-linked sshd
-	"Debian",  // libbsd-linked sshd
-	"Fedora",  // libbsd-linked sshd
-	"Red Hat", // RHEL
-	"RHEL",    // RHEL alternate
-	"PuTTY",   // no vis() — passes UTF-8 through
+	"Ubuntu",
+	"Debian",
+	"Fedora",
+	"Red Hat",
+	"RHEL",
+	"PuTTY",
 }
 
-// hasUTF8SafeVis returns true if the SSH client version indicates
-// UTF-8 will survive the server's strnvis() call.
-func hasUTF8SafeVis(version string) bool {
-	if version == "" || version == "unknown" {
+// clientRendersQR reports whether the SSH client with this version string
+// renders the Unicode QR: Win32-OpenSSH (any version) never does; a
+// distribution build or PuTTY (case-insensitive substring) does; otherwise a
+// plain "OpenSSH_<major>…" banner does from major 10 on. Every other or unknown
+// client gets no QR (link and code are always shown).
+func clientRendersQR(version string) bool {
+	lower := strings.ToLower(version)
+	if strings.Contains(lower, "openssh_for_windows") {
 		return false
 	}
-	lower := strings.ToLower(version)
 	for _, pattern := range utf8SafePatterns {
 		if strings.Contains(lower, strings.ToLower(pattern)) {
 			return true
 		}
 	}
-	return false
+	rest, ok := strings.CutPrefix(version, "OpenSSH_")
+	if !ok {
+		return false
+	}
+	n := 0
+	for n < len(rest) && rest[n] >= '0' && rest[n] <= '9' {
+		n++
+	}
+	major, err := strconv.Atoi(rest[:n])
+	return err == nil && major >= 10
 }
 
 // parseClientVersion extracts the SSH client version from journalctl output.
