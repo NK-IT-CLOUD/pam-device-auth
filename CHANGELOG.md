@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - 0.5.15
+## [0.5.15] - 2026-10-13
 
 ### Security
 - **Toolchain bumped to Go 1.26.9.** govulncheck flagged nine standard
