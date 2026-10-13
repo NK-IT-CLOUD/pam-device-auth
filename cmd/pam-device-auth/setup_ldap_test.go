@@ -410,23 +410,20 @@ func TestSSSDConfHasInfoPipeForClients(t *testing.T) {
 // (SSSD 2.12 reports it; 2.x defaults to version 2). Any other diff is a
 // behaviour change on every LLDAP host at the next --setup-ldap.
 func TestRenderSSSDConf_LLDAPGolden(t *testing.T) {
-	want, err := os.ReadFile("testdata/sssd-lldap.golden")
-	if err != nil {
-		t.Fatal(err)
-	}
+	want := lldapGolden(t)
 	got := renderSSSDConf(ldapRenderData{
 		URI: "ldaps://ldap.example.com:6360", BaseDN: "dc=example,dc=com",
 		UserBase: "ou=people,dc=example,dc=com", GroupBase: "ou=groups,dc=example,dc=com",
 		BindDN: "uid=ro,ou=people,dc=example,dc=com", BindPassword: "pw",
 		AccessGroup: "ssh-access", ServiceGroups: []string{"ssh-service"},
 	}, "/etc/ssl/certs/ca-certificates.crt")
-	if got != string(want) {
+	if got != want {
 		t.Fatalf("lldap sssd.conf differs from the golden file:\n--- got\n%s\n--- want\n%s", got, want)
 	}
 }
 
 func TestRenderSSSDConf_LLDAPExplicitDefaultsEqualGolden(t *testing.T) {
-	want, _ := os.ReadFile("testdata/sssd-lldap.golden")
+	want := lldapGolden(t)
 	got := renderSSSDConf(ldapRenderData{
 		Profile: config.LDAPProfileLLDAP, URI: "ldaps://ldap.example.com:6360", BaseDN: "dc=example,dc=com",
 		UserBase: "ou=people,dc=example,dc=com", GroupBase: "ou=groups,dc=example,dc=com",
@@ -434,7 +431,7 @@ func TestRenderSSSDConf_LLDAPExplicitDefaultsEqualGolden(t *testing.T) {
 		AccessGroup: "ssh-access", ServiceGroups: []string{"ssh-service"},
 		UserNameAttr: "uid", SSHKeyAttr: "sshPublicKey", ClientsAttr: "clients", Home: "/home/%u", Shell: "/bin/bash",
 	}, "/etc/ssl/certs/ca-certificates.crt")
-	if got != string(want) {
+	if got != want {
 		t.Fatalf("explicit lldap defaults change the output:\n%s", got)
 	}
 }
@@ -1137,8 +1134,8 @@ func TestRenderDataFor_LLDAPDefaultsMatchGolden(t *testing.T) {
 	l.BindDN = "uid=ro,ou=people,dc=example,dc=com"
 	l.BindPassword = "pw"
 	l.ServiceAccountGroups = []string{"ssh-service"}
-	want, _ := os.ReadFile("testdata/sssd-lldap.golden")
-	if got := renderSSSDConf(renderDataFor(l, "pw"), "/etc/ssl/certs/ca-certificates.crt"); got != string(want) {
+	want := lldapGolden(t)
+	if got := renderSSSDConf(renderDataFor(l, "pw"), "/etc/ssl/certs/ca-certificates.crt"); got != want {
 		t.Fatalf("renderDataFor changes the lldap output:\n%s", got)
 	}
 }
