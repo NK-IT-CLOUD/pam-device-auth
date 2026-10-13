@@ -11,6 +11,7 @@ Documentation for operators and developers. For quick install, see the project
 | [configuration-reference.md](configuration-reference.md) | Every `config.json` field: type, default, meaning, validation, examples |
 | [keycloak-setup.md](keycloak-setup.md) | Keycloak client, MFA in the device flow, roles, mappers, token lifetimes, LLDAP federation |
 | [ldap-directory-setup.md](ldap-directory-setup.md) | SSSD/LDAP host setup, local-account migration, revocation and 2FA activation order |
+| [active-directory-setup.md](active-directory-setup.md) | Active Directory: attributes, transport, Kerberos, UIDs in containers |
 | [ip-allowlist.md](ip-allowlist.md) | End-to-end IP-allowlist pipeline (LLDAP → SSSD InfoPipe → PAM account phase) |
 | [troubleshooting.md](troubleshooting.md) | Symptoms and fixes for common issues |
 | [operations.md](operations.md) | Logs, rotation, monitoring, upgrades, failure modes |

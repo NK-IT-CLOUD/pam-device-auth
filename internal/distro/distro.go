@@ -20,6 +20,7 @@ type Profile struct {
 	// without this step removing pam-device-auth removes the dependency again.
 	MarkManualCmd     []string
 	SSSDPackages      []string // packages that provide SSSD LDAP/NSS/PAM
+	KrbPackages       []string // SSSD krb5 provider and SASL GSSAPI plugin (keytab bind), only with ldap.kerberos
 	SudoInstall       []string // package(s) providing sudo/visudo
 	PamWiring         string   // mkhomedir wiring tool: "pam-auth-update" | "authselect"
 	MkhomedirPackages []string // extra packages the mkhomedir wiring needs (RHEL: authselect, oddjob-mkhomedir)
@@ -39,7 +40,11 @@ var debianProfile = Profile{
 	// `ifp` is in the config.
 	// sssd-tools provides sss_cache and sssctl: --setup-ldap expires the SSSD
 	// cache with sss_cache, and the revocation procedure in the docs uses it.
+	// libsasl2-modules-gssapi-mit (KrbPackages) is only a Recommends of
+	// sssd-krb5-common; without it the GSSAPI keytab bind fails with
+	// "no worthy mechs found".
 	SSSDPackages:    []string{"sssd-ldap", "libnss-sss", "libpam-sss", "sssd-dbus", "sssd-tools"},
+	KrbPackages:     []string{"sssd-krb5", "libsasl2-modules-gssapi-mit"},
 	SudoInstall:     []string{"sudo"},
 	PamWiring:       "pam-auth-update",
 	CACertPath:      "/etc/ssl/certs/ca-certificates.crt",
@@ -56,6 +61,7 @@ var rhelProfile = Profile{
 	// dependency, `dnf remove pam-device-auth` would remove it again while
 	// sssd.conf still enables ifp, and sssd would then fail to start.
 	SSSDPackages:      []string{"sssd", "sssd-ldap", "sssd-tools", "sssd-dbus"},
+	KrbPackages:       []string{"sssd-krb5", "cyrus-sasl-gssapi"},
 	SudoInstall:       []string{"sudo"},
 	PamWiring:         "authselect",
 	MkhomedirPackages: []string{"authselect", "oddjob-mkhomedir"},

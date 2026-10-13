@@ -87,6 +87,9 @@ Bind it as the client's browser flow override.
   in `acr` (with `default.acr.values` = `3` on the client: `"3"`), also after a
   refresh. A login through a flow without the condition reports a lower value
   (level 1, or `0` after a cookie sign-in).
+- Set `required_acr` to the level's value (for example `["3"]`) so the helper
+  refuses tokens from any other flow, also after a refresh. See the
+  [configuration reference](configuration-reference.md#required_acr).
 
 ## 2 · Create the SSH roles
 
@@ -179,6 +182,11 @@ Mappers in **User Federation → <your-ldap> → Mappers** should include:
 No mapper is needed for the IP allowlist: since 0.5.7 the `clients`
 attribute never passes through Keycloak (see section 4).
 
+For an Active Directory, pick the vendor **Active Directory** and set
+**Username LDAP attribute** to `sAMAccountName`, so that `preferred_username`
+equals the login name on the host (see
+[active-directory-setup.md](active-directory-setup.md)).
+
 ### Sync
 
 Run **Synchronize all users** once, then rely on the **Periodic changed
@@ -249,6 +257,8 @@ directory-side in the PAM account phase (see section 4).
 | `token audience does not include "ssh-server"` | Client authentication flipped to confidential, or audience mapper removed. Public clients normally emit `azp`; confirm `azp == client_id`. |
 | `unknown key ID` errors after realm key rotation | JWKS cache inside Keycloak is stale, or the host's DNS is caching an old IdP endpoint. The helper caches the OIDC discovery document and the JWKS for 10 minutes in `/run/pam-device-auth/oidc/` (`discovery.json`, `jwks.json`). When a token's `kid` is not in the cached key set, it refetches the JWKS once live. A key removed at the IdP (revoked or rotated out) stays trusted from the cache for up to 10 minutes; clear the cache right after such a change with `rm -rf /run/pam-device-auth/oidc`. |
 | Device flow URL opens Keycloak but the `Authorize` button does nothing | Device Authorization Grant is globally disabled at the realm level. Enable it under **Realm settings → Advanced**. |
+| `Access denied: the token carries no authentication level (acr)` | `required_acr` is set but the client lacks the `acr` client scope (section 3), so the token has no `acr` claim. |
+| `Access denied: authentication level "<acr>" is not accepted` | The sign-in did not reach a level listed in `required_acr`: the browser flow override is missing or was changed (section 1), or `required_acr` lists another value than the flow reports. |
 | `required_role` fails despite the role being assigned | Role is a **client** role assigned to the wrong client, or `fullScopeAllowed=false` plus no scope mapping for that role. Fix: assign as realm role OR add an explicit client-scope mapping. |
 | JWT rejected as `JWT header missing kid` | A key was added to the realm keystore without a `kid`. This was always invalid for our verifier; upgrade Keycloak or re-import the key. |
 

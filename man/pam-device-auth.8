@@ -16,8 +16,8 @@ provides two-factor SSH login: an SSH key served from an LDAP directory
 plus the OIDC Device Authorization Grant (RFC 8628). Identity, groups, home
 directory and the sudo password come from the directory via SSSD/NSS.
 pam-device-auth is the OIDC layer: it validates an access token (signature,
-issuer, client binding, expiry, required role, optional IP allowlist) for the
-SSH user and grants or denies the login. It never reads
+issuer, client binding, expiry, required role, optional authentication level)
+for the SSH user and grants or denies the login. It never reads
 .IR /etc/shadow ,
 prompts for a local password, or creates users.
 .PP
@@ -75,14 +75,21 @@ allowlist posture, and SSSD InfoPipe health. It also verifies that
 exposes the
 .I clients
 attribute to the InfoPipe
-.RB ( "ldap_user_extra_attrs = clients:clients"
+.RB ( "ldap_user_extra_attrs = clients:<attribute>"
 and
 .BR "[ifp] user_attributes = +clients" ),
 that
 .I ldap.uri
-uses the
+is a single
 .B ldaps://
-scheme, and that the AuthorizedKeysCommand binary exists.
+or
+.B ldap://
+(StartTLS) URI and which transport it gives, that
+.I ldap.ca_file
+and the Kerberos keytab are in place, that the UIDs and GIDs of directory
+users exist in the host's ID map, root's sshd policy for every
+.I root_login_sources
+address, and that the AuthorizedKeysCommand binary exists.
 Each item is reported as [OK]/[WARN]/[FAIL]; exits non-zero if any blocker is found.
 .TP
 .B \-\-setup\-ldap
@@ -98,12 +105,21 @@ to nsswitch, enable
 .BR pam_mkhomedir ,
 install the sudoers rules for the admin and NOPASSWD sudo groups, write the
 sshd drop-in, and migrate any pre-existing local accounts that shadow a
-directory user. Distro-aware (apt/dnf, pam-auth-update/authselect, CA path,
+directory user (no process is killed; an account with running processes is
+skipped with a warning). The
+.I ldap.profile
+selects LLDAP
+.RB ( lldap ,
+default) or Active Directory
+.RB ( ad ).
+Distro-aware (apt/dnf, pam-auth-update/authselect, CA path,
 .BR sss_ssh_authorizedkeys
-path); on Debian/Ubuntu it also installs the
+path); it also installs the
 .B sssd-dbus
-package needed for the InfoPipe responder. Does not restart sshd. Idempotent.
-Requires root.
+package needed for the InfoPipe responder and, with
+.IR ldap.kerberos ,
+the SSSD Kerberos provider and the SASL GSSAPI plugin. Does not restart sshd.
+Idempotent. Requires root.
 .TP
 .B \-\-enable
 Activate PAM authentication. Backs up
@@ -141,6 +157,9 @@ role_claim	No	\-	Extra JWT claim path for roles
 auth_timeout	No	180	Device flow timeout (30\-240s)
 allowed_algorithms	No	\-	Pin accepted JWT alg (e.g. ["RS256"])
 show_qr	No	auto	QR display: true/false/auto-detect
+root_login	No	key	key (root SSH key) or disabled
+required_acr	No	\-	Accepted acr claim values (exact match)
+root_login_sources	No	\-	Client IPs for root's policy in \-\-check
 ldap	setup	\-	Directory block for \-\-setup\-ldap (see below)
 .TE
 .PP
@@ -149,24 +168,38 @@ The
 block (used only by
 .BR \-\-setup\-ldap )
 holds
-.IR uri ", " base_dn ", " bind_dn ", " bind_password ", " access_group
+.IR uri ", " base_dn ", " bind_dn ", " bind_password
+(or
+.IR bind_password_file ,
+or neither with a Kerberos keytab),
+.I access_group
 and
 .IR admin_group ,
 plus two opt-in lists:
 .I service_account_groups
 (directory groups whose members log in key-only, with no OIDC step) and
 .I nopasswd_sudo_groups
-(groups granted passwordless sudo). The read-only bind password is written
-into the root-only
+(groups granted passwordless sudo). Optional keys:
+.IR profile ", " ca_file ", " attributes ", " id_mapping ", " id_range ,
+.IR home ", " shell ", " kerberos ", " user_search_base
+and
+.IR group_search_base .
+There is no cleartext transport:
+.B ldap://
+always means StartTLS, or GSSAPI with SASL sealing for a keytab bind. The
+read-only bind password is written into the root-only
 .I /etc/sssd/sssd.conf
 for SSSD's runtime use and is not read by the auth runtime.
 .PP
 Per-user source-IP allowlisting uses the directory
 .I clients
-attribute (set on the LLDAP user entry, not in config.json) and is enforced
-for every login by the PAM account phase.
+attribute (set on the directory user entry, not in config.json; the attribute
+name comes from
+.IR ldap.attributes.clients )
+and is enforced for every login by the PAM account phase.
 .PP
-Every field can be overridden via environment variables prefixed with
+The fields issuer_url, client_id, required_role, sudo_role, role_claim and
+auth_timeout can be overridden via environment variables prefixed with
 .BR PAM_DEVICE_AUTH_ .
 .SH FILES
 .TP
@@ -216,8 +249,10 @@ IP allowlist check in the PAM account phase.
 .PP
 .B First login / new IP:
 full OIDC Device Authorization Grant. User sees URL + code (+ QR code if the
-client supports UTF-8), authorizes in a browser. The token is re-validated
-(required role, IP allowlist) and the login is granted.
+client supports UTF-8), authorizes in a browser. The token is validated
+(required role and, if set, the accepted
+.I acr
+values) and the login is granted.
 .PP
 .B Known IP:
 silent OIDC token refresh, re-validated, no browser round-trip. The SSH key
@@ -240,8 +275,9 @@ and root cannot log in over SSH at all.
 .SH SECURITY
 .PP
 Two factors (directory SSH key + OIDC), with full token validation on every
-login: signature, issuer, azp/aud, exp/nbf/iat, required role and IP allowlist;
-JWT algorithm/key-type binding, kid required, no none/HMAC. The per-user
+login: signature, issuer, azp/aud, exp/nbf/iat, required role and the optional
+.I required_acr
+level; JWT algorithm/key-type binding, kid required, no none/HMAC. The per-user
 .I clients
 IP allowlist is enforced separately in the PAM account phase and fails
 closed on a directory/InfoPipe lookup error. Directory

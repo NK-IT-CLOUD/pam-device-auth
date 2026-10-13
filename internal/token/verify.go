@@ -18,6 +18,8 @@ type TokenResult struct {
 	Email    string
 	Name     string
 	Roles    []string
+	// ACR is the acr claim (authentication context class), "" when absent.
+	ACR string
 }
 
 // Validate verifies a JWT access token and extracts claims.
@@ -139,6 +141,7 @@ func Validate(accessToken string, keys map[string]crypto.PublicKey, issuer, clie
 		Email:    getStringClaim(claims, "email"),
 		Name:     getStringClaim(claims, "name"),
 		Roles:    ExtractRoles(claims, clientID, roleClaim),
+		ACR:      getStringClaim(claims, "acr"),
 	}
 
 	if result.Username == "" {

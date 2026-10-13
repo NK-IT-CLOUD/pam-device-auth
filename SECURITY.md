@@ -25,8 +25,9 @@ Identity (users, groups, home, SSH keys, sudo password) comes from an LDAP
 directory via SSSD/NSS; pam-device-auth is the OIDC and IP-policy layer. The
 authentication path never reads `/etc/shadow`, prompts for a local password,
 or modifies local accounts. The separate root-run `--setup-ldap` command can
-migrate a same-name local account to its directory identity; this is
-announced before `userdel`.
+migrate a same-name local account to its directory identity; it lists the
+accounts before `userdel`, sends no signal, and skips an account that still
+has running processes.
 
 - **Two factors, AND-combined**: `AuthenticationMethods publickey,keyboard-interactive:pam`
   for `access_group` members: the SSH key (served from the directory by
@@ -38,6 +39,9 @@ announced before `userdel`.
   cross-validated against discovery to prevent MITM; audience, expiry,
   not-before and issued-at claims checked on every token (60 s clock-skew
   tolerance on `iat`). Re-validated on the silent cached-refresh path too.
+- **Authentication level**: with `required_acr`, a token whose `acr` claim is
+  missing or not in the list is denied, after the device flow and after every
+  refresh.
 - **JWT algorithm/key-type binding**: RS256/384/512 requires RSA keys,
   ES256/384/512 requires EC keys; `alg=none` and HMAC rejected; prevents
   key-confusion. `allowed_algorithms` pins the accepted set.
@@ -50,8 +54,9 @@ announced before `userdel`.
 - **Directory revocation**: removing a user from the access group and its mapped
   OIDC access role denies new login after SSSD and identity-provider
   federation/cache updates. Existing SSH sessions are not terminated.
-- **Two sudo tiers**: `admin_group` members sudo with the LLDAP password via
-  `pam_sss` (no local passwords or `/etc/shadow` to drift). `nopasswd_sudo_groups`
+- **Two sudo tiers**: `admin_group` members sudo with the directory password via
+  `pam_sss`, checked by an LDAP bind over TLS or, with `ldap.kerberos`, by the
+  KDC (no local passwords or `/etc/shadow` to drift). `nopasswd_sudo_groups`
   is a separate, opt-in, admin-declared list of groups granted `NOPASSWD:ALL`
   through a managed sudoers file (`/etc/sudoers.d/pam-device-auth`, validated
   with `visudo -c` at write time). A group can be in both lists; NOPASSWD wins
@@ -88,8 +93,12 @@ announced before `userdel`.
   IPs, roles); tightened via postinst, logrotate, the Go logger `Chmod`, and
   `O_NOFOLLOW` in the C module.
 - **Setup-time injection guard**: `--setup-ldap` writes `/etc/sssd/sssd.conf`
-  (0600 root) and rejects newline / LDAP-filter-metacharacter injection in the
-  `ldap` config values; LDAPS uses `tls_reqcert = hard`.
+  (0600 root). It rejects control characters in every `ldap` value, the bind
+  password and the content of `bind_password_file` included, and
+  LDAP-filter metacharacters in the base DNs and group names.
+- **No cleartext directory bind**: `ldaps://` uses TLS, `ldap://` always uses
+  StartTLS, both with `ldap_tls_reqcert = hard`; a Kerberos keytab bind over
+  `ldap://` requires SASL sealing instead. No config value turns this off.
 - **CGO-free static binary**: the Go helper links no native libraries, which
   shrinks the runtime dependency surface; the C PAM shim links `libpam` only.
 - **Clean uninstall**: removing the package (`dpkg -r`/`--purge` or
@@ -102,9 +111,14 @@ announced before `userdel`.
 
 The security guarantees above depend on correct deployment:
 
-- Protect the LDAP bind password and keep `config.json` mode `0600 root:root`.
-- Use LDAPS with certificate verification for the managed setup path. Plain
-  `ldap://` does not protect directory credentials or results from interception.
+- Protect the LDAP bind password (or `bind_password_file`, or the keytab) and
+  keep `config.json` mode `0600 root:root`.
+- Give the directory a certificate the host trusts (LDAPS or StartTLS), or use a
+  Kerberos keytab bind with SASL sealing.
+- Keep the SSH key and `clients` attributes writable for administrators only.
+  In Active Directory, users can write the *Personal Information* attributes of
+  their own account by default; see
+  [docs/active-directory-setup.md](docs/active-directory-setup.md#who-can-write-the-key-and-the-allowlist).
 - Keep the OIDC provider, directory, host OS and SSH keys trusted and patched.
 - Pin `allowed_algorithms` to the algorithm used by the provider.
 - Review every `pam-device-auth --check` warning before activation.
@@ -128,7 +142,7 @@ The security guarantees above depend on correct deployment:
 |---|---|
 | SSH client → sshd/PAM/helper | Usernames, client IPs and terminal-facing provider data are untrusted and sanitized/validated. |
 | Helper → OIDC provider | The configured issuer is trusted; TLS, discovery issuer, endpoint host and JWT claims/signature are validated. |
-| Host → LDAP directory | The configured directory is trusted; the managed secure path is certificate-verified LDAPS. |
+| Host → LDAP directory | The configured directory is trusted; the connection is certificate-verified LDAPS or StartTLS, or GSSAPI with SASL sealing. |
 | Local root → authentication stack | Root controls PAM, sshd, config and token cache and is therefore fully trusted. |
 
 ### In scope
@@ -141,7 +155,7 @@ The security guarantees above depend on correct deployment:
 | Stolen refresh token from the host | Reading the cache normally requires root. Cache lookup is limited to previously approved client IPs; the directory `clients` allowlist further restricts source IPs in the PAM account phase. The refresh token itself is not cryptographically IP-bound. |
 | Forged or modified OIDC token | JWT signature, issuer, client binding, lifetime, algorithm/key type and `kid` are validated. The OIDC provider itself remains trusted. |
 | MITM on OIDC endpoints | HTTPS with normal certificate verification, blocked redirects and issuer-host pinning for discovered endpoints. |
-| MITM on the directory | The managed setup must use LDAPS; it configures certificate verification with `tls_reqcert = hard`. Plain LDAP is not protected. |
+| MITM on the directory | `--setup-ldap` writes no cleartext connection: LDAPS or StartTLS with `ldap_tls_reqcert = hard`, or a GSSAPI bind with SASL sealing. |
 | Brute-force IP accumulation | KnownIPs capped at 20 per user (FIFO); new IPs require full device auth; the directory `clients` allowlist restricts source IPs in the account phase. |
 | Login from an unapproved source IP | The directory `clients` allowlist is checked in the PAM account phase for every directory user (root exempt); non-matching source IPs are denied. |
 | sudoers left behind after removal | postrm deletes `/etc/sudoers.d/pam-device-auth` on both remove and purge, on deb and rpm. |
@@ -149,7 +163,7 @@ The security guarantees above depend on correct deployment:
 | Log exfiltration | No tokens, passwords, or unsanitized user input in logs; log file `0640 root:adm`; `O_NOFOLLOW`. |
 | Child process hang | Per-call monotonic deadline covering pipe reads + waitpid; reentrant under concurrent sshd auth calls. |
 | Shell injection via PAM | No shell in auth path: fork/exec with pipes, no popen(). |
-| sssd.conf injection via config | `--setup-ldap` rejects newlines / LDAP-filter metacharacters in `ldap` values. |
+| sssd.conf injection via config | `--setup-ldap` rejects control characters in every `ldap` value (bind password and `bind_password_file` content included) and LDAP-filter metacharacters in the base DNs and group names. |
 | Token accepted outside its validity window | Required `exp`, optional `nbf`, and required `iat` are checked; `iat` permits at most 60 seconds of future clock skew. |
 
 ### Out of scope

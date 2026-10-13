@@ -369,3 +369,95 @@ func TestLDAPConfigParsesTierGroups(t *testing.T) {
 		t.Errorf("NopasswdSudoGroups = %v", c.LDAP.NopasswdSudoGroups)
 	}
 }
+
+func TestLoad_NewFieldsParse(t *testing.T) {
+	path := writeConfig(t, `{
+  "issuer_url": "https://sso.example.com/realms/r", "client_id": "ssh-server", "required_role": "ssh-access",
+  "required_acr": ["3"], "root_login_sources": ["192.0.2.10", "2001:db8::1"],
+  "ldap": {"profile": "ad", "uri": "ldaps://dc1.example.com", "ca_file": "/etc/ssl/ad-ca.pem",
+    "bind_password_file": "/etc/pam-device-auth/ldap.secret",
+    "attributes": {"username": "sAMAccountName", "ssh_key": "sshPublicKey", "clients": "extensionAttribute1"},
+    "id_mapping": true, "id_range": {"min": 10000, "max": 60000}, "home": "/home/%u", "shell": "/bin/bash",
+    "kerberos": {"realm": "EXAMPLE.COM", "kdc": "dc1.example.com", "kpasswd": "dc1.example.com", "keytab": "/etc/krb5.sssd.keytab"}}
+}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.RequiredACR; len(got) != 1 || got[0] != "3" {
+		t.Errorf("RequiredACR = %v", got)
+	}
+	if got := cfg.RootLoginSources; len(got) != 2 {
+		t.Errorf("RootLoginSources = %v", got)
+	}
+	l := cfg.LDAP
+	if l.ProfileName() != LDAPProfileAD || l.CAFile != "/etc/ssl/ad-ca.pem" || l.BindPasswordFile == "" {
+		t.Errorf("ldap basics = %+v", l)
+	}
+	if l.Attributes.Clients != "extensionAttribute1" || l.IDMapping == nil || !*l.IDMapping || l.IDRange.Max != 60000 {
+		t.Errorf("ldap ad fields = %+v", l)
+	}
+	if l.Kerberos == nil || l.Kerberos.Realm != "EXAMPLE.COM" || l.Kerberos.Keytab != "/etc/krb5.sssd.keytab" {
+		t.Errorf("kerberos = %+v", l.Kerberos)
+	}
+}
+
+func TestLDAPConfig_ProfileNameDefaultsToLLDAP(t *testing.T) {
+	if got := (&LDAPConfig{}).ProfileName(); got != LDAPProfileLLDAP {
+		t.Fatalf("ProfileName() = %q, want %q", got, LDAPProfileLLDAP)
+	}
+}
+
+func TestValidate_RequiredACR(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		acr  []string
+		ok   bool
+	}{
+		{"absent", nil, true},
+		{"numeric level", []string{"3"}, true},
+		{"several names", []string{"gold", "platinum"}, true},
+		{"empty entry", []string{""}, false},
+		{"whitespace", []string{"3 "}, false},
+		{"control character", []string{"3\n"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := validBase()
+			cfg.RequiredACR = c.acr
+			if err := cfg.Validate(); (err == nil) != c.ok {
+				t.Fatalf("Validate() err = %v, want ok=%v", err, c.ok)
+			}
+		})
+	}
+}
+
+func TestValidate_RootLoginSources(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		sources []string
+		ok      bool
+	}{
+		{"absent", nil, true},
+		{"ipv4 and ipv6", []string{"192.0.2.10", "2001:db8::1"}, true},
+		{"cidr rejected", []string{"192.0.2.0/24"}, false},
+		{"host name rejected", []string{"admin.example.com"}, false},
+		{"empty rejected", []string{""}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := validBase()
+			cfg.RootLoginSources = c.sources
+			if err := cfg.Validate(); (err == nil) != c.ok {
+				t.Fatalf("Validate() err = %v, want ok=%v", err, c.ok)
+			}
+		})
+	}
+}
+
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

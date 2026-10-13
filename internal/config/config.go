@@ -3,10 +3,12 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const DefaultConfigPath = "/etc/pam-device-auth/config.json"
@@ -31,6 +33,13 @@ type Config struct {
 	// is then reachable only through a console. Used by --setup-ldap, --enable
 	// and --check, not by the login itself.
 	RootLogin string `json:"root_login,omitempty"`
+	// RequiredACR lists the accepted values of the access token's acr claim
+	// (exact string match). Empty = no check. Keycloak does not enforce a
+	// minimum level for the device grant, see docs/keycloak-setup.md.
+	RequiredACR []string `json:"required_acr,omitempty"`
+	// RootLoginSources are client addresses for which --check additionally
+	// evaluates root's sshd policy (Match Address blocks). Used by --check only.
+	RootLoginSources []string `json:"root_login_sources,omitempty"`
 	// LDAP holds the directory settings consumed ONLY by `--setup-ldap` to write
 	// /etc/sssd/sssd.conf. It is not used by the auth runtime (SSSD owns the
 	// bind), so it may be absent in the deployed runtime config.
@@ -56,6 +65,62 @@ type LDAPConfig struct {
 	// NopasswdSudoGroups are LLDAP groups granted passwordless sudo (NOPASSWD:ALL).
 	// Opt-in and admin-declared; empty ⇒ only admin_group gets (password) sudo.
 	NopasswdSudoGroups []string `json:"nopasswd_sudo_groups,omitempty"`
+	// Profile selects the directory layout: "lldap" (default) or "ad".
+	Profile string `json:"profile,omitempty"`
+	// CAFile overrides the distro CA bundle for ldap_tls_cacert.
+	CAFile string `json:"ca_file,omitempty"`
+	// BindPasswordFile is a root-owned 0600 file holding the bind password;
+	// mutually exclusive with BindPassword.
+	BindPasswordFile string `json:"bind_password_file,omitempty"`
+	// Attributes names the LDAP attributes for the login name, the SSH key and
+	// the source-IP allowlist. Empty fields take the profile default.
+	Attributes LDAPAttributes `json:"attributes,omitempty"`
+	// IDMapping (ad only, default true) maps UIDs/GIDs from the objectSid.
+	IDMapping *bool `json:"id_mapping,omitempty"`
+	// IDRange (ad only) bounds the mapped IDs; needed in unprivileged containers.
+	IDRange *IDRange `json:"id_range,omitempty"`
+	// Home and Shell override the defaults /home/%u and /bin/bash.
+	Home  string `json:"home,omitempty"`
+	Shell string `json:"shell,omitempty"`
+	// Kerberos switches sudo and passwd to the KDC; with Keytab the identity
+	// bind uses GSSAPI instead of a password.
+	Kerberos *KerberosConfig `json:"kerberos,omitempty"`
+}
+
+// Values of LDAPConfig.Profile.
+const (
+	LDAPProfileLLDAP = "lldap"
+	LDAPProfileAD    = "ad"
+)
+
+// LDAPAttributes names directory attributes; empty fields take the profile default.
+type LDAPAttributes struct {
+	Username string `json:"username,omitempty"`
+	SSHKey   string `json:"ssh_key,omitempty"`
+	Clients  string `json:"clients,omitempty"`
+}
+
+// IDRange is the ID mapping range for SSSD (ldap_idmap_range_min/max).
+type IDRange struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
+// KerberosConfig wires SSSD's krb5 auth/chpass provider and, with Keytab, the
+// GSSAPI identity bind.
+type KerberosConfig struct {
+	Realm   string `json:"realm"`
+	KDC     string `json:"kdc"`
+	Kpasswd string `json:"kpasswd,omitempty"`
+	Keytab  string `json:"keytab,omitempty"`
+}
+
+// ProfileName returns the configured profile, "lldap" when unset.
+func (l *LDAPConfig) ProfileName() string {
+	if l.Profile == "" {
+		return LDAPProfileLLDAP
+	}
+	return l.Profile
 }
 
 // Values of Config.RootLogin.
@@ -161,6 +226,16 @@ func (c *Config) Validate() error {
 	case "", RootLoginKey, RootLoginDisabled:
 	default:
 		return fmt.Errorf("root_login must be %q or %q, got %q", RootLoginKey, RootLoginDisabled, c.RootLogin)
+	}
+	for _, a := range c.RequiredACR {
+		if a == "" || strings.IndexFunc(a, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return fmt.Errorf("required_acr entries must be non-empty and contain no whitespace or control characters, got %q", a)
+		}
+	}
+	for _, s := range c.RootLoginSources {
+		if net.ParseIP(s) == nil {
+			return fmt.Errorf("root_login_sources entries must be IP addresses (no CIDR, no host name), got %q", s)
+		}
 	}
 	return nil
 }

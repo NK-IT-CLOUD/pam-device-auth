@@ -5,6 +5,9 @@ via SSSD/NSS, the NSS best practice). pam-device-auth is the **OIDC SSH-login la
 on top. This is the only supported model, and the only one that works on
 **OpenSSH 10.2+**, which refuses PAM for users `getpwnam` cannot resolve.
 
+This guide covers LLDAP (the default `ldap.profile`, `lldap`). For an Active
+Directory, see [active-directory-setup.md](active-directory-setup.md).
+
 ## Prerequisites (per host)
 
 1. **Directory CA trusted**: if the directory uses a private CA, install its
@@ -141,20 +144,23 @@ hand-made account), the **local account shadows the directory one**:
 - `useradd <name>` is refused once the directory provides the name (a safety net
   against new collisions).
 
-`--setup-ldap` automatically migrates each pre-existing collision after printing
-the complete destructive scope. For every listed user it kills running processes,
-removes the local passwd/shadow entry with `userdel` (without deleting the home),
-and re-owns the home, mail spool and crontab to the directory uid/gid. Genuine
-local-only accounts and same-uid entries are left untouched.
+`--setup-ldap` lists every local account (UID 1000 to 64999) whose name also
+resolves through SSSD with another UID, then migrates it: it removes the local
+entry, keeps the home directory, re-owns the files that belonged to the old IDs
+(home below `/home`, mail spool, crontab) and puts the user back into its local
+groups except `sudo`, `admin` and `wheel`. An account with running processes is
+skipped with a warning; stop them and run `--setup-ldap` again. No process is
+killed. Genuine local-only accounts and same-uid entries are left untouched.
 
-Review the warning carefully when running the command from a persistent root
-session. The equivalent manual steps are:
+The equivalent manual steps, with the old IDs from `/etc/passwd` and the new
+ones from `getent -s sss passwd <user>`:
 
 ```bash
-# stop their sessions, then:
-userdel <user>                              # remove the local /etc/passwd entry
-chown -R <user>:ssh-access /home/<user>     # re-own home to the directory uid/gid
-# (the directory uidNumber/gidNumber now resolve via SSSD)
+# no process of <user> may be running
+userdel <user>                                        # remove the local entry, the home stays
+gpasswd -a <user> <group>                             # for each local group to keep
+chown -R --from=<old-uid> <new-uid> /home/<user>      # re-own only what the old UID owned
+chown -R --from=:<old-gid> :<new-gid> /home/<user>    # same for the old GID
 ```
 
 A plain package update (`dpkg`) does not migrate accounts. Re-running
@@ -187,7 +193,9 @@ installs.
 ## Troubleshooting
 
 - **`setresuid <n>: Invalid argument`** on login: uidNumber is 65536 or higher on
-  an LXC host. Set an in-range uidNumber (below 60000) in LLDAP.
+  an LXC host. Set an in-range uidNumber (below 60000) in LLDAP. `--check` fails
+  for access-group and service-group members whose UID or primary GID is
+  outside the host's ID map.
 - **Changed a uidNumber/gidNumber in LLDAP but the host still shows the old value**:
   `sss_cache -E` is not enough. Full wipe:
   `systemctl stop sssd; rm -f /var/lib/sss/db/*.ldb /var/lib/sss/mc/*; systemctl start sssd`.
@@ -195,8 +203,8 @@ installs.
 - **`getent -s sss passwd <user>` empty**: check CA trust, firewall (6360), and that
   the user has `uidNumber` and `gidNumber` (a posixAccount without gidNumber is
   dropped by SSSD, and the same applies to groups without a gidNumber).
-- **sudo "Authentication failed"**: SSSD `auth_provider` must be `ldap`; the user
-  enters their LLDAP password.
+- **sudo "Authentication failed"**: SSSD `auth_provider` must be `ldap` (or `krb5`
+  with `ldap.kerberos`); the user enters their directory password.
 - **InfoPipe/account-phase denies everyone**: `sssd-dbus` is not installed,
   or the `[ifp]` section absent from `sssd.conf`. Check with
   `pam-device-auth --check` and `busctl status org.freedesktop.sssd.infopipe`.

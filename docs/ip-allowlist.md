@@ -42,10 +42,10 @@ rolling this out: it reports the IP-pin posture per group (how many members have
 ```
 
 The account-phase check reads the attribute that SSSD exposes as `clients`.
-`--setup-ldap` maps the LLDAP attribute `clients` to that name
-(`ldap_user_extra_attrs = clients:clients`). A directory that stores the
-allowlist under another attribute needs `clients:<that attribute>` in
-`sssd.conf`; the name on the SSSD side stays `clients`.
+`--setup-ldap` maps the directory attribute named in `ldap.attributes.clients`
+(default `clients`, required for the `ad` profile) to that name
+(`ldap_user_extra_attrs = clients:<attribute>`); the name on the SSSD side
+stays `clients`.
 
 ## Data model
 

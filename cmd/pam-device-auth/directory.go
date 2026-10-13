@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/cache"
@@ -24,10 +26,10 @@ import (
 // directoryAuthFlow is the auth path for hosts where identity comes from the
 // directory (LLDAP via SSSD/NSS). pam-device-auth here is ONLY the extra OIDC
 // SSH-login layer: it validates an OIDC token (signature/issuer/client/exp/iat,
-// required_role, optional IP allowlist) for the SSH user, then grants or denies
-// the login. It NEVER reads /etc/shadow, never prompts for a local password,
-// and never creates users or manages groups — SSSD/LLDAP own identity, groups,
-// home dir, and the sudo password (pam_sss).
+// required_role, optional required_acr, optional IP allowlist) for the SSH
+// user, then grants or denies the login. It NEVER reads /etc/shadow, never
+// prompts for a local password, and never creates users or manages groups —
+// SSSD/LLDAP own identity, groups, home dir, and the sudo password (pam_sss).
 func directoryAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser, clientIP string) {
 	// Defensive NSS identity gate. In directory mode the SSH user MUST resolve
 	// via NSS (SSSD/LDAP). The deployed sshd config already guarantees this —
@@ -209,7 +211,7 @@ func rememberDeviceLogin(log *logger.Logger, sshUser, refreshToken, clientIP str
 // validateDirectoryToken loads the JWKS (root-only metadata cache, live on a
 // miss), validates the token (signature, issuer, client binding, exp/iat,
 // allowed algorithms), and confirms the token subject matches the SSH user.
-// Policy (role/IP) is checked separately by checkDirectoryAccess so callers
+// Policy (role, acr) is checked separately by checkDirectoryAccess so callers
 // can distinguish "bad token" from "denied".
 func validateDirectoryToken(log *logger.Logger, httpClient *http.Client, endpoints *discovery.Endpoints, cfg *config.Config, accessToken, sshUser string) (*token.TokenResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
@@ -243,13 +245,19 @@ func validateDirectoryToken(log *logger.Logger, httpClient *http.Client, endpoin
 	return result, nil
 }
 
-// checkDirectoryAccess applies the required-role policy gate. Returns "" when
-// access is allowed, or a human-readable denial reason. The `clients` IP
-// allowlist is enforced separately in the PAM account phase (acct.go) for every
-// login, so it is not re-checked here.
+// checkDirectoryAccess applies the token policy: the required role, then the
+// accepted authentication levels (required_acr, exact match). It returns the
+// deny reason or "". The `clients` IP allowlist is enforced separately in the
+// PAM account phase (acct.go) for every login, so it is not re-checked here.
 func checkDirectoryAccess(result *token.TokenResult, cfg *config.Config) string {
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		return fmt.Sprintf("Access denied: '%s' lacks required role '%s'.", result.Username, cfg.RequiredRole)
+	}
+	if len(cfg.RequiredACR) > 0 && !slices.Contains(cfg.RequiredACR, result.ACR) {
+		if result.ACR == "" {
+			return "Access denied: the token carries no authentication level (acr); the identity provider must add the acr claim (Keycloak: client scope acr)."
+		}
+		return fmt.Sprintf("Access denied: authentication level %q is not accepted (required: %s).", result.ACR, strings.Join(cfg.RequiredACR, ", "))
 	}
 	return ""
 }

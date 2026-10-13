@@ -19,10 +19,10 @@ func TestValidateLDAPURI(t *testing.T) {
 		{"ldaps://lldap.example:6360", true},
 		{"ldaps://lldap.example", true},
 		{"ldaps://lldap.example/", true},
-		{"ldap://lldap.example", false},
+		{"ldap://lldap.example", true}, // StartTLS, enforced by the renderer
 		{"ldaps://", false},
 		{"", false},
-		// SSSD failover lists: url.Parse accepts these, SSSD would fall back to cleartext.
+		// SSSD failover lists: url.Parse accepts these, SSSD would fall back to another transport.
 		{"ldaps://a,ldap://b", false},
 		{"ldaps://a/,ldap://b", false},
 		// No path at all: only the list-separator check catches this; SSSD would

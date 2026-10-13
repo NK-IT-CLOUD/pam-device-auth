@@ -28,6 +28,8 @@ returns `PAM_AUTH_ERR`.
 | [`allowed_algorithms`](#allowed_algorithms) | string[] | no | `[]` (accept all supported) | Pin accepted JWT `alg` header values (e.g. `["RS256"]`). Empty/unset accepts any of RS256/384/512, ES256/384/512. |
 | [`show_qr`](#show_qr) | bool (nullable) | no | `null` (auto-detect) | `true` = always render QR, `false` = never, `null` = auto-detect client capability. |
 | [`root_login`](#root_login) | string | no | `"key"` | `"key"` keeps root's own SSH key as the emergency path. `"disabled"` refuses every SSH login of root. Applied by `--setup-ldap` and `--enable`. |
+| [`required_acr`](#required_acr) | string[] | no | `[]` (no check) | Accepted values of the access token's `acr` claim, exact match. A token without `acr` or with another value is denied. |
+| [`root_login_sources`](#root_login_sources) | string[] | no | `[]` | Client IP addresses for which `--check` evaluates root's sshd policy (`Match Address` blocks). Used by `--check` only. |
 | [`ldap`](#ldap) | object | setup only | (none) | Directory wiring consumed by `--setup-ldap` to write `/etc/sssd/sssd.conf`. Not used by the auth runtime. |
 
 Unknown fields are ignored; extra fields do not fail validation. (Configs from
@@ -58,16 +60,18 @@ ignored.)
 - Keycloak realm role is preferred (appears under `realm_access.roles`)
 - Client roles also work (`resource_access.<client_id>.roles`)
 - Revocation effect: on the next login attempt the token no longer carries the
-  role and the helper denies the login (exit 2, `PAM_MAXTRIES`). Because the
-  SSSD access filter (`ldap_access_filter` = access group) is also evaluated,
-  removing the user from the access group denies login and sudo independently,
-  bounded by the SSSD cache TTL. There is no local account to lock.
+  role and the helper denies the login (exit 2, `PAM_MAXTRIES`). Because SSSD's
+  access control (`ldap_access_filter`, or `simple_allow_groups` with the `ad`
+  profile) is also evaluated, removing the user from the access group denies
+  login and sudo independently, bounded by the SSSD cache TTL. There is no local
+  account to lock.
 
 ### `sudo_role`
 
 - The directory **admin group** (e.g. `ssh-admin`) is what actually grants sudo:
   `--setup-ldap` writes `/etc/sudoers.d/pam-device-auth` with `%<admin_group>`,
-  and `pam_sss` re-authenticates sudo against the directory password.
+  and `pam_sss` re-authenticates sudo against the directory password (against
+  the KDC with `ldap.kerberos`).
 - `sudo_role` names the matching OIDC role for documentation/parity; the helper
   does not assign local groups (SSSD/NSS owns group membership).
 
@@ -177,43 +181,145 @@ the drop-in, and one that sorts after it has no effect.
 > make sure you can reach a console. If LDAP or the identity provider is down,
 > the console is then the only way in.
 
+To allow root only from some addresses, keep `"key"`, restrict root in sshd
+yourself and list the addresses in [`root_login_sources`](#root_login_sources).
+
+### `required_acr`
+
+Accepted values of the `acr` claim (authentication context class) in the access
+token. Empty or absent: no check.
+
+- Values are compared as exact strings. There is no ordering of levels, so list
+  every value you accept.
+- The helper checks the claim after the device flow and after every refresh of
+  the cached login, next to `required_role`. A token whose `acr` is missing is
+  denied with `Access denied: the token carries no authentication level (acr);
+  the identity provider must add the acr claim (Keycloak: client scope acr).`;
+  a token with another value with `Access denied: authentication level "<acr>"
+  is not accepted (required: <list>).` Both are hard denies (exit 2), and a
+  denied refresh also removes the cached session.
+- Each entry must be non-empty and contain no whitespace or control
+  characters; otherwise the config does not load.
+- `--check` prints the policy (`Token policy: acr must be one of …`) but
+  cannot test it: it sees no token.
+
+Keycloak does not enforce a minimum level for the device grant itself. With the
+browser flow override from
+[keycloak-setup.md](keycloak-setup.md#require-a-strong-factor-in-the-browser)
+and the `acr` client scope, the token carries `"3"`, also after a refresh:
+
+```json
+"required_acr": ["3"]
+```
+
+### `root_login_sources`
+
+Client IP addresses (IPv4 or IPv6; no CIDR range, no host name) for which
+`--check` evaluates root's sshd policy, usually the hosts root is meant to log
+in from. Only `--check` (and the same preflight in `--enable`) uses them;
+nothing writes sshd configuration from them. An entry that is not an IP address
+is a config error.
+
+For each address, `--check` evaluates root's effective policy with
+`sshd -T -C user=root,addr=<address>` in addition to the run without an
+address:
+
+- With `root_login` `"key"` and a global `PermitRootLogin no`, an address from
+  which sshd allows root with `prohibit-password` and `AuthenticationMethods
+  publickey` is the emergency path: `--check` reports
+  `root: publickey only from <addresses> (break-glass via Match Address)`. If no
+  address reaches root that way, it warns that there is no emergency path. When
+  sshd does not refuse root globally, the addresses do not change the result.
+- With `root_login` `"disabled"`, an address from which sshd still allows root
+  is a blocker.
+
+OpenSSH up to 10.0 prints `prohibit-password` as `without-password` in
+`sshd -T`; both count. The sshd side is yours to write, for example in a file in
+`/etc/ssh/sshd_config.d/` that sorts before `10-pam-device-auth.conf` (sshd uses
+the first value it reads for `PermitRootLogin`):
+
+```
+PermitRootLogin no
+
+Match User root Address 192.0.2.10
+    PermitRootLogin prohibit-password
+    AuthenticationMethods publickey
+```
+
+with `"root_login_sources": ["192.0.2.10"]` in `config.json`.
+
 ### `ldap`
 
 Consumed only by `pam-device-auth --setup-ldap`, which writes
 `/etc/sssd/sssd.conf` (0600 root). Not read by the auth runtime (SSSD owns the
 bind), so it may be absent in the deployed runtime config.
 
+For an Active Directory, set `profile` to `"ad"`; see
+[active-directory-setup.md](active-directory-setup.md).
+
 | Key | Description |
 |---|---|
-| `uri` | Directory URL, must be `ldaps://<host>[:port]` with a host (for example `ldaps://ldap.example.com:636`). Plain `ldap://` is rejected: the generated `sssd.conf` never enables StartTLS, so a plain bind would expose `bind_password`. A comma- or whitespace-separated URI list is rejected too, because SSSD would treat it as a failover list and could fall back to cleartext. `--setup-ldap` and `--check` both enforce this. |
+| `uri` | Directory URL: one `ldaps://<host>[:port]` or `ldap://<host>[:port]` (for example `ldaps://ldap.example.com:636`). `ldap://` means StartTLS: the generated `sssd.conf` sets `ldap_id_use_start_tls = true`, and SSSD does not talk to the server without TLS. With `kerberos.keytab`, `uri` must be `ldap://`: the bind uses GSSAPI with SASL sealing (`ldap_sasl_minssf = 56`) instead of TLS, and `sssd.conf` sets `ldap_id_use_start_tls = false`; `--setup-ldap` and `--check` reject a keytab with `ldaps://`. There is no cleartext option. LLDAP does not offer StartTLS, so use `ldaps://` with LLDAP. A comma- or whitespace-separated URI list is rejected, because SSSD would treat it as a failover list. `--setup-ldap` and `--check` both enforce this. |
 | `base_dn` | Directory base DN, e.g. `dc=example,dc=com`. |
-| `bind_dn` | Read-only bind DN for SSSD lookups. |
-| `bind_password` | Read-only bind password. Read only at setup time; written into root-only `sssd.conf`. |
-| `access_group` | Login gate group (e.g. `ssh-access`). Interactive users: directory SSH key plus OIDC. Becomes part of `ldap_access_filter`. |
+| `bind_dn` | Read-only bind identity for SSSD lookups: a DN, a UPN (`svc-sssd@example.com`) or a down-level logon name (`EXAMPLE\svc-sssd`). With `kerberos.keytab` the Kerberos principal, for example `svc-sssd@EXAMPLE.COM`. |
+| `bind_password` | Read-only bind password. Set exactly one of `bind_password` and `bind_password_file` for a password bind, neither with `kerberos.keytab`. Read only at setup time; written into root-only `sssd.conf`. |
+| `access_group` | Login gate group (e.g. `ssh-access`). Interactive users: directory SSH key plus OIDC. Becomes part of `ldap_access_filter` (`lldap`) or `simple_allow_groups` (`ad`). |
 | `admin_group` | Sudo group (e.g. `ssh-admin`). Members get password sudo via `pam_sss`. Gets the `/etc/sudoers.d` rule. |
-| `user_search_base` | Optional. Defaults to `ou=people,<base_dn>`. |
-| `group_search_base` | Optional. Defaults to `ou=groups,<base_dn>`. |
-| `service_account_groups` | Optional array of LLDAP groups whose members authenticate SSH with a directory key only, no OIDC device flow. For automation and service accounts. Widens the access filter (OR'd with `access_group`) but skips the OIDC factor. Empty or unset: no service tier, every non-root login requires OIDC. |
-| `nopasswd_sudo_groups` | Optional array of LLDAP groups granted passwordless sudo (`NOPASSWD:ALL`). Opt-in and admin-declared; empty or unset means only `admin_group` gets (password) sudo. |
+| `user_search_base` | Optional. Defaults to `ou=people,<base_dn>` (`lldap`) or `<base_dn>` (`ad`). |
+| `group_search_base` | Optional. Defaults to `ou=groups,<base_dn>` (`lldap`) or `<base_dn>` (`ad`). |
+| `service_account_groups` | Optional array of directory groups whose members authenticate SSH with a directory key only, no OIDC device flow. For automation and service accounts. Widens the access gate (OR'd with `access_group`) but skips the OIDC factor. Empty or unset: no service tier, every non-root login requires OIDC. |
+| `nopasswd_sudo_groups` | Optional array of directory groups granted passwordless sudo (`NOPASSWD:ALL`). Opt-in and admin-declared; empty or unset means only `admin_group` gets (password) sudo. |
+
+Optional keys for the directory layout, the password file and Kerberos:
+
+| Key | Default | Description |
+|---|---|---|
+| `profile` | `"lldap"` | `"lldap"` (rfc2307bis, `ldap_access_filter`) or `"ad"` (`ldap_schema = ad`, SSSD's simple access provider, nested groups, groups in any OU). Anything else is a config error. |
+| `ca_file` | distro CA bundle | Absolute path of the CA bundle written to `ldap_tls_cacert`. `--setup-ldap` and `--check` fail when it does not exist or is not a regular file. It must be readable by the user SSSD runs as: on distributions where `sssd_be` runs as user `sssd`, a file below the 0700 directory `/etc/pam-device-auth` is not readable. Use `/usr/local/share/ca-certificates/` (Debian, Ubuntu) or `/etc/pki/ca-trust/source/anchors/` (RHEL family). |
+| `bind_password_file` | (none) | Absolute path of a file that holds the bind password on one line; one trailing newline is stripped. It must be a regular file (no symlink) owned by root, without access for group or others (mode 0600), and at most 4096 bytes long; `--setup-ldap` fails on a longer file. |
+| `attributes.username` | `uid` (`lldap`), `sAMAccountName` (`ad`) | LDAP attribute of the login name (`ldap_user_name`). |
+| `attributes.ssh_key` | `sshPublicKey` (`lldap`); required for `ad` | LDAP attribute with the SSH public keys (`ldap_user_ssh_public_key`). |
+| `attributes.clients` | `clients` (`lldap`); required for `ad` | LDAP attribute with the source-IP allowlist, exposed to the InfoPipe as `clients` (`ldap_user_extra_attrs = clients:<attribute>`). One IP address or CIDR range per value; more than one allowed address needs a multi-valued attribute. A single-valued attribute such as `extensionAttribute1` … `15` or `msDS-cloudExtensionAttribute1` … `20` holds exactly one entry. |
+| `id_mapping` | `true` | `ad` only. `true` derives UIDs and GIDs from the objectSid; `false` reads `uidNumber` and `gidNumber` from the directory. |
+| `id_range` | (none: SSSD maps from 200000) | `ad` only, needs `id_mapping`. `{"min": 10000, "max": 60000}` with `1000 <= min < max` sets `ldap_idmap_range_min`, `ldap_idmap_range_max` and `ldap_idmap_range_size = max - min` (one ID slice, one domain). Needed in unprivileged containers. |
+| `home` | `/home/%u` | Home directory (`override_homedir`). `%u`, `%d` and `%f` are passed to SSSD. |
+| `shell` | `/bin/bash` | Login shell (`default_shell`). |
+| `kerberos.realm` | (none) | Upper-case realm, e.g. `EXAMPLE.COM`. A `kerberos` block switches `auth_provider` and `chpass_provider` to `krb5`: sudo and `passwd` talk to the KDC, the user password never goes over LDAP. With it, `--setup-ldap` also installs the SSSD Kerberos provider and the SASL GSSAPI plugin. Without it, the `ad` profile sets `chpass_provider = none` (AD does not implement the LDAP password modify operation). Applies to both profiles. |
+| `kerberos.kdc` | (none) | KDC host name or address, optionally with a port (`krb5_server`). Required in a `kerberos` block. `--check` warns when it does not resolve. |
+| `kerberos.kpasswd` | (none) | Optional password-change server (`krb5_kpasswd`). |
+| `kerberos.keytab` | (none) | Absolute path of a keytab for `bind_dn`: a regular file owned by root, mode 0600. Switches the identity bind to GSSAPI (`ldap_sasl_mech = GSSAPI`) and replaces the bind password. Needs an `ldap://` `uri`: the bind is protected by SASL sealing, not TLS. `--setup-ldap` and `--check` fail when it is missing, a symlink, not owned by root or accessible to group or others. |
 
 `--setup-ldap` validates every value before it is written into `sssd.conf` /
-`sudoers` (injection guard): newlines are rejected in all fields; `access_group`,
-`admin_group`, and every entry in `service_account_groups` and
-`nopasswd_sudo_groups` must be a bare Unix group name (`[A-Za-z_][A-Za-z0-9_-]*`);
-and `base_dn`, `user_search_base`, `group_search_base` are constrained to a DN
-charset (`[A-Za-z0-9 ._=,-]`) so they cannot inject directives or alter the
-`ldap_access_filter`. `uri` must be a single `ldaps://` URL (see above), and `tls_reqcert = hard` is always set.
+`sudoers` (injection guard). Every value, including the bind password and the
+content of `bind_password_file`, is rejected when it contains a control
+character (newline, tab and the rest of U+0000 to U+001F, U+007F); the error
+names the field and never the value. Beyond that:
+
+- `access_group`, `admin_group`, and every entry in `service_account_groups`
+  and `nopasswd_sudo_groups` must be a bare Unix group name
+  (`[A-Za-z_][A-Za-z0-9_-]*`, so no spaces and no `DOMAIN\`).
+- `base_dn`, `user_search_base` and `group_search_base` are constrained to a DN
+  charset (`[A-Za-z0-9 ._=,-]`) so they cannot inject directives or alter the
+  access filter.
+- `bind_dn` is constrained to `[A-Za-z0-9 ._=,@\-]`; with `kerberos.keytab` it
+  must be a Kerberos principal (`[A-Za-z0-9._$/-]`, optionally `@` and an
+  upper-case realm).
+- `attributes.*` must be LDAP attribute names (`[A-Za-z][A-Za-z0-9-]*`).
+- `ca_file`, `bind_password_file`, `home`, `shell` and `kerberos.keytab` must be
+  absolute paths of `[A-Za-z0-9._%/+-]`.
+- `uri` must be a single URL (see above), and `ldap_tls_reqcert = hard` is
+  always set.
 
 **Two orthogonal group axes.** SSH auth and sudo are controlled
 independently: `access_group` (key plus OIDC) and `service_account_groups`
 (key only) both grant SSH login, a user only needs to be in one of them
-(the access filter ORs them together). Separately, `admin_group` grants
+(the access gate ORs them together). Separately, `admin_group` grants
 password sudo and `nopasswd_sudo_groups` grants passwordless sudo. A user
 can be in any combination of these four groups.
 
-Any new LLDAP group referenced here needs a POSIX **gidNumber** set, or
-SSSD will not resolve it and the group is effectively invisible to the
-access filter and sudoers rules.
+With the `lldap` profile, any new group referenced here needs a POSIX
+**gidNumber** set, or SSSD will not resolve it and the group is effectively
+invisible to the access filter and sudoers rules.
 
 `--setup-ldap` also renders the `ifp` (InfoPipe) responder into
 `sssd.conf`, which the PAM account-phase IP gate (`--pam-acct`) depends on

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/distro"
 )
 
@@ -161,5 +162,82 @@ func TestMarkManualCommand(t *testing.T) {
 	}
 	if markManualCommand(rhel, nil) != nil {
 		t.Error("no packages must give nil")
+	}
+}
+
+func TestRootLoginWithSources(t *testing.T) {
+	key := rootSourcePolicy{Source: "192.0.2.10", Permit: "prohibit-password", Methods: "publickey"}
+	none := rootSourcePolicy{Source: "198.51.100.7", Permit: "no", Methods: "publickey"}
+	for _, c := range []struct {
+		name            string
+		mode, permit    string
+		sources         []rootSourcePolicy
+		wantOK, wantFat bool
+		wantMsg         string
+	}{
+		{"no sources: unchanged default", "", "prohibit-password", nil, true, false, "publickey only"},
+		{"global no, a source allows the key", "", "no", []rootSourcePolicy{key, none}, true, false, "192.0.2.10"},
+		{"global no, no source allows it", "", "no", []rootSourcePolicy{none}, false, false, "no emergency path"},
+		{"disabled but a source allows root", config.RootLoginDisabled, "no", []rootSourcePolicy{key}, false, true, "192.0.2.10"},
+		{"disabled and every source refuses", config.RootLoginDisabled, "no", []rootSourcePolicy{none}, true, true, "disabled"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ok, fatal, okMsg, badMsg := rootLoginWithSources(c.mode, c.permit, "publickey", c.sources)
+			if ok != c.wantOK || (!ok && fatal != c.wantFat) {
+				t.Fatalf("ok=%v fatal=%v, want ok=%v fatal=%v (ok=%q bad=%q)", ok, fatal, c.wantOK, c.wantFat, okMsg, badMsg)
+			}
+			msg := badMsg
+			if ok {
+				msg = okMsg
+			}
+			if !strings.Contains(msg, c.wantMsg) {
+				t.Errorf("message %q does not mention %q", msg, c.wantMsg)
+			}
+		})
+	}
+}
+
+func TestSshdParamForPassesConnectionSpec(t *testing.T) {
+	old := sshdTOutput
+	t.Cleanup(func() { sshdTOutput = old })
+	var gotArgs []string
+	sshdTOutput = func(args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte("permitrootlogin prohibit-password\n"), nil
+	}
+	v, ok := sshdParamFor("permitrootlogin", "user=root,addr=192.0.2.10")
+	if !ok || v != "prohibit-password" {
+		t.Fatalf("got %q, %v", v, ok)
+	}
+	if strings.Join(gotArgs, " ") != "-T -C user=root,addr=192.0.2.10" {
+		t.Fatalf("sshd args = %v", gotArgs)
+	}
+}
+
+// OpenSSH up to 10.0 prints PermitRootLogin prohibit-password as its alias
+// without-password in `sshd -T`; both spellings are the key-only path.
+func TestRootLoginWithSources_WithoutPasswordAlias(t *testing.T) {
+	src := []rootSourcePolicy{{Source: "192.0.2.10", Permit: "without-password", Methods: "publickey"}}
+	ok, _, okMsg, badMsg := rootLoginWithSources("", "no", "publickey", src)
+	if !ok || !strings.Contains(okMsg, "192.0.2.10") {
+		t.Fatalf("ok=%v okMsg=%q badMsg=%q, want the key path from 192.0.2.10", ok, okMsg, badMsg)
+	}
+}
+
+func TestSshdParamWrapperArgs(t *testing.T) {
+	old := sshdTOutput
+	t.Cleanup(func() { sshdTOutput = old })
+	var gotArgs []string
+	sshdTOutput = func(args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte("usedns no\n"), nil
+	}
+	for user, want := range map[string]string{"": "-T", "root": "-T -C user=root"} {
+		if v, ok := sshdParam("usedns", user); !ok || v != "no" {
+			t.Fatalf("sshdParam(usedns, %q) = %q, %v", user, v, ok)
+		}
+		if got := strings.Join(gotArgs, " "); got != want {
+			t.Errorf("sshdParam(usedns, %q): sshd args %q, want %q", user, got, want)
+		}
 	}
 }

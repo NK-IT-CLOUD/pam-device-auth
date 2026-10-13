@@ -57,6 +57,9 @@ func runPreflight() (fails, warns int) {
 	}
 
 	fmt.Printf("Config OK: issuer=%s client=%s role=%s sudo_role=%s\n", cfg.IssuerURL, cfg.ClientID, cfg.RequiredRole, cfg.SudoRole)
+	if len(cfg.RequiredACR) > 0 {
+		fmt.Printf("Token policy: acr must be one of %s (checked at login; the IdP must issue the acr claim)\n", strings.Join(cfg.RequiredACR, ", "))
+	}
 
 	// chk reports one check. fatal=true counts as a blocker (non-zero exit);
 	// fatal=false is an advisory warning that still lets activation proceed.
@@ -136,19 +139,30 @@ func runPreflight() (fails, warns int) {
 	if cfg.LDAP == nil {
 		chk(false, false, "", "no 'ldap' block in config; required for --setup-ldap")
 	} else {
-		uriErr := validateLDAPURI(cfg.LDAP.URI)
-		uriMsg := ""
-		if uriErr != nil {
-			uriMsg = uriErr.Error()
+		uok, uokMsg, ubadMsg := ldapURICheck(cfg.LDAP)
+		chk(uok, true, uokMsg, ubadMsg)
+		pok, pokMsg, pbadMsg := ldapProfileCheck(cfg.LDAP)
+		chk(pok, true, pokMsg, pbadMsg)
+		if cfg.LDAP.CAFile != "" {
+			cok, cokMsg, cbadMsg := caFileCheck(cfg.LDAP.CAFile)
+			chk(cok, true, cokMsg, cbadMsg)
 		}
-		chk(uriErr == nil, true,
-			"ldap.uri is a single ldaps:// URI (TLS enforced for the bind)",
-			uriMsg)
+		if k := cfg.LDAP.Kerberos; k != nil {
+			fmt.Printf("  [OK]   Kerberos realm %s, KDC %s (sudo and passwd via krb5)\n", k.Realm, k.KDC)
+			if _, lerr := net.LookupHost(kdcHost(k.KDC)); lerr != nil {
+				chk(false, false, "", fmt.Sprintf("Kerberos KDC %s does not resolve: %v", k.KDC, lerr))
+			}
+			if k.Keytab != "" {
+				kerr := checkSecretFile(k.Keytab)
+				chk(kerr == nil, true, "keytab "+k.Keytab+" is root-only",
+					fmt.Sprintf("ldap.kerberos.keytab: %v", kerr))
+			}
+		}
 		if cfg.LDAP.AccessGroup != "" {
 			members, gerr := getentGroup(cfg.LDAP.AccessGroup)
 			chk(gerr == nil, true,
 				fmt.Sprintf("access group %q resolves via NSS (%d member(s)); SSSD↔LDAP↔CA path OK", cfg.LDAP.AccessGroup, len(members)),
-				fmt.Sprintf("access group %q does not resolve via NSS; directory path broken (LDAP/CA/bind/firewall)", cfg.LDAP.AccessGroup))
+				accessGroupFailMessage(cfg.LDAP.AccessGroup))
 			// Every access-group member needs a VALID sshPublicKey, or they cannot
 			// satisfy the publickey factor and are locked out of non-root login after
 			// --enable. "invalid" = present but not parseable as an SSH key (sshd rejects).
@@ -172,6 +186,35 @@ func runPreflight() (fails, warns int) {
 					fmt.Sprintf("all %d member(s) of service group %q have a valid sshPublicKey (key-only factor)", len(members), g),
 					fmt.Sprintf("%%d of %%d member(s) of service group %q have NO sshPublicKey; locked out (key-only tier): %%s", g),
 					fmt.Sprintf("%%d of %%d member(s) of service group %q have an UNPARSEABLE sshPublicKey; sshd will reject it: %%s", g))
+			}
+		}
+		// IDs must exist in this host's user namespace, or the login fails in
+		// setresuid (unprivileged containers map only 65536 IDs; SSSD's AD ID
+		// mapping starts at 200000 unless ldap.id_range is set).
+		uidMap, uerr := os.ReadFile("/proc/self/uid_map")
+		gidMap, gerr2 := os.ReadFile("/proc/self/gid_map")
+		if uerr == nil && gerr2 == nil {
+			// A group that does not resolve is already reported above (access
+			// group FAIL, service group WARN); it simply contributes no members.
+			var members []string
+			for _, g := range append([]string{cfg.LDAP.AccessGroup}, cfg.LDAP.ServiceAccountGroups...) {
+				m, _ := getentGroup(g)
+				members = append(members, m...)
+			}
+			checked, outside, unresolved := idMapReport(members, directoryUserIDs,
+				parseIDMap(string(uidMap)), parseIDMap(string(gidMap)))
+			switch {
+			case len(outside) > 0:
+				chk(false, true, "",
+					"directory user(s) outside this host's uid/gid map, their login fails in setresuid: "+strings.Join(outside, ", ")+
+						"; set ldap.id_range (ad) or lower uidNumber/gidNumber (lldap)")
+			case checked > 0:
+				chk(true, true,
+					fmt.Sprintf("UIDs/GIDs of %d directory user(s) exist in this host's ID map", checked), "")
+			}
+			if len(unresolved) > 0 {
+				chk(false, false, "",
+					"could not read uid/gid of directory user(s) "+strings.Join(unresolved, ", ")+"; their ID map fit is unverified")
 			}
 		}
 		for _, g := range cfg.LDAP.NopasswdSudoGroups {
@@ -286,7 +329,14 @@ func runPreflight() (fails, warns int) {
 			"non-root AuthenticationMethods not 2FA (got "+am+"); expected publickey,keyboard-interactive:pam")
 		rootAm, _ := sshdParam("authenticationmethods", "root")
 		rootPermit, _ := sshdParam("permitrootlogin", "root")
-		rok, rfatal, rokMsg, rbadMsg := rootLoginCheck(cfg.RootLogin, rootPermit, rootAm)
+		var sources []rootSourcePolicy
+		for _, src := range cfg.RootLoginSources {
+			spec := "user=root,addr=" + src
+			p, _ := sshdParamFor("permitrootlogin", spec)
+			m, _ := sshdParamFor("authenticationmethods", spec)
+			sources = append(sources, rootSourcePolicy{Source: src, Permit: p, Methods: m})
+		}
+		rok, rfatal, rokMsg, rbadMsg := rootLoginWithSources(cfg.RootLogin, rootPermit, rootAm, sources)
 		chk(rok, rfatal, rokMsg, rbadMsg)
 		if akf, ok := sshdParam("authorizedkeysfile", "nobody"); ok {
 			chk(akf == "none", false,
@@ -329,6 +379,68 @@ func runCheck() {
 	default:
 		fmt.Println("\nAll checks passed.")
 	}
+}
+
+// ldapTransportDescription names how the directory connection is protected.
+// LDAPS detection matches renderSSSDConf (case-insensitive scheme).
+func ldapTransportDescription(l *config.LDAPConfig) string {
+	keytab := l.Kerberos != nil && l.Kerberos.Keytab != ""
+	ldaps := strings.HasPrefix(strings.ToLower(l.URI), "ldaps://")
+	switch {
+	case keytab:
+		return "GSSAPI with SASL sealing"
+	case ldaps:
+		return "LDAPS"
+	default:
+		return "StartTLS"
+	}
+}
+
+// ldapURICheck is the --check result for ldap.uri and the transport derived
+// from it, with the URI rules --setup-ldap enforces (validateLDAPURI,
+// keytabTransportError).
+func ldapURICheck(l *config.LDAPConfig) (ok bool, okMsg, badMsg string) {
+	if err := validateLDAPURI(l.URI); err != nil {
+		return false, "", err.Error()
+	}
+	if err := keytabTransportError(l); err != nil {
+		return false, "", err.Error()
+	}
+	return true, "ldap.uri is a single URI, transport " + ldapTransportDescription(l) + " (no cleartext bind)", ""
+}
+
+// ldapProfileCheck is the --check result for ldap.profile, by the rule
+// --setup-ldap enforces.
+func ldapProfileCheck(l *config.LDAPConfig) (ok bool, okMsg, badMsg string) {
+	if err := validateLDAPProfile(l); err != nil {
+		return false, "", err.Error()
+	}
+	return true, "profile " + l.ProfileName(), ""
+}
+
+// caFileCheck is the --check result for ldap.ca_file, with the rule
+// --setup-ldap enforces (caFileError).
+func caFileCheck(path string) (ok bool, okMsg, badMsg string) {
+	if err := caFileError(path); err != nil {
+		return false, "", err.Error()
+	}
+	return true, "ldap.ca_file is a regular file: " + path, ""
+}
+
+// kdcHost returns the host part of ldap.kerberos.kdc for the DNS lookup:
+// "host", "host:port", "[v6]:port", "[v6]" or a bare IPv6 address.
+func kdcHost(kdc string) string {
+	if host, _, err := net.SplitHostPort(kdc); err == nil {
+		return host
+	}
+	return strings.Trim(kdc, "[]")
+}
+
+// accessGroupFailMessage is the --check FAIL for an access group that does not
+// resolve via NSS. With ldap:// a server without StartTLS (LLDAP has none)
+// leaves SSSD offline, which looks exactly like this.
+func accessGroupFailMessage(group string) string {
+	return fmt.Sprintf("access group %q does not resolve via NSS; directory path broken (LDAP/CA/bind/firewall; with ldap:// the server must support StartTLS)", group)
 }
 
 // fileExists reports whether the path exists.
@@ -447,19 +559,25 @@ func hasValidSSHKey(authKeys []byte) bool {
 	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
-// sshdParam returns the effective value of an sshd_config keyword (lowercased
-// keyword as printed by `sshd -T`). When user != "" the value is resolved for
-// that user (Match blocks applied). The bool is false if `sshd -T` could not run.
-func sshdParam(keyword, user string) (string, bool) {
+// sshdTOutput runs `sshd -T` with the given arguments; a seam for tests.
+var sshdTOutput = func(args ...string) ([]byte, error) {
 	bin := "sshd"
 	if _, err := exec.LookPath("sshd"); err != nil {
 		bin = "/usr/sbin/sshd"
 	}
+	return exec.Command(bin, args...).Output()
+}
+
+// sshdParamFor returns the effective value of an sshd_config keyword for the
+// connection spec of `sshd -T -C` ("user=root", "user=root,addr=192.0.2.10");
+// an empty spec evaluates without Match criteria. The bool is false if
+// `sshd -T` could not run.
+func sshdParamFor(keyword, connSpec string) (string, bool) {
 	args := []string{"-T"}
-	if user != "" {
-		args = append(args, "-C", "user="+user)
+	if connSpec != "" {
+		args = append(args, "-C", connSpec)
 	}
-	out, err := exec.Command(bin, args...).Output()
+	out, err := sshdTOutput(args...)
 	if err != nil {
 		return "", false
 	}
@@ -470,6 +588,14 @@ func sshdParam(keyword, user string) (string, bool) {
 		}
 	}
 	return "", true
+}
+
+// sshdParam is sshdParamFor for a user without an address.
+func sshdParam(keyword, user string) (string, bool) {
+	if user == "" {
+		return sshdParamFor(keyword, "")
+	}
+	return sshdParamFor(keyword, "user="+user)
 }
 
 // isEnabled reports whether pam-device-auth is already wired into SSH auth,
@@ -603,6 +729,39 @@ func rootLoginCheck(mode, permitRootLogin, rootAuthMethods string) (ok, fatal bo
 	return rootAuthMethods == "publickey", false,
 		"root: publickey only (break-glass)",
 		"root AuthenticationMethods is " + rootAuthMethods + "; break-glass should be 'publickey' to avoid OIDC/SSSD lockout"
+}
+
+// rootSourcePolicy is root's effective sshd policy for one root_login_sources address.
+type rootSourcePolicy struct{ Source, Permit, Methods string }
+
+// rootLoginWithSources extends rootLoginCheck with the addresses from
+// root_login_sources. With root_login "key", a global PermitRootLogin no is
+// fine when a configured source still reaches root by key (Match Address);
+// with root_login "disabled", any source that reaches root is a blocker.
+func rootLoginWithSources(mode, permit, methods string, sources []rootSourcePolicy) (ok, fatal bool, okMsg, badMsg string) {
+	var keyFrom, allowFrom []string
+	for _, s := range sources {
+		if s.Permit != "no" {
+			allowFrom = append(allowFrom, s.Source)
+			// OpenSSH up to 10.0 prints prohibit-password as without-password.
+			if (s.Permit == "prohibit-password" || s.Permit == "without-password") && s.Methods == "publickey" {
+				keyFrom = append(keyFrom, s.Source)
+			}
+		}
+	}
+	if mode == config.RootLoginDisabled {
+		if len(allowFrom) > 0 {
+			return false, true, "", "root_login is 'disabled' but sshd allows root from " + strings.Join(allowFrom, ", ") + " (Match Address)"
+		}
+		return rootLoginCheck(mode, permit, methods)
+	}
+	if permit == "no" && len(sources) > 0 {
+		if len(keyFrom) > 0 {
+			return true, false, "root: publickey only from " + strings.Join(keyFrom, ", ") + " (break-glass via Match Address)", ""
+		}
+		return false, false, "", "root SSH login is refused globally and from every root_login_sources address; there is no emergency path if LDAP, SSSD or the identity provider fail"
+	}
+	return rootLoginCheck(mode, permit, methods)
 }
 
 // sssdClientsExposure reports whether sssd.conf makes the directory "clients"

@@ -6,7 +6,9 @@ it does not create those services for you.
 
 For the overall login model, start with the [README](README.md). This guide
 contains the complete host installation path and the required LLDAP/Keycloak
-preparation.
+preparation. For an Active Directory, prepare the directory and the `ldap`
+block as in [docs/active-directory-setup.md](docs/active-directory-setup.md);
+the host steps below stay the same.
 
 ## Before you start
 
@@ -84,7 +86,8 @@ sudo dnf install ./pam-device-auth-<version>.x86_64.rpm
 
 Before touching sshd, confirm that:
 
-1. LDAP is reachable from the host. Prefer LDAPS and install the directory CA.
+1. LDAP is reachable from the host over LDAPS or StartTLS, and the directory
+   CA is installed.
 2. Every intended SSH user has a Unix UID, primary GID and valid SSH public key.
 3. The access and sudo groups have Unix GIDs.
 4. The OIDC client has Device Authorization enabled.
@@ -170,13 +173,16 @@ sudo pam-device-auth --setup-ldap
 
 This command configures SSSD, NSS, automatic home creation, sudo and the sshd
 drop-in. It can be rerun after configuration changes, but always review its
-local-account migration warning before continuing.
+local-account migration output and warnings before continuing.
 
 Important: if a local account has the same name but a different UID from a
-directory user, `--setup-ldap` announces and automatically migrates it. Running
-processes are terminated, the local passwd/shadow entry is removed, and the
-home files, mail spool and crontab are preserved and re-owned. Genuine
-local-only accounts and same-UID entries are not changed.
+directory user, `--setup-ldap` lists and migrates it. The local passwd/shadow
+entry is removed; the home, the mail spool and the crontab are kept, and only
+the files that belonged to the old IDs are re-owned. The user goes back into
+its local groups except `sudo`, `admin` and `wheel`. No process is killed: an
+account with running processes is skipped with a warning; stop them and run
+`--setup-ldap` again. Genuine local-only accounts and same-UID entries are not
+changed.
 
 Do not activate SSH yet. First run the preflight.
 
@@ -198,9 +204,11 @@ Directory (SSSD/NSS):
   [OK]   /etc/sssd/sssd.conf present
   [OK]   sssd.conf exposes the clients attribute to the InfoPipe (IP allowlist gate input)
   [OK]   sssd service active
-  [OK]   ldap.uri is a single ldaps:// URI (TLS enforced for the bind)
+  [OK]   ldap.uri is a single URI, transport LDAPS (no cleartext bind)
+  [OK]   profile lldap
   [OK]   access group "ssh-access" resolves via NSS (2 member(s)); SSSD↔LDAP↔CA path OK
   [WARN] 1 of 2 member(s) have NO sshPublicKey; locked out of non-root login until set: no-key-user
+  [OK]   UIDs/GIDs of 2 directory user(s) exist in this host's ID map
 SSH daemon:
   [OK]   AuthorizedKeysCommand → sss_ssh_authorizedkeys (directory key = factor 1)
   [OK]   AuthorizedKeysCommand binary exists: /usr/bin/sss_ssh_authorizedkeys
@@ -435,6 +443,7 @@ user's `clients` attribute, if one is set.
 | Username mismatch | OIDC `preferred_username` must exactly match the SSH username |
 | Browser authorization repeats | cache permissions, provider refresh-token lifetime, and client IP detection |
 | Sudo denied | membership in `ldap.admin_group`, SSSD status, and directory password |
+| `Access denied` naming the authentication level (`acr`) | the `acr` client scope on the OIDC client and the values in `required_acr` ([docs/keycloak-setup.md](docs/keycloak-setup.md#require-a-strong-factor-in-the-browser)) |
 
 ## Installed files
 

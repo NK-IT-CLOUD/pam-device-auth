@@ -45,9 +45,11 @@ Non-root SSH access for interactive users requires **both** factors (OpenSSH
 
 - **`publickey`**: sshd fetches the user's key from the directory via
   `AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys` (SSSD `ssh` responder,
-  `ldap_user_ssh_public_key = sshPublicKey`).
+  `ldap_user_ssh_public_key`, `sshPublicKey` unless `ldap.attributes.ssh_key`
+  names another attribute).
 - **`keyboard-interactive`**: `pam_device_auth.so` runs the OIDC Device
-  Authorization flow and validates the token (required role). The source-IP
+  Authorization flow and validates the token (required role, and the accepted
+  `acr` values when `required_acr` is set). The source-IP
   `clients` allowlist is enforced in the PAM account phase, not here.
 
 Identity, groups, home directory and the sudo password come from the directory
@@ -81,8 +83,9 @@ SSSD will not resolve it.
 
 Revocation: removing a user from the access group (or stripping their
 `required_role`) denies the next login and sudo. The OIDC factor is mandatory,
-and SSSD's `ldap_access_filter` gates `pam_sss` services (login/sudo)
-independently, bounded by the SSSD cache TTL. There is no local account to lock.
+and SSSD's access control (`ldap_access_filter`, or `simple_allow_groups` with
+the `ad` profile) gates `pam_sss` services (login/sudo) independently, bounded
+by the SSSD cache TTL. There is no local account to lock.
 
 ## Per-login flows
 
@@ -99,6 +102,7 @@ sshd ──► pam.so ──► helper:
   OIDC token refresh           → new access token
   JWT validate (iss, azp, exp, sig, kid, iat, role)
   role check                   → ssh-access present
+  acr check (required_acr set) → acr in the list
   exit 0                       → PAM_SUCCESS
 ```
 
@@ -116,6 +120,7 @@ sshd ──► pam.so ──► helper:
   JWT validate                 → ok
   token.username == sshUser    → ok
   role check                   → ssh-access present
+  acr check (required_acr set) → acr in the list
   cache.Save(session + clientIP)
   exit 0                       → PAM_SUCCESS
 ```
@@ -135,8 +140,13 @@ cfg.RequiredRole)`. If the role is gone:
   exit 2                        → hard deny (sshd won't retry)
 ```
 
-Independently, SSSD's `ldap_access_filter` (access group) denies `pam_sss`
-for login/sudo once the user is removed from the group. No `usermod` is involved.
+A token whose `acr` is missing or not in `required_acr` is denied the same way,
+with the reason `the token carries no authentication level (acr)` or
+`authentication level "<acr>" is not accepted`.
+
+Independently, SSSD's access control (`ldap_access_filter`, or
+`simple_allow_groups` with the `ad` profile) denies `pam_sss` for login/sudo once
+the user is removed from the group. No `usermod` is involved.
 
 ### 4 · OIDC transient failure on the fast path
 
@@ -243,7 +253,7 @@ infrastructure failure and denies (see [Account phase](#account-phase-the-client
 | Helper exit | PAM result | Meaning |
 |---|---|---|
 | 0 | `PAM_SUCCESS` | Authenticated |
-| 2 | `PAM_MAXTRIES` | Hard deny: required role missing or revoked; sshd does not retry |
+| 2 | `PAM_MAXTRIES` | Hard deny: required role or accepted `acr` missing, or the role revoked; sshd does not retry |
 | other | `PAM_AUTH_ERR` | Soft failure (user cancelled, bad password, timeout at device endpoint) |
 | killed / timed-out | `PAM_SYSTEM_ERR` | Infrastructure failure |
 
@@ -284,12 +294,14 @@ infrastructure failure and denies (see [Account phase](#account-phase-the-client
 9. `preferred_username` is present
 10. Roles extracted from `realm_access.roles` + `resource_access.<client>.roles`
     (or from a custom `role_claim` path); `required_role` membership enforced
+11. With `required_acr` set, `acr` is one of the listed values (exact match;
+    checked next to the role in `checkDirectoryAccess`)
 
 The source-IP `clients` allowlist is enforced separately in the PAM account
 phase, not during token validation; see [ip-allowlist.md](ip-allowlist.md).
 
 Violation at any step is logged and the helper exits 1 (soft fail) or 2
-(hard deny for role revocation).
+(hard deny for a missing role or an `acr` that is missing or not accepted).
 
 ## Process security
 

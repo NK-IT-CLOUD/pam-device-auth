@@ -1,0 +1,45 @@
+[sssd]
+services = nss, pam, ssh, ifp
+domains = nkit
+
+[nss]
+filter_users = root
+filter_groups = root
+
+[pam]
+
+[ssh]
+
+[domain/nkit]
+id_provider = ldap
+auth_provider = ldap
+access_provider = ldap
+ldap_uri = ldaps://ldap.example.com:6360
+ldap_search_base = dc=example,dc=com
+ldap_user_search_base = ou=people,dc=example,dc=com
+ldap_group_search_base = ou=groups,dc=example,dc=com
+ldap_default_bind_dn = uid=ro,ou=people,dc=example,dc=com
+ldap_default_authtok = pw
+ldap_schema = rfc2307bis
+ldap_user_extra_attrs = clients:clients
+ldap_user_object_class = posixAccount
+ldap_user_name = uid
+ldap_user_ssh_public_key = sshPublicKey
+ldap_user_uid_number = uidNumber
+ldap_user_gid_number = gidNumber
+ldap_group_object_class = groupOfNames
+ldap_group_name = cn
+ldap_group_member = member
+ldap_group_gid_number = gidNumber
+ldap_id_mapping = false
+ldap_tls_reqcert = hard
+ldap_tls_cacert = /etc/ssl/certs/ca-certificates.crt
+override_homedir = /home/%u
+default_shell = /bin/bash
+ldap_access_filter = (|(memberOf=cn=ssh-access,ou=groups,dc=example,dc=com)(memberOf=cn=ssh-service,ou=groups,dc=example,dc=com))
+enumerate = false
+cache_credentials = false
+entry_cache_timeout = 600
+
+[ifp]
+user_attributes = +clients

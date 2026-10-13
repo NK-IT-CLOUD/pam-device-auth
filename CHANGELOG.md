@@ -3,6 +3,53 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 0.6.0
+
+### Added
+- Active Directory profile (`ldap.profile = "ad"`): `--setup-ldap` writes an
+  SSSD configuration with `ldap_schema = ad`, ID mapping from the objectSid
+  (optional `id_range` for containers), the access gate via SSSD's simple access
+  provider (nested groups, any OU) and freely chosen attributes for the SSH key
+  and the source-IP allowlist (`ldap.attributes`). See
+  `docs/active-directory-setup.md`.
+- `ldap://` URIs with mandatory StartTLS, a Kerberos keytab bind (GSSAPI, over
+  `ldap://` with SASL sealing), and Kerberos (`ldap.kerberos`) for sudo and
+  passwd; with `kerberos`, `--setup-ldap` also installs the SSSD Kerberos
+  provider and the SASL GSSAPI plugin. There is still no cleartext option.
+  The keytab bind needs an `ldap://` URI: it is protected by SASL sealing, not
+  TLS, and the generated `sssd.conf` sets `ldap_id_use_start_tls = false`
+  (SSSD 2.10 and later default to StartTLS, and AD and Samba refuse GSSAPI
+  sealing inside TLS). `--setup-ldap` and `--check` reject a keytab with an
+  `ldaps://` URI.
+- `ldap.bind_password_file`, `ldap.ca_file`, `ldap.home`, `ldap.shell`.
+  `--setup-ldap` and `--check` fail when `ldap.ca_file` is missing or not a
+  regular file (a directory, for example). `ldap.ca_file` must be readable by
+  the SSSD service user: where `sssd_be` runs as user `sssd`, a file below the
+  0700 directory `/etc/pam-device-auth` is not readable; use
+  `/usr/local/share/ca-certificates/` (Debian, Ubuntu) or
+  `/etc/pki/ca-trust/source/anchors/` (RHEL family). `--setup-ldap` fails on a
+  `bind_password_file` longer than 4096 bytes.
+- `required_acr`: the helper denies tokens whose `acr` claim is missing or not
+  in the list, after the device flow and after every refresh.
+- `root_login_sources`: `--check` evaluates root's sshd policy for these client
+  addresses (Match Address blocks).
+- `--check` reports the directory transport (`LDAPS`, `StartTLS`, `GSSAPI with
+  SASL sealing`), the profile, `ca_file`, the Kerberos realm and KDC and the
+  keytab permissions, and fails when `ldap.profile` is neither `lldap` nor
+  `ad` or a directory user's UID or GID is outside the host's ID map
+  (unprivileged containers).
+
+### Changed
+- `--setup-ldap` migrates local accounts that shadow a directory user without
+  killing processes: accounts with running processes are skipped with a
+  warning, local supplementary groups (except sudo, admin, wheel) are kept, and
+  only files that belonged to the old IDs are re-owned.
+- `ldap.bind_dn` must consist of `[A-Za-z0-9 ._=,@\-]` (a DN, a UPN or a
+  down-level logon name), and every `ldap` value rejects all control
+  characters, not only line breaks. A `bind_dn` with other characters now fails
+  `--setup-ldap`.
+- The rendered `sssd.conf` no longer contains `config_file_version = 2`.
+
 ## [0.5.15] - 2026-10-13
 
 ### Security

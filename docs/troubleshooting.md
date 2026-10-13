@@ -163,6 +163,21 @@ sudo PAM_USER=alice PAM_RHOST=198.51.100.2 pam-device-auth --debug
 # logs will include: "Roles extracted: [...]"
 ```
 
+### `Access denied: the token carries no authentication level (acr)`
+
+`required_acr` is set, but the access token has no `acr` claim, so every login
+is denied. In Keycloak, add the `acr` client scope to the client's default
+scopes ([keycloak-setup.md](keycloak-setup.md), section 3).
+
+### `Access denied: authentication level "<acr>" is not accepted`
+
+The token's `acr` is not one of the values in `required_acr`. Either the sign-in
+went through a flow that does not reach the expected level (the client's browser
+flow override was removed or changed), or `required_acr` lists another value
+than the flow reports. Decode the token (see
+[keycloak-setup.md](keycloak-setup.md#inspect-a-real-access-token)) and compare
+its `acr` with `required_acr`.
+
 ### Directory user denied at the account phase ("not in clients allowlist")
 
 The account phase (`--pam-acct`) reads the `clients` attribute for the user
@@ -267,6 +282,9 @@ If `root_login` is `"disabled"` in `config.json`, the sshd drop-in sets
 To get root back, use a console, set `root_login` to `"key"` (or remove the field)
 and run `--setup-ldap`, `--check` and `--enable`. `--check` warns when sshd refuses
 root while `root_login` is `"key"`, so an override from another file shows up there.
+If root is meant to log in only from some addresses (a `Match User root Address`
+block), list them in `root_login_sources`; `--check` then judges root's policy
+per address ([configuration reference](configuration-reference.md#root_login_sources)).
 
 ### sshd changes from `--setup-ldap` have no effect
 

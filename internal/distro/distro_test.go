@@ -88,3 +88,16 @@ func TestDebianProfileHasSSSDDbusForIfp(t *testing.T) {
 		t.Errorf("debian SSSDPackages missing sssd-dbus: %v", fromOSRelease("debian", "").SSSDPackages)
 	}
 }
+
+// The GSSAPI keytab bind needs the Cyrus SASL GSSAPI plugin, which Debian
+// pulls in only as a Recommends of sssd-krb5-common.
+func TestProfilesNameKrbPackages(t *testing.T) {
+	for _, c := range []struct {
+		p    Profile
+		sasl string
+	}{{debianProfile, "libsasl2-modules-gssapi-mit"}, {rhelProfile, "cyrus-sasl-gssapi"}} {
+		if !contains(c.p.KrbPackages, "sssd-krb5") || !contains(c.p.KrbPackages, c.sasl) {
+			t.Errorf("%s KrbPackages = %v, want sssd-krb5 and %s", c.p.Family, c.p.KrbPackages, c.sasl)
+		}
+	}
+}

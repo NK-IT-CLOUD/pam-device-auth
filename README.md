@@ -62,7 +62,7 @@ ends the login. Denials in layers 2 and 3 are written to
 | Layer | Enforced by | What it checks |
 |---|---|---|
 | 1. SSH key | `sshd` with `sss_ssh_authorizedkeys` | The public key comes from the directory (`sshPublicKey`). Local `authorized_keys` files are ignored for non-root users. |
-| 2. OIDC sign-in | `pam_device_auth.so` (keyboard-interactive) | The user resolves through SSSD. Browser approval through the Device Authorization Grant, or a silent refresh from a known source IP. Token signature, issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, `kid`, username equal to the SSH user, and the required role. |
+| 2. OIDC sign-in | `pam_device_auth.so` (keyboard-interactive) | The user resolves through SSSD. Browser approval through the Device Authorization Grant, or a silent refresh from a known source IP. Token signature, issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, `kid`, username equal to the SSH user, the required role and, with `required_acr`, the authentication level (`acr`). |
 | 3. Account phase | `pam_device_auth.so --pam-acct` and `pam_sss` | The `clients` source-IP allowlist, which fails closed when it cannot be read. Membership in the access group or a service-account group. |
 
 Service accounts skip layer 2 only: they still need their directory key and pass
@@ -85,8 +85,14 @@ and is cleared on reboot.
 - Two factors for every non-root login: a key from the directory and an OIDC
   approval, both checked again on each login.
 - Any OIDC provider that supports the device grant. Keycloak with
-  [LLDAP](https://github.com/lldap/lldap) is the tested setup, and templates for
-  Auth0, Okta and Authentik are included.
+  [LLDAP](https://github.com/lldap/lldap) or Samba AD is the tested setup, and
+  templates for Auth0, Okta and Authentik are included.
+- LLDAP or Active Directory as the directory. For AD, `--setup-ldap` writes an
+  SSSD configuration with ID mapping, nested groups and attributes of your
+  choice for the SSH key and the allowlist, over LDAPS, StartTLS or a Kerberos
+  keytab bind. There is no cleartext option.
+- An optional check of the authentication level the identity provider reports
+  (`required_acr`), so a token from a weaker sign-in is refused.
 - Silent re-login from a known source IP with a cached refresh token.
 - Access control through directory groups, with sudo either by directory password
   or passwordless for selected groups.
@@ -105,8 +111,9 @@ and is cleared on reboot.
 - Ubuntu 24.04+, Debian 13+ or Rocky Linux 9 or 10 on amd64, with OpenSSH 9.6+.
   Other amd64 distributions with OpenSSH 9.6+ and SSSD may work, but they are not
   tested or packaged.
-- An LDAP directory containing each user's Unix ID, group membership and SSH
-  public key.
+- An LDAP directory such as LLDAP, or an Active Directory, holding each user's
+  group membership and SSH public key. LLDAP users also need a Unix ID; for
+  Active Directory, SSSD derives it from the objectSid by default.
 - An OIDC provider with the Device Authorization Grant enabled, such as Keycloak,
   Auth0, Okta or Authentik. It must serve its discovery, token and JWKS endpoints
   from the issuer host and issue an access token with `preferred_username`, the
@@ -124,8 +131,8 @@ each one with the expected output.
 
 ### 1. Prepare the directory and the identity provider
 
-- LDAP connectivity from the server. Use LDAPS where possible and install the
-  directory CA on the server.
+- LDAP connectivity from the server over LDAPS or StartTLS, with the directory
+  CA installed on the server.
 - An access group such as `ssh-access` and an optional sudo group such as
   `ssh-admin`.
 - `uidNumber`, `gidNumber` and `sshPublicKey` for every user who should log in.
@@ -148,7 +155,9 @@ Every group named in the config needs a `gidNumber`. SSSD drops a group without
 one, so its members cannot log in and the sudoers rules never match. Groups stay
 `groupOfNames`; do not convert them to `posixGroup`. Numbering, the data model and
 the migration of existing hosts are in
-[docs/ldap-directory-setup.md](docs/ldap-directory-setup.md).
+[docs/ldap-directory-setup.md](docs/ldap-directory-setup.md). For an Active
+Directory, follow [docs/active-directory-setup.md](docs/active-directory-setup.md)
+instead.
 
 ### 2. Install
 
@@ -213,10 +222,11 @@ sudo pam-device-auth --enable       # activate the PAM/sshd config (restarts ssh
 > are locked out. Root is unaffected.
 >
 > **Existing local accounts.** `--setup-ldap` migrates same-name local accounts
-> that shadow a directory identity. It prints the full scope, terminates those
-> users' processes, removes their local passwd and shadow entries, and re-owns
-> their home files. Run it from a persistent root session and read the warning
-> before you activate.
+> that shadow a directory identity. It lists them, removes their local passwd and
+> shadow entries, keeps their homes and local groups (except `sudo`, `admin` and
+> `wheel`) and re-owns only the files of the old IDs. It sends no signal: an
+> account with running processes is skipped with a warning, so stop them and
+> run `--setup-ldap` again.
 
 `--check` must report no `[FAIL]` items before activation. A `[WARN]` does not
 block and can be intentional, for example an access-group member who is
@@ -241,9 +251,12 @@ the PAM account phase), `--debug`, `--version`, `--help`.
 | `auth_timeout` | no | device-flow timeout, 30-240 s (default 180) |
 | `show_qr` | no | `true`/`false`/omit (auto-detect client) |
 | `root_login` | no | `key` (default) keeps root's local SSH key as the emergency path; `disabled` refuses every SSH login of root, so root is reachable only through a console |
-| `ldap` | setup/check | directory settings for `--setup-ldap` and the directory preflight: `uri`, `base_dn`, `bind_dn`, `bind_password`, `access_group`, `admin_group`; optional `user_search_base`, `group_search_base`, `service_account_groups`, `nopasswd_sudo_groups` |
+| `required_acr` | no | accepted values of the token's `acr` claim (exact match); a token without `acr` or with another value is denied |
+| `root_login_sources` | no | client IPs for which `--check` evaluates root's sshd policy (`Match Address` blocks) |
+| `ldap` | setup/check | directory settings for `--setup-ldap` and the directory preflight: `uri`, `base_dn`, `bind_dn`, `bind_password` or `bind_password_file` (none with a Kerberos keytab), `access_group`, `admin_group`; optional `profile` (`lldap` or `ad`), `ca_file`, `attributes`, `id_mapping`, `id_range`, `home`, `shell`, `kerberos`, `user_search_base`, `group_search_base`, `service_account_groups`, `nopasswd_sudo_groups` |
 
-`--setup-ldap` reads `ldap.bind_password` and writes it into the root-only
+`--setup-ldap` reads `ldap.bind_password` or the file in
+`ldap.bind_password_file` and writes the password into the root-only
 `/etc/sssd/sssd.conf` for SSSD. Environment overrides exist only for
 `issuer_url`, `client_id`, `required_role`, `sudo_role`, `role_claim` and
 `auth_timeout`, through `PAM_DEVICE_AUTH_ISSUER`, `PAM_DEVICE_AUTH_CLIENT_ID`,
@@ -289,6 +302,7 @@ family, and `--setup-ldap` installs it. The whole pipeline is described in
 | [docs/configuration-reference.md](docs/configuration-reference.md) | Every `config.json` field, with defaults and validation |
 | [docs/keycloak-setup.md](docs/keycloak-setup.md) | Keycloak client, MFA in the device flow, roles, mappers, token lifetimes |
 | [docs/ldap-directory-setup.md](docs/ldap-directory-setup.md) | Directory data model, host setup, migration of existing hosts, revocation |
+| [docs/active-directory-setup.md](docs/active-directory-setup.md) | Active Directory: attributes, transport, Kerberos, UIDs in containers |
 | [docs/ip-allowlist.md](docs/ip-allowlist.md) | The source IP allowlist from LDAP to the PAM account phase |
 | [docs/operations.md](docs/operations.md) | Logs, monitoring, upgrades, failure modes |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms and fixes |
@@ -305,16 +319,17 @@ family, and `--setup-ldap` installs it. The whole pipeline is described in
   recovery then needs a console.
 - Non-root local accounts are not a supported login tier. Users must exist in the
   directory.
-- Keycloak with LLDAP is the tested combination. Auth0, Okta and Authentik have
-  config templates but are not covered in depth.
+- Keycloak with LLDAP or Samba AD is the tested combination. Auth0, Okta and
+  Authentik have config templates but are not covered in depth.
 - The packages are built for amd64.
 
 ## Security
 
 The first factor is a key from the directory, the second an OIDC approval, and
 both are checked on every login. The token is validated locally: signature,
-issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, required role, algorithm and key-type
-binding (RS and ES, 256/384/512), a required `kid`, and no `none` or HMAC.
+issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, required role, the optional
+authentication level (`required_acr`), algorithm and key-type binding (RS and
+ES, 256/384/512), a required `kid`, and no `none` or HMAC.
 
 - **Source IP allowlist.** Enforced in the PAM account phase for every login. Only
   root is exempt.

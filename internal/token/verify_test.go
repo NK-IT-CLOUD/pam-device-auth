@@ -575,3 +575,22 @@ func TestValidate_ClockSkewWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_ExtractsACR(t *testing.T) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	keys := map[string]crypto.PublicKey{"test-key-1": &privKey.PublicKey}
+	for _, want := range []string{"3", ""} {
+		claims := validClaims()
+		if want != "" {
+			claims["acr"] = want
+		}
+		jwt := createRSATestJWT(t, privKey, "test-key-1", claims)
+		res, err := Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "", nil)
+		if err != nil {
+			t.Fatalf("Validate() error: %v", err)
+		}
+		if res.ACR != want {
+			t.Fatalf("ACR = %q, want %q", res.ACR, want)
+		}
+	}
+}
