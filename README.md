@@ -287,7 +287,7 @@ family, and `--setup-ldap` installs it. The whole pipeline is described in
 | [INSTALL.md](INSTALL.md) | Step-by-step install, preflight output, upgrade, uninstall, installed files |
 | [docs/architecture.md](docs/architecture.md) | Components, request flows, the protocol between the C module and the Go helper, cache lifecycle |
 | [docs/configuration-reference.md](docs/configuration-reference.md) | Every `config.json` field, with defaults and validation |
-| [docs/keycloak-setup.md](docs/keycloak-setup.md) | Keycloak client, roles, mappers, token lifetimes |
+| [docs/keycloak-setup.md](docs/keycloak-setup.md) | Keycloak client, MFA in the device flow, roles, mappers, token lifetimes |
 | [docs/ldap-directory-setup.md](docs/ldap-directory-setup.md) | Directory data model, host setup, migration of existing hosts, revocation |
 | [docs/ip-allowlist.md](docs/ip-allowlist.md) | The source IP allowlist from LDAP to the PAM account phase |
 | [docs/operations.md](docs/operations.md) | Logs, monitoring, upgrades, failure modes |

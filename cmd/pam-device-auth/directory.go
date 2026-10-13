@@ -182,10 +182,24 @@ func deviceDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Cl
 
 	log.Info("Directory auth OK: user=%s email=%s roles=%v", result.Username, result.Email, result.Roles)
 
-	if err := cache.Update(sshUser, func(s *cache.CachedSession) {
-		if tokenResp.RefreshToken != "" {
-			s.RefreshToken = tokenResp.RefreshToken
+	rememberDeviceLogin(log, sshUser, tokenResp.RefreshToken, clientIP)
+}
+
+// rememberDeviceLogin stores the refresh token and the client IP for the
+// cached login (tryCachedDirectory). Without a refresh token from the IdP there
+// is nothing to cache, and a session from an earlier login is removed: the
+// cached login must reflect the latest device login, for example after the IdP
+// stopped issuing refresh tokens for the client.
+func rememberDeviceLogin(log *logger.Logger, sshUser, refreshToken, clientIP string) {
+	if refreshToken == "" {
+		log.Debug("Directory: the IdP returned no refresh token, no cached login for %s", sshUser)
+		if err := cache.WithUserLock(sshUser, func() error { return cache.Delete(sshUser) }); err != nil {
+			log.Warn("Directory: could not remove the earlier cached session of %s: %v", sshUser, err)
 		}
+		return
+	}
+	if err := cache.Update(sshUser, func(s *cache.CachedSession) {
+		s.RefreshToken = refreshToken
 		s.AddIP(clientIP)
 	}); err != nil {
 		log.Warn("Directory: session cache save failed (non-fatal, next login needs the device flow again): %v", err)

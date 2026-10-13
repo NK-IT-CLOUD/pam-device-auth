@@ -8,7 +8,7 @@ a client that supports:
 - Standard `realm_access.roles` + `resource_access.<client>.roles`
   extraction
 
-Tested against Keycloak 24.x and 25.x.
+Tested against Keycloak 26.7.
 
 ## Prerequisites
 
@@ -49,6 +49,45 @@ and the `.well-known` document at
 `https://<host>/realms/<realm>/.well-known/openid-configuration` should
 advertise `device_authorization_endpoint`.
 
+### Require a strong factor in the browser
+
+Keycloak does not apply the client's minimum ACR (`minimum.acr.value`) or
+default ACR (`default.acr.values`) to the device grant, and it ignores
+`acr_values` and `claims` in the device authorization request (verified with
+Keycloak 26.7.5, tracked as CVE-2026-105305). A step-up flow based on levels
+of authentication therefore stops at its first level, usually the password.
+What the user has to present on the device verification page is decided by
+the client's browser flow override (**Advanced → Authentication flow
+overrides → Browser Flow**), which Keycloak applies there.
+
+Create a dedicated flow (**Authentication → Create flow**, basic flow), for
+example `ssh device`:
+
+| Step | Requirement |
+|---|---|
+| Username Form | Required |
+| Sub-flow `ssh device level 3` | Conditional |
+| ↳ Condition - Level of Authentication (level `3`, max age `0`) | Required |
+| ↳ WebAuthn Passwordless Authenticator | Required |
+
+Bind it as the client's browser flow override.
+
+- Do not add the **Cookie** authenticator. A browser session from a weaker
+  sign-in satisfies it, and the device login then completes without any factor.
+- Use exactly one Level of Authentication condition. The device grant requests
+  no level, so Keycloak runs the first condition in the flow and skips every
+  further one: a ladder of levels stops at its first rung.
+- Use passkeys (WebAuthn passwordless) rather than OTP as the strong factor.
+  A user without OTP is offered OTP enrollment during the sign-in, so the
+  password alone reaches the level. A passkey cannot be enrolled during the
+  sign-in; a user without one is refused.
+- Max age `0` keeps the level out of the browser session, so a device login
+  does not raise the level of later browser sign-ins.
+- With the `acr` client scope (section 3) the access token reports the level
+  in `acr` (with `default.acr.values` = `3` on the client: `"3"`), also after a
+  refresh. A login through a flow without the condition reports a lower value
+  (level 1, or `0` after a cookie sign-in).
+
 ## 2 · Create the SSH roles
 
 Two **realm-level** roles (recommended over client roles: simpler to
@@ -77,8 +116,9 @@ client scope emits both. Confirm the `roles` scope is in the client's
 
 ## 3 · Client scopes
 
-Default scopes should be: `profile`, `email`, `roles`. Remove `acr` and any
-other default scope you don't need; it's not harmful, just clutter.
+Default scopes should be: `profile`, `email`, `roles`, `acr`. `acr` puts the
+authentication level into the access token, so a token shows which level the
+sign-in reached (see section 1). Remove any other default scope you don't need.
 
 ### `fullScopeAllowed`
 

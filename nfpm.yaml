@@ -61,6 +61,14 @@ overrides:
       - libnss-sss
       - libpam-sss
       - sssd-dbus
+    # The predecessor package restores /etc/pam.d/sshd.original (the same
+    # backup --enable uses) when it is removed. Conflicts makes apt remove it
+    # before this package is configured, not later behind an active
+    # pam-device-auth.
+    conflicts:
+      - keycloak-ssh-auth
+    replaces:
+      - keycloak-ssh-auth
   rpm:
     depends:
       - glibc

@@ -41,7 +41,11 @@ rolling this out: it reports the IP-pin posture per group (how many members have
                                                            └──────────┘
 ```
 
-The account-phase check reads the LLDAP attribute literally named `clients`.
+The account-phase check reads the attribute that SSSD exposes as `clients`.
+`--setup-ldap` maps the LLDAP attribute `clients` to that name
+(`ldap_user_extra_attrs = clients:clients`). A directory that stores the
+allowlist under another attribute needs `clients:<that attribute>` in
+`sssd.conf`; the name on the SSSD side stays `clients`.
 
 ## Data model
 
@@ -117,6 +121,7 @@ A mix of IPv4 and IPv6 entries is fine; the helper parses both.
 | User is root | Allow, exempt, never touches SSSD |
 | Local-only non-root user | Deny, fail closed (unsupported login tier; no InfoPipe identity) |
 | `clients` has malformed entries | Bad entries logged once per call, good entries still enforced |
+| sshd runs with `UseDNS yes` | Deny for every user with `clients` set: sshd passes the client host name in `PAM_RHOST`, which no entry matches. `pam-device-auth --check` warns; set `UseDNS no` (the OpenSSH default) |
 
 The absent-attribute fallback is deliberate: an unpinned user is unrestricted. To
 make the allowlist mandatory, set `clients` on every SSH-targeted user as an

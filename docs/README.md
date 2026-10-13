@@ -9,7 +9,7 @@ Documentation for operators and developers. For quick install, see the project
 |---|---|
 | [architecture.md](architecture.md) | Component layout, request/response flows, C↔Go IPC protocol, cache lifecycle |
 | [configuration-reference.md](configuration-reference.md) | Every `config.json` field: type, default, meaning, validation, examples |
-| [keycloak-setup.md](keycloak-setup.md) | Keycloak client, roles, mappers, token lifetimes, LLDAP federation |
+| [keycloak-setup.md](keycloak-setup.md) | Keycloak client, MFA in the device flow, roles, mappers, token lifetimes, LLDAP federation |
 | [ldap-directory-setup.md](ldap-directory-setup.md) | SSSD/LDAP host setup, local-account migration, revocation and 2FA activation order |
 | [ip-allowlist.md](ip-allowlist.md) | End-to-end IP-allowlist pipeline (LLDAP → SSSD InfoPipe → PAM account phase) |
 | [troubleshooting.md](troubleshooting.md) | Symptoms and fixes for common issues |

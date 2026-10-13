@@ -106,7 +106,7 @@ func runPreflight() (fails, warns int) {
 			extra, ifp := sssdClientsExposure(string(conf))
 			var missing []string
 			if !extra {
-				missing = append(missing, "[domain/*] ldap_user_extra_attrs = clients:clients")
+				missing = append(missing, "[domain/*] ldap_user_extra_attrs = clients:<LDAP attribute>")
 			}
 			if !ifp {
 				missing = append(missing, "[ifp] user_attributes = +clients")
@@ -294,6 +294,13 @@ func runPreflight() (fails, warns int) {
 				"non-root AuthorizedKeysFile is "+akf+", not 'none'; local authorized_keys still satisfy "+
 					"factor 1 for non-root users; package upgrades do not rewrite an existing sshd drop-in. "+
 					"Re-run 'pam-device-auth --setup-ldap' or update /etc/ssh/sshd_config.d/10-pam-device-auth.conf")
+		}
+		// With UseDNS yes sshd hands PAM the client's host name instead of its
+		// address, which the account-phase IP gate cannot match (fail closed).
+		if useDNS, ok := sshdParam("usedns", ""); ok {
+			chk(useDNS != "yes", false,
+				"UseDNS no (PAM receives the client IP for the IP allowlist)",
+				"sshd has UseDNS yes; PAM receives the client host name instead of its IP and the account-phase IP gate denies every user with a clients allowlist; set UseDNS no")
 		}
 	} else {
 		// Fatal: if sshd -T cannot be evaluated the effective sshd policy is
@@ -599,10 +606,11 @@ func rootLoginCheck(mode, permitRootLogin, rootAuthMethods string) (ok, fatal bo
 }
 
 // sssdClientsExposure reports whether sssd.conf makes the directory "clients"
-// attribute readable through the InfoPipe: the domain must fetch it
-// (ldap_user_extra_attrs = clients:clients) and [ifp] must allow it
-// (user_attributes = +clients). Without either, GetUserAttr returns an empty
-// answer and the account-phase IP gate sees "no allowlist" for every user.
+// attribute readable through the InfoPipe: the domain must fetch it under the
+// name "clients" (ldap_user_extra_attrs = clients, or clients:<LDAP attribute>
+// when the directory stores the allowlist in another attribute) and [ifp] must
+// allow it (user_attributes = +clients). Without either, GetUserAttr returns an
+// empty answer and the account-phase IP gate sees "no allowlist" for every user.
 func sssdClientsExposure(conf string) (extraAttrs, ifp bool) {
 	section := ""
 	for _, line := range strings.Split(conf, "\n") {
@@ -621,7 +629,7 @@ func sssdClientsExposure(conf string) (extraAttrs, ifp bool) {
 		key = strings.ToLower(strings.TrimSpace(key))
 		for _, tok := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
 			switch {
-			case key == "ldap_user_extra_attrs" && strings.HasPrefix(section, "domain/") && (tok == "clients" || tok == "clients:clients"):
+			case key == "ldap_user_extra_attrs" && strings.HasPrefix(section, "domain/") && (tok == "clients" || (strings.HasPrefix(tok, "clients:") && len(tok) > len("clients:"))):
 				extraAttrs = true
 			case key == "user_attributes" && section == "ifp" && tok == "+clients":
 				ifp = true

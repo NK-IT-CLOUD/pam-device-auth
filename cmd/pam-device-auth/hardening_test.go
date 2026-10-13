@@ -71,6 +71,9 @@ func TestSSSDClientsExposure(t *testing.T) {
 		{"commented out", "[domain/nkit]\n# ldap_user_extra_attrs = clients:clients\n[ifp]\n; user_attributes = +clients\n", false, false},
 		{"wrong section", "[nss]\nldap_user_extra_attrs = clients:clients\nuser_attributes = +clients\n", false, false},
 		{"different attribute", "[domain/nkit]\nldap_user_extra_attrs = other:other\n[ifp]\nuser_attributes = +other\n", false, false},
+		{"clients mapped from another LDAP attribute", "[domain/x]\nldap_user_extra_attrs = clients:extensionAttribute1\n[ifp]\nuser_attributes = +clients\n", true, true},
+		{"clients without an LDAP attribute", "[domain/x]\nldap_user_extra_attrs = clients:\n", false, false},
+		{"LDAP clients mapped to another name", "[domain/x]\nldap_user_extra_attrs = other:clients\n", false, false},
 		{"clients without plus in ifp", "[ifp]\nuser_attributes = clients\n", false, false},
 	}
 	for _, c := range cases {

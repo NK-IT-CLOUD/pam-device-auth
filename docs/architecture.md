@@ -155,10 +155,12 @@ required. If the IdP is still unreachable, flow 2 also fails (PAM_AUTH_ERR).
 
 ## Account phase: the `clients` IP gate
 
-`pam_sm_acct_mgmt` in `pam_device_auth.c` runs on every login, including
-sudo and key-only service accounts, independently of the auth-phase OIDC
-flow above. It enforces the directory-provided `clients` source-IP/CIDR
-allowlist:
+`pam_sm_acct_mgmt` in `pam_device_auth.c` runs on every SSH login,
+including key-only service accounts, independently of the auth-phase OIDC
+flow above. It is wired into `/etc/pam.d/sshd` only, so `sudo` does not pass
+through it; sudo is limited by the sudoers rule for `admin_group` and by the
+SSSD access filter (`pam_sss` in the distribution's account stack). It enforces the
+directory-provided `clients` source-IP/CIDR allowlist:
 
 1. Root is exempt and returns `PAM_SUCCESS` immediately, before any fork or
    network activity. It is the sole break-glass path and never touches the

@@ -16,6 +16,33 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - The repository CI also checks every file for private data (a leak gate with
   patterns kept outside the repository; on forks and GitHub it runs its
   self-test only) and can run on a self-hosted runner.
+- `--check` warns when sshd runs with `UseDNS yes`. sshd then passes the
+  client host name instead of its address to PAM, and the account-phase IP
+  gate denies every user with a `clients` allowlist.
+- The account-phase section of `docs/architecture.md` no longer claims that
+  sudo passes the IP gate: the module is wired into `/etc/pam.d/sshd` only.
+- `docs/keycloak-setup.md` explains how to require a strong factor in the
+  device flow. Keycloak ignores the client's minimum ACR and requested ACR
+  values for the device grant (CVE-2026-105305); a browser flow override with
+  one Level of Authentication condition, a passkey and no cookie step enforces
+  it. The guide keeps the `acr` scope instead of recommending its removal and
+  names Keycloak 26.7 as the tested version.
+
+### Fixed
+- `--check` accepted the IP allowlist attribute only as
+  `ldap_user_extra_attrs = clients:clients` and refused activation otherwise.
+  A directory that keeps the allowlist in another attribute
+  (`clients:<attribute>`) now passes; the account phase always read it under
+  the name `clients`.
+- A device login without a refresh token from the identity provider stored the
+  client IP for the cached login, so the next login from that IP spent a round
+  trip to the identity provider on a refresh that could not succeed, and a
+  session from an earlier login kept working from the new IP. Such a login now
+  caches nothing and removes an earlier session of the user.
+- The `.deb` declares `Conflicts` and `Replaces: keycloak-ssh-auth`. Removing
+  the predecessor package restores `/etc/pam.d/sshd.original`, the same backup
+  `--enable` uses, and so deactivated pam-device-auth when it was removed
+  later. apt now removes it before pam-device-auth is configured.
 
 ## [0.5.14] - 2026-10-03
 
