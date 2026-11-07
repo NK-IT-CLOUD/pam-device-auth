@@ -9,4 +9,4 @@ go 1.26
 // crypto/tls), all fixed in 1.26.9.
 // GOTOOLCHAIN=auto (default on 1.21+) auto-downloads this toolchain at
 // build time regardless of the runner's installed Go version.
-toolchain go1.26.9
+toolchain go1.26.10

@@ -5,6 +5,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased] - 0.6.1
 
+### Security
+- Built with Go 1.26.10: `crypto/x509` distrusts compromised intermediate
+  certificates (GO-2026-6809). The helper verifies the identity provider's
+  TLS certificate with it when it fetches the discovery document and the JWKS.
+
 ### Fixed
 - Profile `ad` with `ldap.kerberos`: sudo and `passwd` failed for users whose
   UPN carries the lower-case DNS domain as its realm (`alice@example.com`),
