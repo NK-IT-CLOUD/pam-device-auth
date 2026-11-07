@@ -72,10 +72,12 @@ var rhelProfile = Profile{
 }
 
 // fedoraProfile is rhelProfile with the dnf5 mark command: dnf5 has no
-// `dnf mark install`, its subcommand is `dnf mark user`.
+// `dnf mark install`, its subcommand is `dnf mark user`. dnf5 asks for
+// confirmation when the reason of a package changes and aborts the whole
+// transaction without a terminal, so the command needs -y.
 var fedoraProfile = func() Profile {
 	p := rhelProfile
-	p.MarkManualCmd = []string{"dnf", "mark", "user"}
+	p.MarkManualCmd = []string{"dnf", "-y", "mark", "user"}
 	return p
 }()
 

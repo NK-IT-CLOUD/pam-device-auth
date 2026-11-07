@@ -72,15 +72,17 @@ func TestProfilesMarkPackagesManual(t *testing.T) {
 	}
 }
 
-// dnf5 (Fedora) has no `dnf mark install`; its subcommand is `dnf mark user`.
-// The RHEL family on dnf4 keeps `dnf mark install`, also when ID_LIKE names
-// fedora. Apart from the mark command Fedora uses the RHEL profile.
+// dnf5 (Fedora) has no `dnf mark install`; its subcommand is `dnf mark user`,
+// and it asks for confirmation when a reason changes, so it needs -y without a
+// terminal. The RHEL family on dnf4 keeps `dnf mark install`, also when
+// ID_LIKE names fedora. Apart from the mark command Fedora uses the RHEL
+// profile.
 func TestMarkManualCmdPerDnfVersion(t *testing.T) {
 	for _, c := range []struct {
 		name, id, idLike string
 		want             []string
 	}{
-		{"fedora", "fedora", "", []string{"dnf", "mark", "user"}},
+		{"fedora", "fedora", "", []string{"dnf", "-y", "mark", "user"}},
 		{"rocky", "rocky", "rhel centos fedora", []string{"dnf", "mark", "install"}},
 		{"almalinux", "almalinux", "rhel centos fedora", []string{"dnf", "mark", "install"}},
 		{"rhel", "rhel", "fedora", []string{"dnf", "mark", "install"}},

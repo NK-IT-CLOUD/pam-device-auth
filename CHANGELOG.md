@@ -45,8 +45,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - `--check` on OpenSSH 10.5 (Fedora 45): `sshd -T` prints no
   `authorizedkeysfile` line for `AuthorizedKeysFile none`, and `--check` now
   reads that as `none` instead of reporting an empty value.
-- Fedora: `--setup-ldap` marks the SSSD packages with `dnf mark user` (dnf5 has
-  no `dnf mark install`), so `dnf remove pam-device-auth` keeps SSSD installed.
+- Fedora: `--setup-ldap` marks the SSSD packages with `dnf -y mark user` (dnf5
+  has no `dnf mark install` and asks for confirmation without `-y`), so
+  `dnf remove pam-device-auth` keeps SSSD installed.
 
 ### Changed
 - The comments of the sshd drop-in no longer name LLDAP for every profile
