@@ -42,6 +42,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   Hat), PuTTY and plain OpenSSH 10 or later get the QR; Win32-OpenSSH, plain
   OpenSSH < 10 and unknown clients get link and code only. The sshd version is
   no longer read.
+- `--check` on OpenSSH 10.5 (Fedora 45): `sshd -T` prints no
+  `authorizedkeysfile` line for `AuthorizedKeysFile none`, and `--check` now
+  reads that as `none` instead of reporting an empty value.
+- Fedora: `--setup-ldap` marks the SSSD packages with `dnf mark user` (dnf5 has
+  no `dnf mark install`), so `dnf remove pam-device-auth` keeps SSSD installed.
 
 ### Changed
 - The comments of the sshd drop-in no longer name LLDAP for every profile

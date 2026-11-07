@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -258,6 +259,110 @@ func TestSshdParamWrapperArgs(t *testing.T) {
 		}
 		if got := strings.Join(gotArgs, " "); got != want {
 			t.Errorf("sshdParam(usedns, %q): sshd args %q, want %q", user, got, want)
+		}
+	}
+}
+
+// OpenSSH 10.5 stores AuthorizedKeysFile none as an empty list and `sshd -T`
+// prints no authorizedkeysfile line for it; 10.2 prints "authorizedkeysfile
+// none". Both mean that sshd reads no key file.
+func TestSshdKeysFileFor(t *testing.T) {
+	old := sshdTOutput
+	t.Cleanup(func() { sshdTOutput = old })
+	for _, c := range []struct {
+		name, out string
+		fail      bool
+		want      string
+		wantOK    bool
+	}{
+		{"OpenSSH 10.2 prints none", "permitrootlogin no\nauthorizedkeysfile none\nusedns no\n", false, "none", true},
+		{"OpenSSH 10.5 omits the line for none", "permitrootlogin no\nauthorizedkeyscommand /usr/bin/sss_ssh_authorizedkeys\nusedns no\n", false, "none", true},
+		{"key file", "authorizedkeysfile .ssh/authorized_keys\n", false, ".ssh/authorized_keys", true},
+		{"default key files", "authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n", false, ".ssh/authorized_keys .ssh/authorized_keys2", true},
+		{"sshd -T failed", "", true, "", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sshdTOutput = func(args ...string) ([]byte, error) {
+				if c.fail {
+					return nil, os.ErrNotExist
+				}
+				return []byte(c.out), nil
+			}
+			got, ok := sshdKeysFileFor("user=nobody")
+			if got != c.want || ok != c.wantOK {
+				t.Fatalf("sshdKeysFileFor = %q, %v, want %q, %v", got, ok, c.want, c.wantOK)
+			}
+		})
+	}
+}
+
+// fakeSshdT answers `sshd -T [-C spec]` from per-spec keyword values. With
+// omitNone, an authorizedkeysfile of none is left out of the output as
+// OpenSSH 10.5 does; otherwise it is printed as OpenSSH 10.2 does.
+func fakeSshdT(values map[string]map[string]string, omitNone bool) func(args ...string) ([]byte, error) {
+	return func(args ...string) ([]byte, error) {
+		spec := ""
+		if len(args) == 3 && args[1] == "-C" {
+			spec = args[2]
+		}
+		var b strings.Builder
+		for kw, v := range values[spec] {
+			if kw == "authorizedkeysfile" && v == "none" && omitNone {
+				continue
+			}
+			b.WriteString(kw + " " + v + "\n")
+		}
+		return []byte(b.String()), nil
+	}
+}
+
+// The --check verdicts on root's key path and on the non-root key file are the
+// same whether sshd prints "authorizedkeysfile none" (OpenSSH 10.2) or no
+// authorizedkeysfile line (OpenSSH 10.5).
+func TestKeysFileVerdictsSameOnOpenSSH102And105(t *testing.T) {
+	old := sshdTOutput
+	t.Cleanup(func() { sshdTOutput = old })
+	const keys = ".ssh/authorized_keys"
+	policy := func(permit, akf string) map[string]string {
+		return map[string]string{"permitrootlogin": permit, "authenticationmethods": "publickey", "authorizedkeysfile": akf}
+	}
+	nonRoot := map[string]string{"authenticationmethods": "publickey,keyboard-interactive:pam", "authorizedkeysfile": "none"}
+	for _, c := range []struct {
+		name    string
+		values  map[string]map[string]string
+		sources []string
+		wantOK  bool
+		wantMsg string
+	}{
+		{"root key file, global prohibit-password",
+			map[string]map[string]string{"user=root": policy("prohibit-password", keys), "user=nobody": nonRoot},
+			nil, true, "publickey only"},
+		{"root AuthorizedKeysFile none",
+			map[string]map[string]string{"user=root": policy("prohibit-password", "none"), "user=nobody": nonRoot},
+			nil, false, "root has no key source (AuthorizedKeysFile none)"},
+		{"global no, the source has a key file",
+			map[string]map[string]string{"user=root": policy("no", "none"), "user=root,addr=192.0.2.10": policy("prohibit-password", keys), "user=nobody": nonRoot},
+			[]string{"192.0.2.10"}, true, "192.0.2.10"},
+		{"global no, the source has AuthorizedKeysFile none",
+			map[string]map[string]string{"user=root": policy("no", "none"), "user=root,addr=203.0.113.5": policy("prohibit-password", "none"), "user=nobody": nonRoot},
+			[]string{"203.0.113.5"}, false, "root is allowed from 203.0.113.5 but AuthorizedKeysFile is none there"},
+	} {
+		for _, omitNone := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/omitNone=%v", c.name, omitNone), func(t *testing.T) {
+				sshdTOutput = fakeSshdT(c.values, omitNone)
+				permit, methods, keysFile, sources := rootSSHDPolicy(c.sources)
+				ok, _, okMsg, badMsg := rootLoginWithSources("", permit, methods, keysFile, sources)
+				msg := badMsg
+				if ok {
+					msg = okMsg
+				}
+				if ok != c.wantOK || !strings.Contains(msg, c.wantMsg) {
+					t.Fatalf("root verdict ok=%v %q, want ok=%v containing %q", ok, msg, c.wantOK, c.wantMsg)
+				}
+				if akf, ok := sshdKeysFileFor("user=nobody"); !ok || akf != "none" {
+					t.Fatalf("non-root AuthorizedKeysFile = %q, %v, want none", akf, ok)
+				}
+			})
 		}
 	}
 }

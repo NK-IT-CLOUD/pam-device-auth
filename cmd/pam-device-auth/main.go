@@ -337,20 +337,10 @@ func runPreflight() (fails, warns int) {
 		chk(strings.Contains(am, "publickey") && strings.Contains(am, "keyboard-interactive:pam"), false,
 			"non-root: "+am+" (2FA)",
 			"non-root AuthenticationMethods not 2FA (got "+am+"); expected publickey,keyboard-interactive:pam")
-		rootAm, _ := sshdParam("authenticationmethods", "root")
-		rootPermit, _ := sshdParam("permitrootlogin", "root")
-		rootKeys, _ := sshdParam("authorizedkeysfile", "root")
-		var sources []rootSourcePolicy
-		for _, src := range cfg.RootLoginSources {
-			spec := "user=root,addr=" + src
-			p, _ := sshdParamFor("permitrootlogin", spec)
-			m, _ := sshdParamFor("authenticationmethods", spec)
-			k, _ := sshdParamFor("authorizedkeysfile", spec)
-			sources = append(sources, rootSourcePolicy{Source: src, Permit: p, Methods: m, KeysFile: k})
-		}
+		rootPermit, rootAm, rootKeys, sources := rootSSHDPolicy(cfg.RootLoginSources)
 		rok, rfatal, rokMsg, rbadMsg := rootLoginWithSources(cfg.RootLogin, rootPermit, rootAm, rootKeys, sources)
 		chk(rok, rfatal, rokMsg, rbadMsg)
-		if akf, ok := sshdParam("authorizedkeysfile", "nobody"); ok {
+		if akf, ok := sshdKeysFileFor("user=nobody"); ok {
 			chk(akf == "none", false,
 				"non-root: AuthorizedKeysFile none (directory key is the only publickey source)",
 				"non-root AuthorizedKeysFile is "+akf+", not 'none'; local authorized_keys still satisfy "+
@@ -612,6 +602,37 @@ func sshdParamFor(keyword, connSpec string) (string, bool) {
 		}
 	}
 	return "", true
+}
+
+// sshdKeysFileFor returns the effective AuthorizedKeysFile for connSpec; the
+// bool is false if `sshd -T` could not run. A missing authorizedkeysfile line
+// means none: since OpenSSH 10.5, AuthorizedKeysFile none is stored as an
+// empty list (V_10_5_P1 servconf.c:450, CLEAR_ON_NONE_ARRAY(authorized_keys_files,
+// num_authkeys_files, "none")), and `sshd -T` prints no line for an empty
+// list (dump_cfg_strarray_oneline); 10.2 kept "none" as a list element and
+// printed "authorizedkeysfile none". This holds only for this keyword.
+func sshdKeysFileFor(connSpec string) (string, bool) {
+	v, ok := sshdParamFor("authorizedkeysfile", connSpec)
+	if ok && v == "" {
+		return "none", true
+	}
+	return v, ok
+}
+
+// rootSSHDPolicy returns root's effective PermitRootLogin, AuthenticationMethods
+// and AuthorizedKeysFile, and root's policy for each root_login_sources address.
+func rootSSHDPolicy(rootSources []string) (permit, methods, keysFile string, sources []rootSourcePolicy) {
+	methods, _ = sshdParam("authenticationmethods", "root")
+	permit, _ = sshdParam("permitrootlogin", "root")
+	keysFile, _ = sshdKeysFileFor("user=root")
+	for _, src := range rootSources {
+		spec := "user=root,addr=" + src
+		p, _ := sshdParamFor("permitrootlogin", spec)
+		m, _ := sshdParamFor("authenticationmethods", spec)
+		k, _ := sshdKeysFileFor(spec)
+		sources = append(sources, rootSourcePolicy{Source: src, Permit: p, Methods: m, KeysFile: k})
+	}
+	return permit, methods, keysFile, sources
 }
 
 // sshdParam is sshdParamFor for a user without an address.

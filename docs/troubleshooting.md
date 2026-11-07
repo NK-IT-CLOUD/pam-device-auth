@@ -69,8 +69,9 @@ sudo systemctl restart sssd
 On a RHEL-family host set up with release 0.5.10 or earlier, `sssd-dbus` is installed
 only as a dependency, not as a package you asked for. `dnf remove pam-device-auth`
 then removes it too, and the next restart of sssd fails with `Could not restart
-critical service [ifp]`. Run `sudo dnf mark install sssd-dbus` once (or re-run
-`--setup-ldap` from release 0.5.11 or later, which marks it) so that removing the
+critical service [ifp]`. Run `sudo dnf mark install sssd-dbus` (Fedora, dnf5:
+`sudo dnf mark user sssd-dbus`) once, or re-run `--setup-ldap` from release 0.5.11
+or later (Fedora: 0.6.1 or later), which marks it, so that removing the
 package leaves it in place. `--check` reports a missing responder as a blocker.
 
 ### systemd is degraded: `sssd-nss.socket` (or `-pam`, `-ssh`) failed

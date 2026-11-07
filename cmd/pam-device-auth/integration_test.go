@@ -227,7 +227,7 @@ func TestIntegrationSSHDPolicy(t *testing.T) {
 			t.Errorf("PermitRootLogin = no although root_login is key; the emergency path is gone")
 		}
 	}
-	if akf, _ := sshdParam("authorizedkeysfile", "nobody"); akf != "none" {
+	if akf, _ := sshdKeysFileFor("user=nobody"); akf != "none" {
 		t.Errorf("non-root AuthorizedKeysFile = %q, want none", akf)
 	}
 	akc, _ := sshdParam("authorizedkeyscommand", "")

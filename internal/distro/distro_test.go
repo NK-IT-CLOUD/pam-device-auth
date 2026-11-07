@@ -1,6 +1,9 @@
 package distro
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestFromOSRelease(t *testing.T) {
 	cases := []struct {
@@ -66,6 +69,32 @@ func TestProfilesMarkPackagesManual(t *testing.T) {
 	}
 	if got := fromOSRelease("debian", "").MarkManualCmd; got[0] != "apt-mark" || got[len(got)-1] != "manual" {
 		t.Errorf("debian MarkManualCmd = %v, want apt-mark manual", got)
+	}
+}
+
+// dnf5 (Fedora) has no `dnf mark install`; its subcommand is `dnf mark user`.
+// The RHEL family on dnf4 keeps `dnf mark install`, also when ID_LIKE names
+// fedora. Apart from the mark command Fedora uses the RHEL profile.
+func TestMarkManualCmdPerDnfVersion(t *testing.T) {
+	for _, c := range []struct {
+		name, id, idLike string
+		want             []string
+	}{
+		{"fedora", "fedora", "", []string{"dnf", "mark", "user"}},
+		{"rocky", "rocky", "rhel centos fedora", []string{"dnf", "mark", "install"}},
+		{"almalinux", "almalinux", "rhel centos fedora", []string{"dnf", "mark", "install"}},
+		{"rhel", "rhel", "fedora", []string{"dnf", "mark", "install"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fromOSRelease(c.id, c.idLike)
+			if !reflect.DeepEqual(p.MarkManualCmd, c.want) {
+				t.Errorf("MarkManualCmd = %v, want %v", p.MarkManualCmd, c.want)
+			}
+			p.MarkManualCmd = rhelProfile.MarkManualCmd
+			if !reflect.DeepEqual(p, rhelProfile) {
+				t.Errorf("profile apart from MarkManualCmd = %+v, want the RHEL profile", p)
+			}
+		})
 	}
 }
 

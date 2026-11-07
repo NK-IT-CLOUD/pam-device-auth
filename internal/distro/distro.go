@@ -71,10 +71,23 @@ var rhelProfile = Profile{
 	SoDir:             "/usr/lib64/security",
 }
 
+// fedoraProfile is rhelProfile with the dnf5 mark command: dnf5 has no
+// `dnf mark install`, its subcommand is `dnf mark user`.
+var fedoraProfile = func() Profile {
+	p := rhelProfile
+	p.MarkManualCmd = []string{"dnf", "mark", "user"}
+	return p
+}()
+
 // fromOSRelease selects a Profile from os-release ID / ID_LIKE. Unknown
 // distros fall back to the Debian profile (the historical default), so the
 // tool degrades to its prior behaviour rather than misconfiguring a host.
+// Fedora itself (ID fedora) gets fedoraProfile; the RHEL family on dnf4 lists
+// fedora only in ID_LIKE and keeps rhelProfile.
 func fromOSRelease(id, idLike string) Profile {
+	if strings.EqualFold(id, "fedora") {
+		return fedoraProfile
+	}
 	hay := strings.ToLower(id + " " + idLike)
 	for _, k := range []string{"rhel", "fedora", "centos", "rocky", "almalinux"} {
 		if strings.Contains(hay, k) {
