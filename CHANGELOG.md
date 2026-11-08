@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - 0.6.1
+## [0.6.1] - 2026-11-08
 
 ### Security
 - Built with Go 1.26.10: `crypto/x509` distrusts compromised intermediate
