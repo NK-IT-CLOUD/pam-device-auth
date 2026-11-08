@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"embed"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -33,7 +37,332 @@ func TestSudoersWithNopasswdGroups(t *testing.T) {
 	}
 }
 
+// stubChownRoot replaces the chownRoot seam for the test; nil makes it succeed
+// without touching the file (tests also run as non-root).
+func stubChownRoot(t *testing.T, fn func(string) error) {
+	t.Helper()
+	orig := chownRoot
+	t.Cleanup(func() { chownRoot = orig })
+	if fn == nil {
+		fn = func(string) error { return nil }
+	}
+	chownRoot = fn
+}
+
+func TestWriteSSSDConfChownFails(t *testing.T) {
+	eperm := &os.PathError{Op: "chown", Err: syscall.EPERM}
+	t.Run("new file is removed", func(t *testing.T) {
+		stubChownRoot(t, func(p string) error { eperm.Path = p; return eperm })
+		path := filepath.Join(t.TempDir(), "sssd.conf")
+		restore, err := writeSSSDConfAt(path, "[new]\n")
+		if err == nil || !strings.Contains(err.Error(), "operation not permitted") ||
+			!strings.Contains(err.Error(), "removed the new sssd.conf (none existed before)") {
+			t.Fatalf("err = %v, want the chown EPERM and the removal of the new file", err)
+		}
+		if restore != nil {
+			t.Error("restore func returned with an error")
+		}
+		if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+			t.Errorf("sssd.conf left behind after the chown failure: stat err = %v", serr)
+		}
+	})
+	t.Run("previous file is restored", func(t *testing.T) {
+		calls := 0
+		stubChownRoot(t, func(p string) error {
+			calls++
+			if calls == 1 {
+				return eperm
+			}
+			return nil
+		})
+		path := filepath.Join(t.TempDir(), "sssd.conf")
+		if err := os.WriteFile(path, []byte("[old]\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeSSSDConfAt(path, "[new]\n"); err == nil || !strings.Contains(err.Error(), "restored previous sssd.conf") {
+			t.Fatalf("err = %v, want the chown failure and the restore state", err)
+		}
+		if got, _ := os.ReadFile(path); string(got) != "[old]\n" {
+			t.Errorf("content after the chown failure = %q, want the previous file", got)
+		}
+		if calls != 2 {
+			t.Errorf("chownRoot called %d times, want 2 (write and restore)", calls)
+		}
+	})
+	t.Run("restore reports its chown failure", func(t *testing.T) {
+		stubChownRoot(t, nil)
+		path := filepath.Join(t.TempDir(), "sssd.conf")
+		if err := os.WriteFile(path, []byte("[old]\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		restore, err := writeSSSDConfAt(path, "[new]\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		chownRoot = func(string) error { return eperm }
+		if _, err := restore(); err == nil {
+			t.Fatal("restore() = nil although its chown failed")
+		}
+	})
+}
+
+// stubSyncDir makes the directory fsync after the rename fail with fn's error.
+func stubSyncDir(t *testing.T, fn func(string) error) {
+	t.Helper()
+	orig := syncDir
+	t.Cleanup(func() { syncDir = orig })
+	syncDir = fn
+}
+
+// A failed directory fsync comes after the rename: the new content is at the
+// path, and the error says so.
+func TestAtomicWriteFileDirSyncFailsAfterRename(t *testing.T) {
+	stubSyncDir(t, func(dir string) error { return &os.PathError{Op: "sync", Path: dir, Err: syscall.EIO} })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sssd.conf")
+	err := atomicWriteFile(path, []byte("[new]\n"), 0600)
+	if !errors.Is(err, errWrittenNotSynced) || !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), path) {
+		t.Fatalf("err = %v, want errWrittenNotSynced with EIO naming %s", err, path)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "[new]\n" {
+		t.Errorf("content = %q, want the new file", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("temp file left behind: %v", entries)
+	}
+}
+
+// writeSSSDConfAt still hands back a working restore when the new sssd.conf
+// is in place but its directory sync failed; the abort message says the new
+// file was written and what the rollback did.
+func TestWriteSSSDConfDirSyncFails(t *testing.T) {
+	stubChownRoot(t, nil)
+	eio := func(dir string) error { return &os.PathError{Op: "sync", Path: dir, Err: syscall.EIO} }
+	t.Run("previous file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sssd.conf")
+		if err := os.WriteFile(path, []byte("[old]\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		stubSyncDir(t, eio)
+		restore, err := writeSSSDConfAt(path, "[new]\n")
+		if err == nil || restore == nil {
+			t.Fatalf("writeSSSDConfAt = %v, restore nil=%v; want an error and a restore", err, restore == nil)
+		}
+		if got, _ := os.ReadFile(path); string(got) != "[new]\n" {
+			t.Fatalf("content = %q, want the new file in place", got)
+		}
+		syncDir = func(string) error { return nil }
+		msg := sssdConfWriteAbort(err, restore)
+		for _, want := range []string{"write /etc/sssd/sssd.conf: ", "the new file is in place", "input/output error", "(restored previous sssd.conf)"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("abort message %q lacks %q", msg, want)
+			}
+		}
+		if got, _ := os.ReadFile(path); string(got) != "[old]\n" {
+			t.Errorf("content after the rollback = %q, want the previous file", got)
+		}
+	})
+	t.Run("no previous file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sssd.conf")
+		stubSyncDir(t, eio)
+		restore, err := writeSSSDConfAt(path, "[new]\n")
+		if err == nil || restore == nil {
+			t.Fatalf("writeSSSDConfAt = %v, restore nil=%v; want an error and a restore", err, restore == nil)
+		}
+		if msg := sssdConfWriteAbort(err, restore); !strings.Contains(msg, "(removed the new sssd.conf (none existed before))") {
+			t.Errorf("abort message %q lacks the removal", msg)
+		}
+		if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+			t.Errorf("new sssd.conf left behind: stat err = %v", serr)
+		}
+	})
+	t.Run("failure before the rename", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing-subdir", "sssd.conf")
+		restore, err := writeSSSDConfAt(path, "[new]\n")
+		if err == nil || restore != nil {
+			t.Fatalf("writeSSSDConfAt = %v, restore nil=%v; want an error and no restore", err, restore == nil)
+		}
+		if msg := sssdConfWriteAbort(err, nil); strings.Contains(msg, "(") || !strings.HasPrefix(msg, "write /etc/sssd/sssd.conf: ") {
+			t.Errorf("abort message %q, want the write error without a rollback note", msg)
+		}
+	})
+}
+
+// An existing file that cannot be read (here: a directory at the path, EISDIR)
+// is not "none existed": each writer refuses before it writes anything, so a
+// rollback can never delete what it could not save.
+func TestWritersRefuseUnreadableExistingFile(t *testing.T) {
+	stubChownRoot(t, nil)
+	oldPath, oldTest := sshdDropinPath, sshdTest
+	t.Cleanup(func() { sshdDropinPath, sshdTest = oldPath, oldTest })
+	sshdTest = func() ([]byte, error) { t.Error("sshd -t ran although nothing was written"); return nil, nil }
+	noCheck := func() ([]byte, error) { t.Error("visudo -c ran although nothing was written"); return nil, nil }
+	for name, write := range map[string]func(path string) error{
+		"sssd.conf": func(path string) error { _, err := writeSSSDConfAt(path, "[new]\n"); return err },
+		"sshd drop-in": func(path string) error {
+			sshdDropinPath = path
+			return writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+		},
+		"sudoers": func(path string) error { return writeSudoersAt(path, "%ssh-admin ALL=(ALL:ALL) ALL\n", noCheck) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "conf")
+			if err := os.Mkdir(path, 0755); err != nil {
+				t.Fatal(err)
+			}
+			err := write(path)
+			if err == nil || !strings.Contains(err.Error(), "cannot read the existing "+path) || !strings.Contains(err.Error(), "nothing was written") {
+				t.Fatalf("err = %v, want a read error before the write", err)
+			}
+			if fi, serr := os.Stat(path); serr != nil || !fi.IsDir() {
+				t.Errorf("existing path changed: %v", serr)
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+				t.Errorf("temp file left behind: %v", entries)
+			}
+		})
+	}
+}
+
+// After a write that is in place but whose directory sync failed, the drop-in
+// and sudoers writers still validate: accepted means the error says the
+// validated file is in place; rejected means the previous file is back.
+func TestValidatedWritersAfterDirSyncFailure(t *testing.T) {
+	oldPath, oldTest := sshdDropinPath, sshdTest
+	t.Cleanup(func() { sshdDropinPath, sshdTest = oldPath, oldTest })
+	failFirstSync := func() {
+		n := 0
+		stubSyncDir(t, func(dir string) error {
+			if n++; n == 1 {
+				return &os.PathError{Op: "sync", Path: dir, Err: syscall.EIO}
+			}
+			return nil
+		})
+	}
+	ok := func() ([]byte, error) { return nil, nil }
+	reject := func() ([]byte, error) { return []byte("bad config"), errors.New("exit status 1") }
+	type writer struct {
+		check string
+		run   func(path string, validate func() ([]byte, error)) error
+	}
+	for name, w := range map[string]writer{
+		"sshd drop-in": {"sshd -t", func(path string, validate func() ([]byte, error)) error {
+			sshdDropinPath, sshdTest = path, validate
+			return writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+		}},
+		"sudoers": {"visudo -c", func(path string, validate func() ([]byte, error)) error {
+			return writeSudoersAt(path, "%ssh-admin ALL=(ALL:ALL) ALL\n", validate)
+		}},
+	} {
+		t.Run(name+" accepted", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "conf")
+			failFirstSync()
+			validated := false
+			err := w.run(path, func() ([]byte, error) { validated = true; return ok() })
+			if !validated {
+				t.Fatalf("%s did not run after the sync failure", w.check)
+			}
+			if !errors.Is(err, errWrittenNotSynced) || !strings.Contains(err.Error(), "passed "+w.check) {
+				t.Fatalf("err = %v, want errWrittenNotSynced saying the file passed %s", err, w.check)
+			}
+			if _, serr := os.Stat(path); serr != nil {
+				t.Errorf("validated file not in place: %v", serr)
+			}
+		})
+		t.Run(name+" rejected", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "conf")
+			if err := os.WriteFile(path, []byte("# previous\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			failFirstSync()
+			err := w.run(path, reject)
+			if err == nil || !strings.Contains(err.Error(), w.check+" rejected") || !strings.Contains(err.Error(), "bad config") {
+				t.Fatalf("err = %v, want the %s rejection", err, w.check)
+			}
+			if got, _ := os.ReadFile(path); string(got) != "# previous\n" {
+				t.Errorf("previous file not restored: %q", got)
+			}
+		})
+	}
+}
+
+func TestSetupAbortMessage(t *testing.T) {
+	got := setupAbortMessage("sshd config: sshd -t rejected", "restored previous sssd.conf",
+		[]string{"mkhomedir PAM wiring (authselect)", "sudoers drop-in /etc/sudoers.d/pam-device-auth"})
+	want := "sshd config: sshd -t rejected (restored previous sssd.conf); still in place on the host: " +
+		"mkhomedir PAM wiring (authselect), sudoers drop-in /etc/sudoers.d/pam-device-auth"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	if got := setupAbortMessage("x", "restored previous sssd.conf", nil); got != "x (restored previous sssd.conf)" {
+		t.Errorf("no remaining changes: got %q", got)
+	}
+}
+
+func TestRollbackSSSD(t *testing.T) {
+	boom := fmt.Errorf("exit status 1")
+	cases := []struct {
+		name       string
+		did        string // what restore reports
+		restoreErr error
+		restart    bool
+		restartErr error
+		want       string
+		wantCalls  int
+	}{
+		{"restore only", "restored previous sssd.conf", nil, false, nil, "restored previous sssd.conf", 0},
+		{"no previous file", "removed the new sssd.conf (none existed before)", nil, false, nil,
+			"removed the new sssd.conf (none existed before)", 0},
+		{"restore and restart", "restored previous sssd.conf", nil, true, nil, "restored previous sssd.conf and restarted sssd", 1},
+		{"restart fails", "restored previous sssd.conf", nil, true, boom, "restored previous sssd.conf, but sssd did not restart", 1},
+		{"restore fails", "", fmt.Errorf("EROFS"), true, nil, "could NOT roll back sssd.conf: EROFS", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var calls []string
+			run := fakeRunner(map[string]error{"systemctl restart sssd": c.restartErr}, nil, &calls)
+			got := rollbackSSSD(run, func() (string, error) { return c.did, c.restoreErr }, c.restart)
+			if !strings.HasPrefix(got, c.want) {
+				t.Errorf("got %q, want prefix %q", got, c.want)
+			}
+			if len(calls) != c.wantCalls {
+				t.Errorf("calls = %q, want %d restart(s)", calls, c.wantCalls)
+			}
+		})
+	}
+}
+
+// The authselect profile stays selected when oddjobd cannot be enabled; the
+// abort message must say so (the restore covers sssd.conf only).
+func TestWireMkhomedirOddjobdFailureNamesAuthselectProfile(t *testing.T) {
+	const oddjobd = "systemctl enable --now oddjobd"
+	var calls []string
+	err := wireMkhomedir(distro.Profile{PamWiring: "authselect"},
+		fakeRunner(map[string]error{oddjobd: fmt.Errorf("exit status 1")}, nil, &calls))
+	if err == nil || !strings.Contains(err.Error(), `authselect profile "sssd with-mkhomedir" stays selected`) {
+		t.Fatalf("err = %v, want the remaining authselect profile named", err)
+	}
+}
+
+func TestCheckSSSDIfp(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "sssd_ifp")
+	if err := os.WriteFile(present, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkSSSDIfp(present); err != nil {
+		t.Errorf("present binary: %v", err)
+	}
+	missing := filepath.Join(dir, "missing", "sssd_ifp")
+	err := checkSSSDIfp(missing)
+	if err == nil || !strings.Contains(err.Error(), missing) || !strings.Contains(err.Error(), "sssd-dbus") {
+		t.Errorf("missing binary: err = %v, want the path and the sssd-dbus package", err)
+	}
+}
+
 func TestWriteSSSDConfAt_AtomicAndRestores(t *testing.T) {
+	stubChownRoot(t, nil)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sssd.conf")
 
@@ -61,7 +390,9 @@ func TestWriteSSSDConfAt_AtomicAndRestores(t *testing.T) {
 
 	// Restore must reinstate the prior known-good config (simulating a failed
 	// sssd restart on the new config).
-	restore()
+	if did, err := restore(); err != nil || did != "restored previous sssd.conf" {
+		t.Errorf("restore() = %q, %v; want the previous file reported as restored", did, err)
+	}
 	got, _ = os.ReadFile(path)
 	if string(got) != "[old]\nknown-good\n" {
 		t.Errorf("after restore, content = %q, want prior known-good", got)
@@ -69,6 +400,7 @@ func TestWriteSSSDConfAt_AtomicAndRestores(t *testing.T) {
 }
 
 func TestWriteSSSDConfAt_RestoreRemovesWhenNoPrior(t *testing.T) {
+	stubChownRoot(t, nil)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sssd.conf")
 
@@ -79,8 +411,10 @@ func TestWriteSSSDConfAt_RestoreRemovesWhenNoPrior(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("file should exist after write: %v", err)
 	}
-	// No prior config existed, so restore removes the file entirely.
-	restore()
+	// No prior config existed, so restore removes the file entirely and says so.
+	if did, err := restore(); err != nil || did != "removed the new sssd.conf (none existed before)" {
+		t.Errorf("restore() = %q, %v; want the removal reported", did, err)
+	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("restore should remove file when no prior existed; stat err = %v", err)
 	}
@@ -90,6 +424,7 @@ func TestWriteSSSDConfAt_RestoreRemovesWhenNoPrior(t *testing.T) {
 // one field at a time to assert a specific rejection.
 func validLDAP() *config.LDAPConfig {
 	return &config.LDAPConfig{
+		Profile:      config.LDAPProfileLLDAP,
 		URI:          "ldaps://ldap.example.com:636",
 		BaseDN:       "dc=example,dc=com",
 		BindDN:       "cn=admin,ou=people,dc=example,dc=com",
@@ -572,6 +907,142 @@ func TestValidateLDAPConfig_Profiles(t *testing.T) {
 	if err := validateLDAPConfig(l); err == nil || !strings.Contains(err.Error(), "profile") {
 		t.Fatalf("unknown profile: err = %v", err)
 	}
+}
+
+// ldap.profile has no implicit value: empty is the verbatim required error,
+// lldap and ad pass, anything else names the value.
+func TestValidateLDAPProfileRequired(t *testing.T) {
+	for _, c := range []struct{ profile, want string }{
+		{"", `config: ldap.profile is required ("lldap" or "ad")`},
+		{"lldap", ""},
+		{"ad", ""},
+		{"openldap", `ldap.profile must be "lldap" or "ad", got "openldap"`},
+	} {
+		err := validateLDAPProfile(&config.LDAPConfig{Profile: c.profile})
+		got := ""
+		if err != nil {
+			got = err.Error()
+		}
+		if got != c.want {
+			t.Errorf("profile %q: err = %q, want %q", c.profile, got, c.want)
+		}
+	}
+	l := validLDAP()
+	l.Profile = ""
+	if err := validateLDAPConfig(l); err == nil || err.Error() != `config: ldap.profile is required ("lldap" or "ad")` {
+		t.Errorf("validateLDAPConfig without profile: err = %v", err)
+	}
+}
+
+// The login shell sssd.conf hands to directory users must exist, be a regular
+// file and be executable by them (other users). ldapShell supplies the
+// documented default when ldap.shell is empty.
+func TestCheckLDAPShell(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(name string, mode os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	ok := mk("ok", 0755)
+	ownerOnly := mk("owner-only", 0700)
+	noExec := mk("noexec", 0644)
+	missing := filepath.Join(dir, "missing")
+	for _, c := range []struct{ path, want string }{
+		{ok, ""},
+		{missing, "login shell " + missing + " (ldap.shell): "},
+		{dir, "login shell " + dir + " (ldap.shell) is not a regular file"},
+		{noExec, "login shell " + noExec + " (ldap.shell) is not executable by directory users (mode -rw-r--r--)"},
+		{ownerOnly, "login shell " + ownerOnly + " (ldap.shell) is not executable by directory users (mode -rwx------)"},
+	} {
+		err := checkLDAPShell(c.path)
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: unexpected error %v", c.path, err)
+		case c.want != "" && (err == nil || !strings.HasPrefix(err.Error(), c.want)):
+			t.Errorf("%s: err = %v, want prefix %q", c.path, err, c.want)
+		}
+	}
+	if got := ldapShell(&config.LDAPConfig{}); got != "/bin/bash" {
+		t.Errorf("ldapShell(unset) = %q, want /bin/bash", got)
+	}
+	if got := ldapShell(&config.LDAPConfig{Shell: "/bin/zsh"}); got != "/bin/zsh" {
+		t.Errorf("ldapShell(/bin/zsh) = %q", got)
+	}
+	// The renderer writes the same default into sssd.conf.
+	if !strings.Contains(renderSSSDConf(ldapRenderData{Profile: config.LDAPProfileLLDAP}, "/ca"), "default_shell = "+defaultLDAPShell+"\n") {
+		t.Errorf("renderer default shell differs from defaultLDAPShell")
+	}
+}
+
+// --setup-ldap refuses a missing ldap.shell before its first host write (the
+// package install). The command exits the process, so it runs in a child test
+// binary. The child is fail-safe: PATH is an empty directory, so no package
+// manager or systemctl can run; the sshd/systemctl seams abort with exit 99;
+// the drop-in path is a temp file. The "guard" mode gives a valid shell and
+// proves the next stage is the package install, which the empty PATH stops.
+func TestSetupLDAP_ShellCheckedBeforeHostWrites(t *testing.T) {
+	const abortMarker = "PDA_TEST_ABORT:"
+	if shell := os.Getenv("PDA_TEST_SHELL_CHILD"); shell != "" {
+		abort := func(stage string) {
+			fmt.Fprintln(os.Stderr, abortMarker, stage)
+			os.Exit(99)
+		}
+		systemctl = func(...string) (string, error) { abort("systemctl"); return "", nil }
+		sshdTOutput = func(...string) ([]byte, error) { abort("sshd -T"); return nil, nil }
+		sshdTest = func() ([]byte, error) { abort("sshd -t"); return nil, nil }
+		readClients = func(string) ([]string, error) { abort("readClients"); return nil, nil }
+		sshdDropinPath = filepath.Join(t.TempDir(), "10-pam-device-auth.conf")
+		detectPlatform = func() (distro.Profile, error) {
+			return distro.Profile{Family: "debian", InstallCmd: "apt-get", SSSDPackages: []string{"sssd-ldap"}}, nil
+		}
+		loadConfig = func(string) (*config.Config, error) {
+			l := validLDAP()
+			l.Shell = shell
+			return &config.Config{IssuerURL: "https://sso.example.org/realms/r", LDAP: l}, nil
+		}
+		runSetupLDAP()
+		abort("setup-ldap returned")
+	}
+	run := func(t *testing.T, shell string) (code int, stdout, stderr string) {
+		t.Helper()
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSetupLDAP_ShellCheckedBeforeHostWrites$")
+		cmd.Env = append(os.Environ(), "PDA_TEST_SHELL_CHILD="+shell, "PATH="+t.TempDir())
+		var out, errOut bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errOut
+		err := cmd.Run()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("child: err=%v, want a non-zero exit; stderr=%q", err, errOut.String())
+		}
+		return exitErr.ExitCode(), out.String(), errOut.String()
+	}
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing")
+	t.Run("missing shell refuses first", func(t *testing.T) {
+		code, stdout, stderr := run(t, missing)
+		if code != 1 || !strings.Contains(stderr, "FAIL: login shell "+missing+" (ldap.shell)") {
+			t.Fatalf("exit %d, stderr %q; want exit 1 with the shell FAIL", code, stderr)
+		}
+		if stdout != "" || strings.Contains(stderr, abortMarker) {
+			t.Errorf("setup ran past the shell check: stdout %q stderr %q", stdout, stderr)
+		}
+	})
+	t.Run("guard: next stage is the package install", func(t *testing.T) {
+		ok := filepath.Join(dir, "sh")
+		if err := os.WriteFile(ok, []byte("#!/bin/sh\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		code, stdout, stderr := run(t, ok)
+		if code != 1 || !strings.Contains(stdout, "Installing sssd-ldap") || !strings.Contains(stderr, "FAIL: apt-get update") {
+			t.Fatalf("exit %d stdout %q stderr %q; want the package install stopped by the empty PATH", code, stdout, stderr)
+		}
+	})
 }
 
 func TestValidateLDAPConfig_ADNeedsKeyAndClientsAttributes(t *testing.T) {
@@ -1318,5 +1789,60 @@ func TestSshdDropin_ProfileNeutralCommentsOnly(t *testing.T) {
 				t.Errorf("%s line %d: non-comment change %q -> %q", c.file, i+1, ol[i], gl[i])
 			}
 		}
+	}
+}
+
+func TestWireMkhomedirUnknownWiring(t *testing.T) {
+	var calls []string
+	err := wireMkhomedir(distro.Profile{PamWiring: "x"}, fakeRunner(nil, nil, &calls))
+	if err == nil || !strings.Contains(err.Error(), `unknown PamWiring "x"`) {
+		t.Fatalf("err = %v, want the unknown PamWiring error", err)
+	}
+	if len(calls) != 0 {
+		t.Errorf("runner called for an unknown wiring: %q", calls)
+	}
+}
+
+func TestWireMkhomedirFailureIsError(t *testing.T) {
+	const pamAuthUpdate = "pam-auth-update --enable mkhomedir"
+	var calls []string
+	err := wireMkhomedir(distro.Profile{PamWiring: "pam-auth-update"},
+		fakeRunner(map[string]error{pamAuthUpdate: fmt.Errorf("exit status 1")},
+			map[string]string{pamAuthUpdate: "no profile mkhomedir"}, &calls))
+	if err == nil || !strings.Contains(err.Error(), "no profile mkhomedir") {
+		t.Fatalf("err = %v, want the pam-auth-update failure with its output", err)
+	}
+}
+
+func TestWireMkhomedirCommands(t *testing.T) {
+	const selectCmd = "authselect select sssd with-mkhomedir --force"
+	const oddjobd = "systemctl enable --now oddjobd"
+	boom := fmt.Errorf("exit status 1")
+	cases := []struct {
+		name      string
+		wiring    string
+		results   map[string]error
+		wantCalls []string
+		wantErr   string
+	}{
+		{"debian ok", "pam-auth-update", nil, []string{"pam-auth-update --enable mkhomedir"}, ""},
+		{"rhel ok", "authselect", nil, []string{selectCmd, oddjobd}, ""},
+		{"rhel select fails, oddjobd not started", "authselect", map[string]error{selectCmd: boom}, []string{selectCmd}, "authselect"},
+		{"rhel oddjobd fails", "authselect", map[string]error{oddjobd: boom}, []string{selectCmd, oddjobd}, "oddjobd"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			err := wireMkhomedir(distro.Profile{PamWiring: tc.wiring}, fakeRunner(tc.results, nil, &calls))
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("err = %v, want an error naming %q", err, tc.wantErr)
+			}
+			if strings.Join(calls, "|") != strings.Join(tc.wantCalls, "|") {
+				t.Errorf("calls = %q, want %q", calls, tc.wantCalls)
+			}
+		})
 	}
 }

@@ -8,6 +8,7 @@ upgrades, failure modes.
 | Path | Perms | Owner | Purpose |
 |---|---|---|---|
 | `/etc/pam-device-auth/config.json` | `0600` | `root:root` | OIDC config |
+| `/etc/pam-device-auth/config.json.pre-0.7.0` | as `config.json` | as `config.json` | Copy kept by `--migrate-config` when it set `ldap.profile` |
 | `/usr/local/bin/pam-device-auth` | `0755` | `root:root` | Go helper binary |
 | `/usr/lib/security/pam_device_auth.so` (deb) or `/usr/lib64/security/pam_device_auth.so` (rpm) | `0755` | `root:root` | PAM module |
 | `/var/log/pam-device-auth.log` | `0640` | `root:adm` | Auth log (PAM + Go) |
@@ -51,8 +52,8 @@ a hard dependency. `pam-device-auth --check` reports both IP-pin posture
 against a resolvable directory user via `busctl`); run it after any change
 to `clients`, `access_group`, or `service_account_groups`.
 
-The InfoPipe responder needs the `sssd-dbus` package on Debian, Ubuntu and the
-RHEL family, and `--setup-ldap` installs it. Keep it installed for as long as
+The InfoPipe responder needs the `sssd-dbus` package on Debian, Ubuntu, Rocky
+Linux and Fedora, and `--setup-ldap` installs it. Keep it installed for as long as
 `sssd.conf` enables `ifp`: sssd does not start without the responder.
 
 Changing `access_group`, `service_account_groups`, or `nopasswd_sudo_groups`
@@ -60,7 +61,7 @@ in `config.json` requires re-running `pam-device-auth --setup-ldap` to push
 the new sssd.conf, sudoers, and sshd drop-in. `--setup-ldap` restarts sssd
 but does **not** restart sshd; the sshd drop-in only takes effect after
 `pam-device-auth --enable` (which restarts sshd) or a manual
-`systemctl reload ssh`.
+`systemctl reload ssh.service` (`sshd.service` on Rocky Linux and Fedora).
 
 ## Logging
 
@@ -90,10 +91,14 @@ Go helper `DEBUG` is suppressed unless the binary runs with `--debug`
 The PAM module additionally writes every line to syslog at the same
 priority, so `/var/log/auth.log` / `journalctl` carries a copy. The Go
 helper does **not** write to syslog, with one exception: if it cannot open
-`/var/log/pam-device-auth.log` it denies the login (fail closed) and sends the
-reason to syslog (`authpriv`, tag `pam-device-auth`), because sshd discards its
-stderr. If you need everything in one stream, point Journal's `ImportantLog` or
-a Fluentd tail at the file.
+`/var/log/pam-device-auth.log` or cannot set it to `0640`, it denies the login
+(fail closed) and sends the reason to syslog (`authpriv`, tag
+`pam-device-auth`), because sshd discards its stderr. This applies to the
+authentication phase (`...; denying login (fail closed)`) and to the account
+phase, `--pam-acct`, for every non-root user (`...; denying`; the helper exits
+3, and the PAM module logs `acct_mgmt: helper exited 3 (infra failure) for user
+<user> from IP <ip> — denying login (fail-closed)`). If you need everything in
+one stream, point Journal's `ImportantLog` or a Fluentd tail at the file.
 
 ### What gets logged
 
@@ -111,9 +116,15 @@ Linux channel for log readers (syslog daemon, logwatch, journald
 forwarders, etc.) without granting other services rights to read. This
 matches `/var/log/auth.log` semantics on Debian/Ubuntu.
 
-If you run on a host that doesn't have an `adm` group, postinst falls
-back to leaving ownership at `root:root` and the permissions at `0640`;
-the log is still readable to anyone who can become root.
+On a host without an `adm` group, postinst does not change the owner of the
+log (`root:root` when the package created it) and sets the permissions to
+`0640`; the log is then readable only by root.
+
+The helper checks the log's mode every time it opens it and sets `0640` when
+the mode differs; a log that already is `0640` is not changed. A log it cannot
+open (for example immutable with `chattr +i`), or whose wrong mode it cannot
+correct (for example a `0644` log made append-only with `chattr +a`), denies
+every non-root login; see [syslog](#syslog).
 
 ## Rotation
 
@@ -154,7 +165,9 @@ No Prometheus endpoint: the helper is not a daemon. Monitor via logs.
 | Helper timed out | `\[PAM\].*timed out after [0-9]+s` | Helper stuck; infrastructure issue |
 | IdP reachable but token invalid | `\[AUTH\].*Token validation failed` | Key rotation mid-session, clock skew, MITM |
 | IdP unreachable | `\[AUTH\].*token refresh failed` or `JWKS fetch` | Network between PAM host and Keycloak broken |
-| Backup failed on enable | `WARN: could not back up` | `--enable` proceeded without a PAM-config backup; investigate before the next change |
+| Backup failed on enable | `FAIL: cannot back up /etc/pam.d/sshd to /etc/pam.d/sshd.original` on the stderr of `--enable` (not in the log) | `--enable` stopped before any write; the message names the cause and, without a pristine PAM config, the restore from the `openssh-server` package |
+| Log unusable (fail-closed deny) | syslog `pam-device-auth: .*denying` or `\[PAM\].*helper exited 3 \(infra failure\)` | The helper cannot open the log or set it to `0640`; every non-root login is denied |
+| Metadata cache not writable | `\[AUTH\].*cache write to .* failed` | Discovery or JWKS cache under `/run/pam-device-auth/oidc/` could not be written; the live documents are used, each login fetches them again |
 | Access revoked mid-session | `\[AUTH\].*access revoked for` | Cached session rejected; user lost the required role or IP authorization |
 | Account-phase IP gate deny | `\[AUTH\].*not in clients allowlist` | Source IP not in the user's `clients` attribute; expected for a locked-down account logging in from a new location |
 | InfoPipe read failure (fail-closed deny) | `\[AUTH\].*clients read failed, fail-closed deny` | SSSD InfoPipe/D-Bus unreachable or timed out; denies this login and, if it persists, every directory user |
@@ -179,21 +192,41 @@ No Prometheus endpoint: the helper is not a daemon. Monitor via logs.
 sudo apt update && sudo apt upgrade pam-device-auth
 ```
 
+Before any file is unpacked, `preinst` refuses a platform outside the
+supported list (Ubuntu 24.04 or later, Debian 13 or later, Rocky Linux 9 and
+10, Fedora 44 or later): the install or upgrade fails with
+`pam-device-auth: unsupported distribution "<ID> <VERSION_ID>" (supported: ubuntu >= 24.04, debian >= 13, rocky 9/10, fedora >= 44)`
+and an installed version stays as it is.
+
 On upgrade, `postinst`:
 
-- preserves `/etc/pam-device-auth/config.json`
+- preserves `/etc/pam-device-auth/config.json` and runs
+  `pam-device-auth --migrate-config` on it: an `ldap` block without `profile`
+  gets `"profile": "lldap"`, the original is kept as `config.json.pre-0.7.0`
+  (see [INSTALL.md](../INSTALL.md#upgrade)); a missing `config.json` is an
+  error
 - rewrites `/etc/logrotate.d/pam-device-auth` (new perms if upgraded)
+- in a drop-in with `LogLevel DEBUG1`, replaces that line with
+  `LogLevel VERBOSE` plus `LogVerbose`, validated with `sshd -t`
 - re-applies file perms (config 0600, log 0640 root:adm)
-- restarts sshd **only** if PAM was previously activated (detected by
-  presence of `/etc/pam.d/sshd.original`)
+- if PAM is active (`/etc/pam.d/sshd` uses `pam_device_auth.so`; an
+  `sshd.original` alone does not count), validates the sshd config with `sshd -t` and
+  restarts `ssh.service` (Debian, Ubuntu) or `sshd.service` (Rocky Linux,
+  Fedora)
 - on fresh install: does **not** activate PAM automatically; run
   `pam-device-auth --enable` after configuring
+
+Any failed step fails `postinst` with an `ERROR:` line that names the cause
+and the step that completes the upgrade once it is fixed: `dpkg --configure
+-a`, or `dnf reinstall ./pam-device-auth-<version>.x86_64.rpm` (`dnf
+reinstall pam-device-auth` from a repository), because rpm does not run a
+failed post-install script again.
 
 ### Via .deb or .rpm
 
 ```bash
 sudo dpkg -i pam-device-auth_<version>_amd64.deb
-# or, on Rocky/RHEL-family:
+# or, on Rocky Linux and Fedora:
 sudo dnf install ./pam-device-auth-<version>.x86_64.rpm
 ```
 
@@ -220,7 +253,7 @@ If `--check` fails post-upgrade, disable PAM while you debug:
 
 ```bash
 sudo cp /etc/pam.d/sshd.original /etc/pam.d/sshd
-sudo systemctl restart ssh
+sudo systemctl restart ssh.service   # sshd.service on Rocky Linux and Fedora
 ```
 
 (This is reversible at any time by re-running `pam-device-auth --enable`.)
@@ -234,7 +267,8 @@ sudo systemctl restart ssh
 | Keycloak realm down | Fast path denies (refresh fails), new device flows fail | No action needed; self-heals when Keycloak returns |
 | JWKS endpoint returns 500 | New tokens cannot be validated, existing cached sessions fail on refresh | No action needed |
 | Host clock drift > 60 s ahead of IdP | `iat` check rejects tokens | NTP; or temporarily widen the skew window (source change) |
-| Log file disk full | Helper still authenticates; new log writes fail silently | logrotate should run; check free space on `/var` |
+| Log file disk full | The existing log still opens: the helper still authenticates; new log writes fail silently | logrotate should run; check free space on `/var` |
+| Log cannot be opened, or is not `0640` and cannot be set to it (missing `/var/log`, symlink, `chattr +i`, `chattr +a` on a log with another mode, read-only filesystem, no space to create a missing log) | Every non-root login denied, in the auth phase and by `--pam-acct` (exit 3); the reason goes to syslog `authpriv`. root is unaffected | Fix the log file (`lsattr`, `chattr -a -i`, `ls -l`); the next login works |
 | `/run/pam-device-auth` removed at runtime | Every user pushed back to device flow once (cache rebuilt on success) | `systemd-tmpfiles --create` to recreate |
 | PAM module segfault | sshd refuses auth, logs SEGV in dmesg | `cp /etc/pam.d/sshd.original /etc/pam.d/sshd` via the root-key session, report bug |
 | SSSD InfoPipe (ifp) down or `busctl` unreachable | Account-phase IP gate fails closed: every directory user denied at login, including key-only service accounts. root is unaffected (exempt from the gate) | Restore SSSD (`systemctl status sssd`, check `ifp` responder in sssd.conf); root-key session stays usable throughout |
@@ -259,19 +293,37 @@ documented alternative rescue path.
 ```bash
 # remove (keeps config)
 sudo apt remove pam-device-auth
-# or on Rocky/RHEL-family:
+# or on Rocky Linux and Fedora:
 sudo dnf remove pam-device-auth
 
 # purge (removes config, logs, cache; apt only, dnf has no separate purge)
 sudo apt purge pam-device-auth
 ```
 
-`postrm` restores `/etc/pam.d/sshd` from `sshd.original`, drops the sshd
-override file, removes the managed sudoers file
-(`/etc/sudoers.d/pam-device-auth`, including any `NOPASSWD:ALL` grant it
-carried) so no leftover privilege escalation stays behind, and restarts
-sshd. This runs the same way for `.deb` (dpkg) and `.rpm` (dnf/rpm)
-removals. Directory users and groups live in LLDAP, not on the host;
+`prerm` refuses the removal while `/etc/pam.d/sshd` uses `pam_device_auth.so`
+and no valid `/etc/pam.d/sshd.original` exists (non-empty, with an `auth` or
+`@include` line, without `pam_device_auth.so`). Removing the module then would
+leave sshd pointing at a missing `pam_device_auth.so`, so the package and sshd
+stay as they are:
+
+```text
+pam-device-auth: /etc/pam.d/sshd uses pam_device_auth.so and no valid /etc/pam.d/sshd.original exists; restore /etc/pam.d/sshd from your distribution's openssh-server package, then remove pam-device-auth
+```
+
+Restore `/etc/pam.d/sshd` from the distribution's `openssh-server` package,
+then remove pam-device-auth again.
+
+`postrm` restores `/etc/pam.d/sshd` from the verified `sshd.original` (a failed
+copy fails the removal and keeps the backup), drops the sshd override file,
+removes the managed sudoers file (`/etc/sudoers.d/pam-device-auth`, including
+any `NOPASSWD:ALL` grant it carried) so no leftover privilege escalation stays
+behind, validates the sshd config with `sshd -t` and restarts
+`ssh.service` or `sshd.service`. A removal or purge does that only when it
+removed the drop-in or restored `/etc/pam.d/sshd`, so a host without either
+(never set up or enabled) and a purge after a removal do not need sshd. A failing `sshd -t` or restart fails `postrm` with the sshd
+error; fix the config and run `systemctl restart <unit>` (with dpkg, then run
+the removal again). This runs the same way for `.deb` (dpkg) and `.rpm`
+(dnf/rpm) removals. Directory users and groups live in LLDAP, not on the host;
 uninstalling pam-device-auth does not touch them or SSSD's identity cache.
 
 ## Package source of truth

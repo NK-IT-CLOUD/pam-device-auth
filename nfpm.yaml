@@ -48,7 +48,9 @@ contents:
     packager: rpm
 
 scripts:
+  preinstall: ./debian/preinst
   postinstall: ./debian/postinst
+  preremove: ./debian/prerm
   postremove: ./debian/postrm
 
 overrides:

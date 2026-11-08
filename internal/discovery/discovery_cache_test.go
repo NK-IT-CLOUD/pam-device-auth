@@ -3,10 +3,12 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -65,7 +67,7 @@ func TestFetchCachedMissFetchesAndWrites(t *testing.T) {
 	dir := setupCacheDir(t)
 	srv, hits := discoveryServer(t, validDiscoveryDoc())
 
-	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil)
+	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("FetchCached() error: %v", err)
 	}
@@ -112,10 +114,10 @@ func TestFetchCachedHitSkipsHTTP(t *testing.T) {
 	setupCacheDir(t)
 	srv, hits := discoveryServer(t, validDiscoveryDoc())
 
-	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil); err != nil {
+	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil)
+	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("second FetchCached() error: %v", err)
 	}
@@ -133,7 +135,7 @@ func TestFetchCachedExpiredRefetches(t *testing.T) {
 	body, _ := json.Marshal(validDiscoveryDoc())
 	plantCache(t, time.Now().Add(-oidccache.TTL-time.Minute).Unix(), srv.URL, string(body))
 
-	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil); err != nil {
+	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if *hits != 1 {
@@ -151,7 +153,7 @@ func TestFetchCachedCorruptRefetches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil); err != nil {
+	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if *hits != 1 {
@@ -165,7 +167,7 @@ func TestFetchCachedIssuerMismatchRefetches(t *testing.T) {
 	body, _ := json.Marshal(validDiscoveryDoc())
 	plantCache(t, time.Now().Unix(), "https://other.example.com/realms/x", string(body))
 
-	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil); err != nil {
+	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if *hits != 1 {
@@ -183,7 +185,7 @@ func TestFetchCachedInvalidBodyRefetches(t *testing.T) {
 	body, _ := json.Marshal(bad)
 	plantCache(t, time.Now().Unix(), srv.URL, string(body))
 
-	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil)
+	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +204,7 @@ func TestFetchCachedFailedFetchNotCached(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil); err == nil {
+	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil); err == nil {
 		t.Fatal("FetchCached() should fail on 500")
 	}
 	if _, err := os.Stat(filepath.Join(dir, oidccache.DiscoveryFile)); !os.IsNotExist(err) {
@@ -216,7 +218,7 @@ func TestFetchCachedInvalidLiveDocNotCached(t *testing.T) {
 	bad["jwks_uri"] = "https://evil.attacker.example/certs"
 	srv, _ := discoveryServer(t, bad)
 
-	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil); err == nil {
+	if _, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, nil); err == nil {
 		t.Fatal("FetchCached() should reject off-issuer jwks_uri")
 	}
 	if _, err := os.Stat(filepath.Join(dir, oidccache.DiscoveryFile)); !os.IsNotExist(err) {
@@ -224,8 +226,11 @@ func TestFetchCachedInvalidLiveDocNotCached(t *testing.T) {
 	}
 }
 
-func TestFetchCachedWriteFailureIsNonFatal(t *testing.T) {
-	// Point the cache at a path under a regular file so MkdirAll fails.
+// A cache that cannot be written is reported at WARN with its path; the
+// validated live document is still used (the cache is no authentication source).
+func TestFetchCachedCacheWriteFailureWarns(t *testing.T) {
+	// Point the cache at a path under a regular file so MkdirAll fails even as
+	// root (a mode-0500 dir would not stop root).
 	base := t.TempDir()
 	blocker := filepath.Join(base, "file")
 	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
@@ -236,17 +241,18 @@ func TestFetchCachedWriteFailureIsNonFatal(t *testing.T) {
 	t.Cleanup(func() { oidccache.Dir = orig })
 
 	srv, hits := discoveryServer(t, validDiscoveryDoc())
-	logged := false
-	debugf := func(string, ...interface{}) { logged = true }
-	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, debugf)
+	var warned []string
+	warnf := func(format string, v ...interface{}) { warned = append(warned, fmt.Sprintf(format, v...)) }
+	ep, err := FetchCached(context.Background(), srv.Client(), srv.URL, nil, warnf)
 	if err != nil {
 		t.Fatalf("cache write failure must not fail the fetch: %v", err)
 	}
 	if ep == nil || *hits != 1 {
 		t.Errorf("expected live result with 1 request, got %v / %d", ep, *hits)
 	}
-	if !logged {
-		t.Error("cache write failure should be reported through debugf")
+	path := filepath.Join(oidccache.Dir, oidccache.DiscoveryFile)
+	if len(warned) != 1 || !strings.Contains(warned[0], path) {
+		t.Errorf("WARN lines = %q, want one naming %s", warned, path)
 	}
 }
 

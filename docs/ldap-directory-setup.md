@@ -5,14 +5,14 @@ via SSSD/NSS, the NSS best practice). pam-device-auth is the **OIDC SSH-login la
 on top. This is the only supported model, and the only one that works on
 **OpenSSH 10.2+**, which refuses PAM for users `getpwnam` cannot resolve.
 
-This guide covers LLDAP (the default `ldap.profile`, `lldap`). For an Active
-Directory, see [active-directory-setup.md](active-directory-setup.md).
+This guide covers LLDAP (`"profile": "lldap"` in the `ldap` block). For an
+Active Directory, see [active-directory-setup.md](active-directory-setup.md).
 
 ## Prerequisites (per host)
 
 1. **Directory CA trusted**: if the directory uses a private CA, install its
    certificate on the host (Debian/Ubuntu: `/usr/local/share/ca-certificates/` and
-   `update-ca-certificates`; RHEL family: `/etc/pki/ca-trust/source/anchors/` and
+   `update-ca-certificates`; Rocky Linux and Fedora: `/etc/pki/ca-trust/source/anchors/` and
    `update-ca-trust`). Verify:
    `echo | openssl s_client -connect ldap.example.com:636 -CApath /etc/ssl/certs | grep 'Verify return'` gives `0 (ok)`.
 2. **Network**: the host can reach the directory on its LDAPS port (636 for most
@@ -20,8 +20,8 @@ Directory, see [active-directory-setup.md](active-directory-setup.md).
 3. **DNS**: the name in `ldap.uri` resolves and matches a name or IP in the
    directory certificate's subject alternative names.
 4. **SSSD packages**: `sssd-ldap libnss-sss libpam-sss sssd-dbus sssd-tools` on Debian/Ubuntu,
-   `sssd sssd-ldap sssd-tools sssd-dbus authselect oddjob-mkhomedir` on the RHEL
-   family (`--setup-ldap` installs them if missing). `sssd-dbus` provides the SSSD
+   `sssd sssd-ldap sssd-tools sssd-dbus authselect oddjob-mkhomedir` on Rocky
+   Linux and Fedora (`--setup-ldap` installs them if missing). `sssd-dbus` provides the SSSD
    InfoPipe (`ifp`) responder. Without it sssd does not start, because `--setup-ldap`
    enables `ifp` in `sssd.conf`; `--check` reports a missing responder as a blocker.
 
@@ -84,11 +84,13 @@ PAM account phase and involves no token claim; see [ip-allowlist.md](ip-allowlis
 
 1. Place the config at `/etc/pam-device-auth/config.json` (start from
    `configs/config.json`): `required_role: ssh-access`,
-   `sudo_role: ssh-admin`, and the `ldap` block (uri, base_dn,
+   `sudo_role: ssh-admin`, and the `ldap` block (`profile: lldap`, uri, base_dn,
    bind_dn as a read-only LLDAP account in `lldap_strict_readonly`, bind_password,
    access_group, admin_group, and optionally service_account_groups /
-   nopasswd_sudo_groups). `chmod 600`.
-2. `sudo pam-device-auth --setup-ldap`: installs the SSSD packages if missing,
+   nopasswd_sudo_groups). `chmod 600`. `profile` is required.
+2. `sudo pam-device-auth --setup-ldap`: installs the SSSD packages if missing
+   (on Debian and Ubuntu after an `apt-get update` that must succeed) and
+   marks them as manually installed,
    writes `/etc/sssd/sssd.conf` (rfc2307bis, ldaps, `auth_provider=ldap` for sudo,
    `ldap_access_filter` covering access_group and any service_account_groups, the
    `[ifp]` responder), nsswitch (`sss`), `pam_mkhomedir`,
@@ -97,7 +99,10 @@ PAM account phase and involves no token claim; see [ip-allowlist.md](ip-allowlis
    responders it starts from the `services` line (Debian and Ubuntu enable them
    by preset; they would fail and leave systemd degraded), restarts sssd and
    resets the failed state of the `sssd-*` units. It does **not** restart
-   sshd or touch the OIDC layer.
+   sshd or touch the OIDC layer. Every step is checked: a failed step aborts
+   with a `FAIL:` line that names the command, what the rollback of
+   `sssd.conf` did and the changes that stay on the host
+   ([troubleshooting](troubleshooting.md#--setup-ldap-aborts-with-fail)).
 3. Verify: `getent -s sss passwd <user>` and `id <user>` resolve (access group
    primary, admin group secondary where applicable).
 4. `sudo pam-device-auth --enable`: activates the OIDC SSH layer (pam_device_auth.so),
@@ -195,10 +200,12 @@ control.
 
 ## Uninstall
 
-Removing the package restores `/etc/pam.d/sshd`, removes the sshd drop-in, and
-removes the managed sudoers file `/etc/sudoers.d/pam-device-auth`, so no NOPASSWD
-grant is left behind. This applies to both `.deb` (dpkg) and `.rpm` (dnf/rpm)
-installs.
+Removing the package restores `/etc/pam.d/sshd` from `/etc/pam.d/sshd.original`,
+removes the sshd drop-in, and removes the managed sudoers file
+`/etc/sudoers.d/pam-device-auth`, so no NOPASSWD grant is left behind. Without
+a valid `sshd.original` the removal is refused while `/etc/pam.d/sshd` uses
+the module ([INSTALL.md](../INSTALL.md#uninstall)). This applies to both
+`.deb` (dpkg) and `.rpm` (dnf/rpm) installs.
 
 ## Troubleshooting
 

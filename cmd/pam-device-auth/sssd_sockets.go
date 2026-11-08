@@ -64,26 +64,27 @@ func conflictingSSSDSockets(conf string) []string {
 // maskConflictingSSSDSockets disables, stops and masks the conflicting socket
 // units of conf (see conflictingSSSDSockets), so neither a reboot nor an sssd
 // package upgrade brings them back. Idempotent; a no-op where no socket
-// conflicts, as on the RHEL family.
-func maskConflictingSSSDSockets(conf string) {
+// conflicts, as on the RHEL family. The first failure stops the step and is
+// returned: a conflicting socket keeps failing and leaves systemd degraded.
+func maskConflictingSSSDSockets(conf string) error {
 	for _, u := range conflictingSSSDSockets(conf) {
 		if out, err := systemctl("disable", "--now", u); err != nil {
-			setupWarnf("disable %s failed (it keeps failing and leaves systemd degraded): %s: %v", u, out, err)
-			continue
+			return fmt.Errorf("systemctl disable --now %s: %s: %w", u, out, err)
 		}
 		if out, err := systemctl("mask", u); err != nil {
-			setupWarnf("mask %s failed (an sssd upgrade may enable it again): %s: %v", u, out, err)
-			continue
+			return fmt.Errorf("systemctl mask %s (an sssd upgrade may enable it again): %s: %w", u, out, err)
 		}
 		fmt.Printf("Masked %s (its responder runs from the sssd.conf services line)\n", u)
 	}
+	return nil
 }
 
 // resetFailedSSSDUnits clears a failed state the reconfiguration left on SSSD
 // units: sockets masked above, or sssd-ifp when a D-Bus request started it
 // before the restarted monitor took it over and it ran into its start limit.
-func resetFailedSSSDUnits() {
+func resetFailedSSSDUnits() error {
 	if out, err := systemctl("reset-failed", "sssd-*"); err != nil {
-		setupWarnf("systemctl reset-failed sssd-* failed: %s: %v", out, err)
+		return fmt.Errorf("systemctl reset-failed sssd-*: %s: %w", out, err)
 	}
+	return nil
 }

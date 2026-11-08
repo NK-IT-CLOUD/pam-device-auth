@@ -65,7 +65,8 @@ type LDAPConfig struct {
 	// NopasswdSudoGroups are LLDAP groups granted passwordless sudo (NOPASSWD:ALL).
 	// Opt-in and admin-declared; empty ⇒ only admin_group gets (password) sudo.
 	NopasswdSudoGroups []string `json:"nopasswd_sudo_groups,omitempty"`
-	// Profile selects the directory layout: "lldap" (default) or "ad".
+	// Profile selects the directory layout: "lldap" or "ad". Required by
+	// --setup-ldap and --check; there is no implicit value.
 	Profile string `json:"profile,omitempty"`
 	// CAFile overrides the distro CA bundle for ldap_tls_cacert.
 	CAFile string `json:"ca_file,omitempty"`
@@ -113,14 +114,6 @@ type KerberosConfig struct {
 	KDC     string `json:"kdc"`
 	Kpasswd string `json:"kpasswd,omitempty"`
 	Keytab  string `json:"keytab,omitempty"`
-}
-
-// ProfileName returns the configured profile, "lldap" when unset.
-func (l *LDAPConfig) ProfileName() string {
-	if l.Profile == "" {
-		return LDAPProfileLLDAP
-	}
-	return l.Profile
 }
 
 // Values of Config.RootLogin.

@@ -132,24 +132,47 @@ func busctlFailure(ctx context.Context, err error) string {
 // a variable so tests can stand in for the busctl/SSSD call.
 var readClients = busctlClients
 
+// newAcctLogger opens the --pam-acct log; a variable so tests can make it fail.
+var newAcctLogger = logger.NewLogger
+
+// acctExitInfraFailure is the --pam-acct exit code for "cannot decide" (no
+// audit log). The C module's acct_mgmt treats every code other than 0 (allow)
+// and 1 (per-user deny) as a helper-infrastructure failure: it logs it at
+// LOG_ERR and denies (fail closed). 2 is avoided (Go's panic exit, the auth
+// phase's hard deny), as is 127 (execl failed).
+const acctExitInfraFailure = 3
+
 // runPamAcct is the entry point for `--pam-acct`: the PAM account-phase hook
 // that enforces the directory-provided "clients" IP allowlist. It is
 // deliberately conservative: any internal surprise for a non-root user fails
 // closed (deny), while root is always exempt and never touches busctl/ifp.
 //
-// Returns 0 (allow) or 1 (deny); never panics or calls os.Exit itself, so it
-// stays unit-testable end to end except for the busctl subprocess call.
+// Returns 0 (allow), 1 (per-user deny) or acctExitInfraFailure; never panics
+// or calls os.Exit itself, so it stays unit-testable end to end except for the
+// busctl subprocess call.
 func runPamAcct() int {
 	debug := hasFlag(os.Args[1:], "--debug")
-	log, err := logger.NewLogger(logFile, debug)
+	user := os.Getenv("PAM_USER")
+	log, err := newAcctLogger(logFile, debug)
 	if err != nil {
-		// Logging infrastructure must never gate the security decision itself;
-		// fall back to a stderr-only logger (NewLogger("", ...) never fails).
-		log, _ = logger.NewLogger("", debug)
+		// NewLogger fails when the log cannot be opened (missing directory,
+		// symlink, immutable file, read-only filesystem, no space to create a
+		// missing file) or, when its mode is not 0640, set to 0640
+		// (append-only file, filesystem without chmod). An existing log on a
+		// full disk opens fine. Either way: no
+		// account decision without an audit log. The decision does not use the
+		// logger; the reason goes to stderr and syslog. root stays exempt from
+		// the account check.
+		if !requiresIPGate(user) {
+			reportLogFailure(logFailureMessage(err, "root is exempt, allowing"))
+			return 0
+		}
+		reportLogFailure(logFailureMessage(err, "denying"))
+		return acctExitInfraFailure
 	}
 	defer log.Close()
 
-	return pamAccount(log, os.Getenv("PAM_USER"), os.Getenv("PAM_RHOST"), readClients)
+	return pamAccount(log, user, os.Getenv("PAM_RHOST"), readClients)
 }
 
 // pamAccount is the decision logic of runPamAcct with its inputs injected: it

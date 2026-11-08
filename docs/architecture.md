@@ -32,11 +32,26 @@ The package is built with a single [nfpm](https://nfpm.goreleaser.com/) manifest
 (`nfpm.yaml`) that produces both the `.deb` and the `.rpm`, so the two
 distro packages come from the same file list with per-format overrides
 (the `.so` install path differs, everything else is shared). Distro
-differences at setup time (Debian/Ubuntu vs. RHEL family: package names,
-`pam-auth-update` vs. `authselect`, CA bundle path, `sss_ssh_authorizedkeys`
-location, PAM stack include token) are resolved once in `internal/distro`
-into a `Profile` struct, so `--setup-ldap` and the maintainer scripts branch
-on data instead of on distro name.
+differences at setup time (Debian/Ubuntu vs. Rocky Linux and Fedora: package
+names, the command that marks packages as manually installed, `pam-auth-update`
+vs. `authselect`, CA bundle path, the paths of `sss_ssh_authorizedkeys` and
+`sssd_ifp`, PAM template, sshd unit) are resolved once in `internal/distro`
+into a `Profile` struct, so `--setup-ldap`, `--check` and `--enable` branch on
+data instead of on distro name. `distro.Detect` reads `ID` and `VERSION_ID`
+from `/etc/os-release` and accepts exactly the supported table:
+
+| `ID` | `VERSION_ID` | Profile |
+|---|---|---|
+| `ubuntu` | 24.04 or later | debian |
+| `debian` | 13 or later | debian |
+| `rocky` | 9.x, 10.x | rhel |
+| `fedora` | 44 or later | rhel (with `dnf -y mark user`) |
+
+Anything else, including an unparsable `VERSION_ID`, is an error
+(`ID_LIKE` is not read); `--setup-ldap`, `--check` and `--enable` call it
+before they read the config. The package's `preinst` checks the same table
+before any file is unpacked, and `postinst`/`postrm` take the sshd unit from
+the same `ID` values.
 
 ## Authentication model
 
@@ -180,23 +195,28 @@ directory-provided `clients` source-IP/CIDR allowlist:
    `pam-device-auth --pam-acct`. This run is non-interactive: there is no
    PAM conversation, so no pipes are wired to the child beyond the closed
    fd table; the module only waits for an exit code.
-3. The helper (`cmd/pam-device-auth/acct.go`) reads the user's `clients`
+3. The helper (`cmd/pam-device-auth/acct.go`) opens its log first. If it
+   cannot open `/var/log/pam-device-auth.log` or set it to `0640`, there is no
+   audit log for the decision: it sends the reason to syslog (`authpriv`,
+   tag `pam-device-auth`, ending in `; denying`) and exits 3 without reading
+   `clients`. Otherwise it reads the user's `clients`
    attribute from SSSD over D-Bus (`busctl … GetUserAttr sas <user> 1
    clients`, the SSSD InfoPipe `ifp` responder) and compares it against
    `PAM_RHOST`.
 4. The module waits up to 7 seconds (`ACCT_TOTAL_TIMEOUT_S`) for the
-   helper. A timeout, a wait error, or any non-0/1 exit code (helper
-   crashed, `execl` itself failed) is treated as an infrastructure
-   failure and denies the login (fail-closed); exit 0 allows, exit 1 is a
-   clean per-user deny.
+   helper. A timeout, a wait error, or any non-0/1 exit code (exit 3 for an
+   unusable log, the helper crashed, `execl` itself failed) is treated as an
+   infrastructure failure, logged as `acct_mgmt: helper exited <n> (infra
+   failure) for user <user> from IP <ip> — denying login (fail-closed)`, and
+   denies the login; exit 0 allows, exit 1 is a clean per-user deny.
 
 Fail-closed means an SSSD/InfoPipe outage denies every directory user, not
 only the ones with a `clients` allowlist set, until InfoPipe recovers. Users
 with no `clients` attribute at all are unrestricted (allow). `pam-device-auth
 --check` reports IP-pin posture and InfoPipe health so operators can see this
 before it becomes an outage. Full details, including the SSSD `ifp`
-responder prerequisite (the `sssd-dbus` package on Debian, Ubuntu and the RHEL
-family) and the matching semantics shared with the auth-phase
+responder prerequisite (the `sssd-dbus` package on Debian, Ubuntu, Rocky Linux
+and Fedora) and the matching semantics shared with the auth-phase
 check, are in [ip-allowlist.md](ip-allowlist.md).
 
 ## C ↔ Go IPC protocol
@@ -247,8 +267,13 @@ process.
 
 These map the auth-phase helper's exit code to the PAM result sshd sees.
 The account-phase helper (`--pam-acct`) uses a different, simpler mapping:
-exit 0 allows, exit 1 is a per-user deny, anything else is treated as an
-infrastructure failure and denies (see [Account phase](#account-phase-the-clients-ip-gate) above).
+exit 0 allows, exit 1 is a per-user deny, anything else (the helper itself
+uses 3 for an unusable log) is treated as an infrastructure failure and
+denies (see [Account phase](#account-phase-the-clients-ip-gate) above).
+
+Before the auth-phase helper does anything else it opens its log; if it
+cannot open it or set it to `0640`, it reports the reason to syslog
+(`authpriv`, `...; denying login (fail closed)`) and exits 1 (`PAM_AUTH_ERR`).
 
 | Helper exit | PAM result | Meaning |
 |---|---|---|

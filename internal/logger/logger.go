@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -71,6 +72,14 @@ type Logger struct {
 	file   *os.File // track file handle for cleanup
 }
 
+// chmodLog sets the opened log file to 0640; a variable so tests can make it fail.
+var chmodLog = func(f *os.File) error { return f.Chmod(0640) }
+
+// ErrLogMode marks a NewLogger failure where the log file opened but its mode
+// could not be read, or was not 0640 and could not be set to 0640. The
+// wrapped *os.PathError names the operation and the path.
+var ErrLogMode = errors.New("cannot set log file mode 0640")
+
 // NewLogger creates a new logger instance
 func NewLogger(logFile string, debug bool) (*Logger, error) {
 	var writer io.Writer = os.Stderr
@@ -88,9 +97,22 @@ func NewLogger(logFile string, debug bool) (*Logger, error) {
 		}
 		// Defensive tightening for upgrades: existing log files created with
 		// earlier versions may have 0644. O_CREATE's mode only applies on
-		// creation, so re-chmod here to guarantee the invariant at runtime.
-		// Ignore EPERM (non-owner): postinst or logrotate will settle it.
-		_ = f.Chmod(0640)
+		// creation, so check the mode here and chmod only when it is not
+		// 0640: a log with the right mode is never chmod-ed (an append-only
+		// log, where chmod fails, keeps working). A wrong mode that cannot be
+		// corrected (append-only file, a filesystem without chmod support) is
+		// a misconfiguration: fail instead of writing PII into it.
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("%w: %w", ErrLogMode, err)
+		}
+		if fi.Mode().Perm() != 0640 {
+			if err := chmodLog(f); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("%w: %w", ErrLogMode, err)
+			}
+		}
 		writer = f
 		logFileHandle = f
 	}

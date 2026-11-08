@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/syslog"
 	"net"
 	"net/http"
@@ -43,8 +42,9 @@ func newOIDCClient() *http.Client {
 // runPreflight runs every pre-activation check, printing [OK]/[WARN]/[FAIL] per
 // item, and returns the count of blockers and warnings. It is shared by --check
 // (which adds the verdict) and --enable (which refuses to activate on a blocker).
-func runPreflight() (fails, warns int) {
-	cfg, err := config.Load("")
+// prof is the detected platform (requirePlatform).
+func runPreflight(prof distro.Profile) (fails, warns int) {
+	cfg, err := loadConfig("")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: config error: %v\n", err)
 		os.Exit(1)
@@ -94,9 +94,10 @@ func runPreflight() (fails, warns int) {
 
 	// --- Directory identity (SSSD/NSS) ---
 	fmt.Println("Directory (SSSD/NSS):")
-	chk(sssAuthorizedKeysCmd() != "", true,
+	sssErr := checkSSSAuthKeys(prof.SSSAuthKeysPath)
+	chk(sssErr == nil, true,
 		"sss_ssh_authorizedkeys present (publickey factor source)",
-		"sss_ssh_authorizedkeys not found; install sssd-ldap/libnss-sss; non-root publickey factor cannot work")
+		fmt.Sprintf("%v; non-root publickey factor cannot work", sssErr))
 	sssdConf := fileExists("/etc/sssd/sssd.conf")
 	chk(sssdConf, true,
 		"/etc/sssd/sssd.conf present",
@@ -117,10 +118,10 @@ func runPreflight() (fails, warns int) {
 			// An enabled ifp service without its binary makes sssd fail to start at
 			// its next restart, which takes the whole directory identity with it.
 			if sssdServicesInclude(string(conf), "ifp") {
-				ifpPath := sssdIfpPath()
-				chk(ifpPath != "", true,
-					"SSSD InfoPipe responder present: "+ifpPath,
-					"sssd.conf enables the 'ifp' service but sssd_ifp is not installed; sssd fails to start at its next restart and the directory identity goes with it; install the sssd-dbus package")
+				ifpErr := checkSSSDIfp(prof.SSSDIfpPath)
+				chk(ifpErr == nil, true,
+					"SSSD InfoPipe responder present: "+prof.SSSDIfpPath,
+					fmt.Sprintf("sssd.conf enables the 'ifp' service but %v; sssd fails to start at its next restart and the directory identity goes with it", ifpErr))
 			}
 			socks := conflictingSSSDSockets(string(conf))
 			chk(len(socks) == 0, false,
@@ -143,6 +144,8 @@ func runPreflight() (fails, warns int) {
 		chk(uok, true, uokMsg, ubadMsg)
 		pok, pokMsg, pbadMsg := ldapProfileCheck(cfg.LDAP)
 		chk(pok, true, pokMsg, pbadMsg)
+		sok, sokMsg, sbadMsg := ldapShellCheck(cfg.LDAP)
+		chk(sok, true, sokMsg, sbadMsg)
 		if cfg.LDAP.CAFile != "" {
 			cok, cokMsg, cbadMsg := caFileCheck(cfg.LDAP.CAFile)
 			chk(cok, true, cokMsg, cbadMsg)
@@ -167,7 +170,7 @@ func runPreflight() (fails, warns int) {
 			// satisfy the publickey factor and are locked out of non-root login after
 			// --enable. "invalid" = present but not parseable as an SSH key (sshd rejects).
 			if gerr == nil && len(members) > 0 {
-				warns += reportMemberKeyStatus(members,
+				warns += reportMemberKeyStatus(prof.SSSAuthKeysPath, members,
 					fmt.Sprintf("all %d access-group member(s) have a valid sshPublicKey (publickey factor)", len(members)),
 					"%d of %d member(s) have NO sshPublicKey; locked out of non-root login until set: %s",
 					"%d of %d member(s) have an UNPARSEABLE sshPublicKey; sshd will reject it: %s")
@@ -182,7 +185,7 @@ func runPreflight() (fails, warns int) {
 			// factor (no OIDC/2FA fallback), so a member with no valid sshPublicKey is
 			// completely locked out. Warn-only: never blocks --enable.
 			if gerr == nil && len(members) > 0 {
-				warns += reportMemberKeyStatus(members,
+				warns += reportMemberKeyStatus(prof.SSSAuthKeysPath, members,
 					fmt.Sprintf("all %d member(s) of service group %q have a valid sshPublicKey (key-only factor)", len(members), g),
 					fmt.Sprintf("%%d of %%d member(s) of service group %q have NO sshPublicKey; locked out (key-only tier): %%s", g),
 					fmt.Sprintf("%%d of %%d member(s) of service group %q have an UNPARSEABLE sshPublicKey; sshd will reject it: %%s", g))
@@ -365,7 +368,8 @@ func runPreflight() (fails, warns int) {
 
 // runCheck runs the preflight and prints the verdict; exits non-zero on a blocker.
 func runCheck() {
-	fails, warns := runPreflight()
+	prof := requirePlatform()
+	fails, warns := runPreflight(prof)
 	fmt.Println()
 	if isEnabled() {
 		fmt.Println("Activation: pam-device-auth is already active (pam_device_auth.so in /etc/pam.d/sshd).")
@@ -420,7 +424,18 @@ func ldapProfileCheck(l *config.LDAPConfig) (ok bool, okMsg, badMsg string) {
 	if err := validateLDAPProfile(l); err != nil {
 		return false, "", err.Error()
 	}
-	return true, "profile " + l.ProfileName(), ""
+	return true, "profile " + l.Profile, ""
+}
+
+// ldapShellCheck is the --check result for the login shell of directory users
+// (ldap.shell or the default): checkLDAPShell, the check --setup-ldap runs,
+// including the absolute-path rule before the file is looked at.
+func ldapShellCheck(l *config.LDAPConfig) (ok bool, okMsg, badMsg string) {
+	sh := ldapShell(l)
+	if err := checkLDAPShell(sh); err != nil {
+		return false, "", err.Error()
+	}
+	return true, "login shell " + sh + " is executable", ""
 }
 
 // caFileCheck is the --check result for ldap.ca_file, with the rule
@@ -460,18 +475,20 @@ func accessGroupFailMessage(group string) string {
 // fileExists reports whether the path exists.
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
-// sssAuthorizedKeysCmd returns the path to sss_ssh_authorizedkeys, or "".
-func sssAuthorizedKeysCmd() string {
-	for _, p := range []string{
-		"/usr/bin/sss_ssh_authorizedkeys",
-		"/usr/libexec/sssd/sss_ssh_authorizedkeys",
-		"/usr/sbin/sss_ssh_authorizedkeys",
-	} {
-		if fileExists(p) {
-			return p
-		}
+// checkSSSAuthKeys verifies that path (the platform's sss_ssh_authorizedkeys,
+// distro.Profile.SSSAuthKeysPath) is a regular file executable by its owner:
+// sshd runs it as AuthorizedKeysCommand to fetch the directory key.
+func checkSSSAuthKeys(path string) error {
+	fi, err := os.Stat(path)
+	switch {
+	case err != nil:
+		return fmt.Errorf("sss_ssh_authorizedkeys %s: %w (shipped by the sssd-common package)", path, err)
+	case !fi.Mode().IsRegular():
+		return fmt.Errorf("sss_ssh_authorizedkeys %s is not a regular file (%s); reinstall the sssd-common package", path, fi.Mode().Type())
+	case fi.Mode().Perm()&0100 == 0:
+		return fmt.Errorf("sss_ssh_authorizedkeys %s is not executable (mode %s); reinstall the sssd-common package", path, fi.Mode().Perm())
 	}
-	return ""
+	return nil
 }
 
 // serviceActive reports whether a systemd unit is active.
@@ -495,18 +512,14 @@ func getentGroup(name string) ([]string, error) {
 }
 
 // userKeyStatus classifies the directory SSH key for a user, as sshd would see
-// it via sss_ssh_authorizedkeys:
+// it via sss_ssh_authorizedkeys (keysCmd):
 //
 //	"none"    — no key returned
 //	"error"   — sss_ssh_authorizedkeys failed (SSSD down, unknown user): the key state is unknown
 //	"invalid" — a key is returned but it does not parse as an SSH public key
 //	"ok"      — at least one parseable key (the user can satisfy the publickey factor)
-func userKeyStatus(user string) string {
-	cmd := sssAuthorizedKeysCmd()
-	if cmd == "" {
-		return "none"
-	}
-	out, err := exec.Command(cmd, user).Output()
+func userKeyStatus(keysCmd, user string) string {
+	out, err := exec.Command(keysCmd, user).Output()
 	if err != nil {
 		return "error"
 	}
@@ -535,14 +548,15 @@ func classifyMembers(members []string, status func(string) string) (noKey, badKe
 }
 
 // reportMemberKeyStatus classifies each member's sshPublicKey via userKeyStatus
-// and prints an [OK]/[WARN] summary, returning the number of warnings raised
-// (0 to 3, one per non-empty noKey/badKey/lookup-error bucket). okMsg is printed
+// (keysCmd is the sss_ssh_authorizedkeys path) and prints an [OK]/[WARN]
+// summary, returning the number of warnings raised (0 to 3, one per non-empty
+// noKey/badKey/lookup-error bucket). okMsg is printed
 // verbatim when every member has a valid key; noKeyFmt/badKeyFmt are
 // Printf-style formats consuming (badCount, totalCount, joinedNames) for the
 // "none" and "invalid" buckets. Members whose key lookup itself failed are
 // reported separately: their key state is unknown, not absent.
-func reportMemberKeyStatus(members []string, okMsg, noKeyFmt, badKeyFmt string) int {
-	noKey, badKey, errKey := classifyMembers(members, userKeyStatus)
+func reportMemberKeyStatus(keysCmd string, members []string, okMsg, noKeyFmt, badKeyFmt string) int {
+	noKey, badKey, errKey := classifyMembers(members, func(user string) string { return userKeyStatus(keysCmd, user) })
 	if len(noKey) == 0 && len(badKey) == 0 && len(errKey) == 0 {
 		fmt.Printf("  [OK]   %s\n", okMsg)
 		return 0
@@ -653,19 +667,46 @@ func isEnabled() bool {
 	return strings.Contains(string(data), "pam_device_auth.so")
 }
 
-// backupFile copies src to dst, but only when dst does not already exist (an
-// existing backup is the pristine original and must never be overwritten with
-// an already-modified config). It reports whether a backup was written. A
-// missing src is "nothing to back up" (no error). Everything that leaves the
-// operator without a usable rollback copy is returned as an error so the caller
-// can warn: an unreadable src or dst, a failed write, an existing backup that
-// already contains pam_device_auth.so, or a src that already contains it with
-// no backup (nothing pristine left to save).
+// errNoPristinePAM marks a backupFile error where no pristine PAM stack is
+// left to save or keep (as opposed to an I/O failure): the operator has to
+// restore /etc/pam.d/sshd by hand.
+var errNoPristinePAM = errors.New("no pristine PAM config")
+
+// pristinePAMError says why data cannot serve as the rollback copy of a PAM
+// stack, by the rule of valid_backup in debian/prerm and debian/postrm: it must
+// be non-empty, have a line that starts with "auth" or "@include" (the Debian
+// default has only '@include common-auth') and must not use pam_device_auth.so.
+// nil means data is a valid rollback copy.
+func pristinePAMError(data []byte) error {
+	s := string(data)
+	switch {
+	case len(data) == 0:
+		return errors.New("it is empty")
+	case strings.Contains(s, "pam_device_auth.so"):
+		return errors.New("it contains pam_device_auth.so")
+	}
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "auth") || strings.HasPrefix(line, "@include") {
+			return nil
+		}
+	}
+	return errors.New("it has no line starting with auth or @include")
+}
+
+// backupFile copies the PAM stack src to dst, but only when dst does not
+// already exist (an existing backup is the pristine original and must never be
+// overwritten with an already-modified config). It reports whether a backup
+// was written. On success dst is a valid rollback copy (pristinePAMError), the
+// one the package's prerm requires before it lets the package go. Everything
+// else is an error: an existing dst or a src that is not a valid copy and a
+// missing src (openssh-server ships /etc/pam.d/sshd on every supported
+// platform) wrap errNoPristinePAM; an unreadable src or dst and a failed write
+// do not.
 func backupFile(src, dst string) (bool, error) {
 	existing, err := os.ReadFile(dst)
 	if err == nil {
-		if strings.Contains(string(existing), "pam_device_auth.so") {
-			return false, fmt.Errorf("existing backup %s already contains pam_device_auth.so; it is not a pristine original", dst)
+		if perr := pristinePAMError(existing); perr != nil {
+			return false, fmt.Errorf("%w: existing backup %s is not a valid rollback copy: %v", errNoPristinePAM, dst, perr)
 		}
 		return false, nil
 	}
@@ -673,14 +714,14 @@ func backupFile(src, dst string) (bool, error) {
 		return false, fmt.Errorf("cannot check existing backup %s: %w", dst, err)
 	}
 	data, err := os.ReadFile(src)
+	if os.IsNotExist(err) {
+		return false, fmt.Errorf("%w: %s does not exist (the openssh-server package ships it)", errNoPristinePAM, src)
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
 		return false, fmt.Errorf("cannot read %s: %w", src, err)
 	}
-	if strings.Contains(string(data), "pam_device_auth.so") {
-		return false, fmt.Errorf("%s already contains pam_device_auth.so and no backup exists; no pristine original to save", src)
+	if perr := pristinePAMError(data); perr != nil {
+		return false, fmt.Errorf("%w: %s is not a valid rollback copy and no backup exists: %v", errNoPristinePAM, src, perr)
 	}
 	if err := atomicWriteFile(dst, data, 0644); err != nil {
 		return false, err
@@ -690,10 +731,9 @@ func backupFile(src, dst string) (bool, error) {
 
 // dropinNeedsRender reports whether --enable must (re)render the sshd drop-in:
 // when it is missing, or when it does not reference the resolved
-// sss_ssh_authorizedkeys path. The latter catches a stale drop-in left by an
-// older version (for example a hardcoded /usr/bin path on RHEL-family hosts,
-// where the binary lives in /usr/libexec/sssd), which would otherwise leave
-// sshd serving no directory key.
+// sss_ssh_authorizedkeys path. The latter catches a stale drop-in that names
+// another AuthorizedKeysCommand path, which would otherwise leave sshd serving
+// no directory key.
 func dropinNeedsRender(path, sssCmd, rootLogin string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -737,21 +777,14 @@ func sssdServicesInclude(conf, service string) bool {
 	return false
 }
 
-// sssdIfpPath returns the path of the InfoPipe responder binary, or "" when no
-// package provides it. It lives in the sssd-dbus package on Debian, Ubuntu and
-// the RHEL family.
-func sssdIfpPath() string {
-	for _, p := range []string{
-		"/usr/libexec/sssd/sssd_ifp",
-		"/usr/lib/x86_64-linux-gnu/sssd/sssd_ifp",
-		"/usr/lib/sssd/sssd_ifp",
-		"/usr/lib64/sssd/sssd_ifp",
-	} {
-		if fileExists(p) {
-			return p
-		}
+// checkSSSDIfp verifies that path (the platform's InfoPipe responder,
+// distro.Profile.SSSDIfpPath) exists. It ships in the sssd-dbus package on
+// Debian, Ubuntu and the RHEL family alike.
+func checkSSSDIfp(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("SSSD InfoPipe responder %s: %w; install the sssd-dbus package", path, err)
 	}
-	return ""
+	return nil
 }
 
 // rootLoginCheck judges root's effective SSH policy against the configured
@@ -866,17 +899,6 @@ func sssdClientsExposure(conf string) (extraAttrs, ifp bool) {
 	return extraAttrs, ifp
 }
 
-// pamTemplateName returns the basename of the sshd PAM stack template to
-// activate for the given distro Profile: RHEL-family hosts get the
-// authselect/password-auth-based stack, everyone else gets the Debian
-// common-auth-based stack.
-func pamTemplateName(prof distro.Profile) string {
-	if prof.Family == "rhel" {
-		return "pam-sshd-device-auth-rhel"
-	}
-	return "pam-sshd-device-auth"
-}
-
 // commandRunner runs a command and returns its combined output; a seam so the
 // enable steps can be tested without touching systemd.
 type commandRunner func(name string, args ...string) ([]byte, error)
@@ -889,32 +911,45 @@ func execRunner(name string, args ...string) ([]byte, error) {
 // drop-in are already written but sshd still runs the old configuration.
 var errSSHRestart = errors.New("sshd was NOT restarted")
 
-// restartSSH restarts the sshd unit: ssh.service on Debian/Ubuntu, sshd.service
-// on RHEL-family hosts. The error carries both units' output.
-func restartSSH(run commandRunner) error {
-	out1, err1 := run("systemctl", "restart", "ssh.service")
-	if err1 == nil {
-		return nil
+// restartSSH restarts unit, the platform's sshd unit (distro.Profile.SSHService).
+// The error carries the unit's output.
+func restartSSH(run commandRunner, unit string) error {
+	if out, err := run("systemctl", "restart", unit); err != nil {
+		return fmt.Errorf("%w (%s: %s: %v)", errSSHRestart, unit, strings.TrimSpace(string(out)), err)
 	}
-	out2, err2 := run("systemctl", "restart", "sshd.service")
-	if err2 == nil {
-		return nil
-	}
-	return fmt.Errorf("%w (ssh.service: %s; sshd.service: %s)", errSSHRestart,
-		strings.TrimSpace(string(out1)), strings.TrimSpace(string(out2)))
+	return nil
 }
 
-// activatePAM backs up the original PAM stack (a failed backup only warns on
-// warn: activation must stay possible, but the operator must know the rollback
-// copy is missing) and installs the template atomically, so a crash or full
-// disk can never leave a truncated PAM stack that also breaks root's
-// break-glass login.
-func activatePAM(pamConf, pamBackup, pamSrc string, warn io.Writer) error {
-	if didBackup, err := backupFile(pamConf, pamBackup); err != nil {
-		fmt.Fprintf(warn, "[WARN] could not back up %s to %s: %v\n", pamConf, pamBackup, err)
-	} else if didBackup {
+// backupPAM is the first step of --enable: it saves the pristine PAM stack
+// pamConf to pamBackup, or keeps a valid existing backup (a re-run of
+// --enable). Without a valid rollback copy the package can never be removed
+// (prerm refuses), so every failure is an error before anything else is
+// written; when no pristine stack is left, the message names the manual step.
+// A backup that is in place but whose directory sync failed is a valid copy,
+// and the message says so.
+func backupPAM(pamConf, pamBackup string) error {
+	didBackup, err := backupFile(pamConf, pamBackup)
+	if errors.Is(err, errNoPristinePAM) {
+		return fmt.Errorf("cannot back up %s to %s: %w; nothing was changed: restore %s from your distribution's openssh-server package, remove any %s that is not a copy of it, then run 'pam-device-auth --enable' again",
+			pamConf, pamBackup, err, pamConf, pamBackup)
+	}
+	if errors.Is(err, errWrittenNotSynced) {
+		return fmt.Errorf("cannot back up %s to %s: %w; %s is in place as a valid copy of %s; nothing else was changed, run 'pam-device-auth --enable' again",
+			pamConf, pamBackup, err, pamBackup, pamConf)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot back up %s to %s: %w; nothing was changed", pamConf, pamBackup, err)
+	}
+	if didBackup {
 		fmt.Println("Backed up original PAM config")
 	}
+	return nil
+}
+
+// activatePAM installs the template pamSrc as pamConf atomically, so a crash
+// or full disk can never leave a truncated PAM stack that also breaks root's
+// break-glass login. backupPAM has saved the original before.
+func activatePAM(pamConf, pamSrc string) error {
 	data, err := os.ReadFile(pamSrc)
 	if err != nil {
 		return fmt.Errorf("cannot read %s: %w", pamSrc, err)
@@ -926,19 +961,45 @@ func activatePAM(pamConf, pamBackup, pamSrc string, warn io.Writer) error {
 	return nil
 }
 
+// detectPlatform, loadConfig, runPreflightFn and runEnableStepsFn are stages of
+// --enable, --check and --setup-ldap; seams so a test can run the commands
+// with every side-effecting stage stubbed out.
+var (
+	detectPlatform   = distro.Detect
+	loadConfig       = config.Load
+	runPreflightFn   = runPreflight
+	runEnableStepsFn = runEnableSteps
+)
+
+// requirePlatform is the first step of --enable, --check and --setup-ldap: it
+// returns the Profile of a supported platform and refuses everything else
+// before any command reads the config or touches the host.
+func requirePlatform() distro.Profile {
+	prof, err := detectPlatform()
+	if err != nil {
+		fail("%v", err)
+	}
+	return prof
+}
+
 // enableSteps are the side-effecting activation steps of --enable, injectable
 // so the ordering contract is testable.
 type enableSteps struct {
+	backupPAM    func() error
 	renderDropin func() error
 	activatePAM  func() error
 	restartSSH   func() error
 }
 
-// runEnableSteps runs the steps in the only safe order: the sshd drop-in must
-// be valid before the PAM stack is switched, and sshd is restarted last. A
-// failing step stops the sequence: a rejected drop-in must never be followed by
-// a PAM switch or an sshd restart.
+// runEnableSteps runs the steps in the only safe order: the PAM backup comes
+// first (without a valid rollback copy nothing is written), the sshd drop-in
+// must be valid before the PAM stack is switched, and sshd is restarted last.
+// A failing step stops the sequence: a rejected drop-in must never be
+// followed by a PAM switch or an sshd restart.
 func runEnableSteps(s enableSteps) error {
+	if err := s.backupPAM(); err != nil {
+		return err
+	}
 	if err := s.renderDropin(); err != nil {
 		return err
 	}
@@ -949,10 +1010,14 @@ func runEnableSteps(s enableSteps) error {
 }
 
 func runEnable() {
+	// Refuse an unsupported platform first, before preflight and before any
+	// step writes the sshd drop-in or the PAM stack.
+	prof := requirePlatform()
+
 	// Run the full preflight and refuse to activate on any blocker, so --enable
 	// never wires PAM/sshd against a MITM'd issuer or a directory that cannot
 	// resolve users / serve keys (which would lock non-root users out).
-	if fails, _ := runPreflight(); fails > 0 {
+	if fails, _ := runPreflightFn(prof); fails > 0 {
 		fmt.Fprintf(os.Stderr, "\nFAIL: %d blocker(s); refusing to activate. Fix the [FAIL] items above (see --check).\n", fails)
 		os.Exit(1)
 	}
@@ -960,7 +1025,7 @@ func runEnable() {
 
 	// runPreflight already loaded and validated the config; reload it here for
 	// the service-group list the sshd drop-in needs.
-	cfg, err := config.Load("")
+	cfg, err := loadConfig("")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: config error: %v\n", err)
 		os.Exit(1)
@@ -972,19 +1037,20 @@ func runEnable() {
 
 	shareDir := "/usr/share/pam-device-auth/config"
 	sshdConf := sshdDropinPath
-	sssCmd := sssAuthorizedKeysCmd()
+	sssCmd := prof.SSSAuthKeysPath
 
-	err = runEnableSteps(enableSteps{
-		// Render the drop-in from the resolved sss_ssh_authorizedkeys path
-		// (RHEL ships it under /usr/libexec/sssd) instead of copying the
-		// packaged template, which hardcodes /usr/bin. writeSshdDropin validates
+	err = runEnableStepsFn(enableSteps{
+		backupPAM: func() error { return backupPAM("/etc/pam.d/sshd", "/etc/pam.d/sshd.original") },
+		// Render the drop-in from the platform's sss_ssh_authorizedkeys path
+		// (distro.Profile.SSSAuthKeysPath) instead of copying the packaged
+		// template, so it matches the checked binary. writeSshdDropin validates
 		// with `sshd -t` and rolls back on rejection.
 		renderDropin: func() error {
 			if !dropinNeedsRender(sshdConf, sssCmd, cfg.RootLogin) {
 				return nil
 			}
-			if sssCmd == "" {
-				return errors.New("sss_ssh_authorizedkeys not found; run --setup-ldap first")
+			if err := checkSSSAuthKeys(sssCmd); err != nil {
+				return fmt.Errorf("%w; run --setup-ldap first", err)
 			}
 			var serviceGroups []string
 			if cfg.LDAP != nil {
@@ -997,15 +1063,14 @@ func runEnable() {
 			return nil
 		},
 		activatePAM: func() error {
-			return activatePAM("/etc/pam.d/sshd", "/etc/pam.d/sshd.original",
-				shareDir+"/"+pamTemplateName(distro.Detect()), os.Stderr)
+			return activatePAM("/etc/pam.d/sshd", shareDir+"/"+prof.PamTemplate)
 		},
-		restartSSH: func() error { return restartSSH(execRunner) },
+		restartSSH: func() error { return restartSSH(execRunner, prof.SSHService) },
 	})
 	if errors.Is(err, errSSHRestart) {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
 		fmt.Fprintln(os.Stderr, "pam-device-auth is NOT fully active: the PAM config and sshd drop-in are written, but sshd still runs the old configuration.")
-		fmt.Fprintln(os.Stderr, "Run: systemctl restart ssh (or sshd), then 'pam-device-auth --check'.")
+		fmt.Fprintf(os.Stderr, "Run: systemctl restart %s, then 'pam-device-auth --check'.\n", prof.SSHService)
 		os.Exit(1)
 	}
 	if err != nil {
@@ -1043,12 +1108,13 @@ func main() {
 			fmt.Printf("pam-device-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--check] [--setup-ldap] [--enable] [--pam-acct] [--help]")
+			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--check] [--setup-ldap] [--enable] [--migrate-config] [--pam-acct] [--help]")
 			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
 			fmt.Println("")
 			fmt.Println("  --check       Pre-activation preflight: config, OIDC, directory/SSSD, sshd factors")
 			fmt.Println("  --setup-ldap  Configure the SSSD directory identity from config (NSS + sudo)")
 			fmt.Println("  --enable      Activate PAM authentication (runs --check first)")
+			fmt.Println("  --migrate-config  Set ldap.profile = \"lldap\" in a 0.6.x config that has none (run by the package on upgrade)")
 			fmt.Println("  --pam-acct    Run the PAM account-phase IP allowlist gate")
 			fmt.Println("  --debug       Run with debug logging")
 			fmt.Println("  --version     Show version")
@@ -1062,6 +1128,8 @@ func main() {
 		case "--enable":
 			runEnable()
 			os.Exit(0)
+		case "--migrate-config":
+			os.Exit(runMigrateConfig(config.DefaultConfigPath, os.Stdout, os.Stderr))
 		case "--pam-acct":
 			os.Exit(runPamAcct())
 		}
@@ -1072,7 +1140,7 @@ func main() {
 		// Fail closed (no audit log, no login), but not invisibly: sshd discards
 		// our stderr and the C side only sees "exit code 1", so also send the
 		// reason to syslog (authpriv).
-		reportLogInitFailure(err)
+		reportLogFailure(logFailureMessage(err, "denying login (fail closed)"))
 		os.Exit(1)
 	}
 	defer log.Close()
@@ -1104,7 +1172,7 @@ func main() {
 	// root-only metadata cache when fresh; a cached document runs through the
 	// same validation and the issuer pin below exactly like a live one.
 	discoveryCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	endpoints, err := discovery.FetchCached(discoveryCtx, httpClient, cfg.IssuerURL, log.Debug)
+	endpoints, err := discovery.FetchCached(discoveryCtx, httpClient, cfg.IssuerURL, log.Debug, log.Warn)
 	cancel()
 	if err != nil {
 		log.Error("OIDC Discovery failed: %v", err)
@@ -1136,17 +1204,30 @@ func canRenderQR(url string) bool {
 	return len(url) <= qrMaxURLBytes
 }
 
-// logInitFailureMessage is the text reported when the auth log cannot be opened.
-func logInitFailureMessage(err error) string {
-	return fmt.Sprintf("pam-device-auth: cannot open %s: %v; denying login (fail closed)", logFile, err)
+// logFailureMessage is the text reported when logger.NewLogger(logFile) fails;
+// outcome says what the caller does about it. NewLogger fails either opening
+// the file or, when its mode is not 0640, setting it to 0640
+// (logger.ErrLogMode, whose wrapped *os.PathError already names chmod and the
+// path).
+func logFailureMessage(err error, outcome string) string {
+	if errors.Is(err, logger.ErrLogMode) {
+		return fmt.Sprintf("pam-device-auth: %v; %s", err, outcome)
+	}
+	return fmt.Sprintf("pam-device-auth: cannot open %s: %v; %s", logFile, err, outcome)
 }
 
-// reportLogInitFailure writes logInitFailureMessage to stderr and, best effort,
-// to syslog so an operator can find out why every login is being denied.
-func reportLogInitFailure(err error) {
-	msg := logInitFailureMessage(err)
+// reportLogFailure writes msg to stderr and, best effort, to syslog: sshd
+// discards the helper's stderr, so syslog is where an operator finds out why
+// logins are being denied.
+func reportLogFailure(msg string) {
 	fmt.Fprintln(os.Stderr, msg)
-	if w, serr := syslog.New(syslog.LOG_AUTHPRIV|syslog.LOG_ERR, "pam-device-auth"); serr == nil {
+	syslogAuthErr(msg)
+}
+
+// syslogAuthErr sends msg to syslog (authpriv, err), best effort; a variable so
+// tests do not write the host's syslog.
+var syslogAuthErr = func(msg string) {
+	if w, err := syslog.New(syslog.LOG_AUTHPRIV|syslog.LOG_ERR, "pam-device-auth"); err == nil {
 		_ = w.Err(msg)
 		_ = w.Close()
 	}

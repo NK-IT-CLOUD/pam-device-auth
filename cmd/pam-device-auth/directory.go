@@ -56,8 +56,8 @@ func directoryAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.
 
 // tryCachedDirectory uses a cached refresh token for a known IP to re-validate
 // with the IdP without a browser round-trip. Returns true on success. A soft
-// failure (network, expired refresh) returns false to fall back to the device
-// flow; a genuine access denial on a known IP (role revoked, IP removed) is a
+// failure (network, expired refresh) returns false: device flow required; a
+// genuine access denial on a known IP (role revoked, IP removed) is a
 // hard deny (exit 2) — no point re-prompting.
 func tryCachedDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser, clientIP string) bool {
 	success := false
@@ -86,7 +86,7 @@ func tryCachedDirectory(log *logger.Logger, cfg *config.Config, httpClient *http
 				return cache.Delete(sshUser)
 			}
 			// Network error or IdP outage: the refresh token may still be good,
-			// so keep the cached session and fall back to the device flow once.
+			// so keep the cached session; device flow required for this login.
 			log.Warn("Directory: token refresh failed, keeping cached session (device auth): %v", err)
 			return nil
 		}
@@ -237,7 +237,7 @@ func rememberDeviceLogin(log *logger.Logger, sshUser, refreshToken, clientIP str
 // can distinguish "bad token" from "denied".
 func validateDirectoryToken(log *logger.Logger, httpClient *http.Client, endpoints *discovery.Endpoints, cfg *config.Config, accessToken, sshUser string) (*token.TokenResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	keys, cached, err := token.FetchJWKSCached(ctx, httpClient, endpoints.JwksURI, cfg.IssuerURL, log.Debug)
+	keys, cached, err := token.FetchJWKSCached(ctx, httpClient, endpoints.JwksURI, cfg.IssuerURL, log.Debug, log.Warn)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("JWKS fetch: %w", err)
@@ -251,7 +251,7 @@ func validateDirectoryToken(log *logger.Logger, httpClient *http.Client, endpoin
 		// kid, is final and must not trigger network traffic.
 		log.Debug("JWKS cache has no key for token kid, refetching live")
 		ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-		keys, err = token.RefreshJWKS(ctx, httpClient, endpoints.JwksURI, cfg.IssuerURL, log.Debug)
+		keys, err = token.RefreshJWKS(ctx, httpClient, endpoints.JwksURI, cfg.IssuerURL, log.Warn)
 		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("JWKS fetch: %w", err)

@@ -227,8 +227,8 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, data ur
 	if client == nil {
 		// Match the hardened default used elsewhere: block redirects so a 3xx
 		// cannot re-send the POST body (device_code / refresh_token) to a
-		// redirect target. Production always passes newOIDCClient(); this keeps
-		// the safe behavior even on the nil-client fallback path.
+		// redirect target. Production always passes newOIDCClient(); a nil
+		// client gets this hardened default client with the same behavior.
 		client = &http.Client{
 			Timeout: DefaultHTTPTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {

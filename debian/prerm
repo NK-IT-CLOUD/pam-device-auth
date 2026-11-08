@@ -1,0 +1,57 @@
+#!/bin/sh
+# prerm for .deb and .rpm (nfpm "preremove", i.e. rpm %preun). It runs before
+# any file is removed, so refusing here leaves the package and sshd as they are.
+set -e
+
+PKG="pam-device-auth"
+ORIG=/etc/pam.d/sshd.original
+
+err() { echo "[${PKG}] ERROR: $*" >&2; }
+
+# valid_backup: sshd.original is non-empty, looks like a PAM config and is not
+# itself a pam-device-auth stack. The Debian default authenticates via
+# '@include common-auth' and has no literal 'auth' line, so '^@include' counts.
+# Same rule as restore_pam in postrm.
+valid_backup() {
+    [ -s "$ORIG" ] && grep -qE '^(auth|@include)' "$ORIG" && ! grep -q 'pam_device_auth.so' "$ORIG"
+}
+
+# check_removal: postrm can only make /etc/pam.d/sshd safe by restoring a valid
+# sshd.original. Without one, removing the module would leave sshd pointing at
+# a missing pam_device_auth.so, so the removal is refused here.
+check_removal() {
+    [ -e /etc/pam.d/sshd ] || return 0
+    _rc=0
+    grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?
+    case "$_rc" in
+        0) ;;
+        1) return 0 ;;
+        *)
+            err "cannot read /etc/pam.d/sshd (grep exit $_rc)"
+            exit 1
+            ;;
+    esac
+    valid_backup && return 0
+    echo "${PKG}: /etc/pam.d/sshd uses pam_device_auth.so and no valid /etc/pam.d/sshd.original exists; restore /etc/pam.d/sshd from your distribution's openssh-server package, then remove pam-device-auth" >&2
+    exit 1
+}
+
+# deb: remove [in-favour <package> <version>] | upgrade <new-version> |
+#      failed-upgrade <old-version> [<new-version>] | deconfigure in-favour ...
+# rpm %preun: 0 = erase, 1 = upgrade (this old version is replaced; the new
+#      version's %post has already run)
+case "$1" in
+    remove | 0)
+        check_removal
+        ;;
+    upgrade | failed-upgrade | deconfigure | 1)
+        # The package stays (replaced by a newer version, or deconfigured
+        # with its files in place): nothing is removed, nothing to check.
+        ;;
+    *)
+        err "prerm called with unknown argument \"$1\""
+        exit 1
+        ;;
+esac
+
+exit 0

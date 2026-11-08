@@ -1,0 +1,103 @@
+#!/bin/sh
+# preinst for .deb and .rpm (nfpm "preinstall", i.e. rpm %pre). It runs
+# before the new files are unpacked, so refusing here leaves an installed
+# version and sshd untouched.
+set -e
+
+PKG="pam-device-auth"
+
+err() { echo "[${PKG}] ERROR: $*" >&2; }
+
+# valid_version V: V is dot-separated, non-empty decimal components that the
+# shell can compare (internal/distro parseVersion: strconv.Atoi per part).
+valid_version() {
+    case "$1" in
+        '' | .* | *. | *..* | *[!0-9.]*) return 1 ;;
+    esac
+    _rest=$1
+    while [ -n "$_rest" ]; do
+        _part=${_rest%%.*}
+        case "$_rest" in
+            *.*) _rest=${_rest#*.} ;;
+            *) _rest= ;;
+        esac
+        # test(1) refuses a number outside intmax_t, where Atoi overflows too;
+        # its message is replaced by the unsupported-distribution error.
+        [ "$_part" -eq "$_part" ] 2>/dev/null || return 1
+    done
+}
+
+# version_ge V MIN: V >= MIN, compared component by component; a missing
+# component counts as 0 ("10" == "10.0"). Both must pass valid_version.
+version_ge() {
+    _v=$1
+    _m=$2
+    while [ -n "$_v" ] || [ -n "$_m" ]; do
+        _a=${_v%%.*}
+        _b=${_m%%.*}
+        case "$_v" in
+            *.*) _v=${_v#*.} ;;
+            *) _v= ;;
+        esac
+        case "$_m" in
+            *.*) _m=${_m#*.} ;;
+            *) _m= ;;
+        esac
+        [ "${_a:-0}" -gt "${_b:-0}" ] && return 0
+        [ "${_a:-0}" -lt "${_b:-0}" ] && return 1
+    done
+    return 0
+}
+
+# supported ID VERSION_ID: the supported table of internal/distro (platforms).
+supported() {
+    valid_version "$2" || return 1
+    case "$1" in
+        ubuntu) version_ge "$2" 24.04 ;;
+        debian) version_ge "$2" 13 ;;
+        rocky) version_ge "$2" 9 && ! version_ge "$2" 11 ;;
+        fedora) version_ge "$2" 44 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_platform() {
+    if [ ! -r /etc/os-release ]; then
+        err "cannot read /etc/os-release"
+        exit 1
+    fi
+    # Subshells: os-release sets NAME, VERSION, ID, ... and must not leak into
+    # this script.
+    # shellcheck source=/dev/null
+    _id=$(. /etc/os-release && printf '%s' "${ID-}") || {
+        err "cannot read ID from /etc/os-release"
+        exit 1
+    }
+    # shellcheck source=/dev/null
+    _version_id=$(. /etc/os-release && printf '%s' "${VERSION_ID-}") || {
+        err "cannot read VERSION_ID from /etc/os-release"
+        exit 1
+    }
+    if ! supported "$_id" "$_version_id"; then
+        echo "${PKG}: unsupported distribution \"${_id} ${_version_id}\" (supported: ubuntu >= 24.04, debian >= 13, rocky 9/10, fedora >= 44)" >&2
+        exit 1
+    fi
+}
+
+# deb: install [<old-version>] | upgrade <old-version> | abort-upgrade <new-version>
+# rpm %pre: 1 = install, 2 = upgrade (number of versions after the transaction)
+case "$1" in
+    install | upgrade | 1 | 2)
+        check_platform
+        ;;
+    abort-upgrade)
+        # dpkg calls this after the old package's postrm failed during an
+        # upgrade; the old version stays installed, there is nothing to undo.
+        ;;
+    *)
+        err "preinst called with unknown argument \"$1\""
+        exit 1
+        ;;
+esac
+
+exit 0

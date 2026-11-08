@@ -14,7 +14,11 @@ the host steps below stay the same.
 
 You need:
 
-- Ubuntu 24.04 or newer, Debian 13 or newer, or Rocky Linux 9 or 10, on amd64;
+- Ubuntu 24.04 or newer, Debian 13 or newer, Rocky Linux 9 or 10, or Fedora 44
+  or newer, on amd64. Every other distribution is refused: the package
+  pre-install script stops before any file is unpacked, and `--setup-ldap`,
+  `--check` and `--enable` exit with
+  `unsupported distribution "<ID> <VERSION_ID>" (supported: ubuntu >= 24.04, debian >= 13, rocky 9/10, fedora >= 44)`;
 - OpenSSH 9.6 or newer;
 - root access and a working root SSH key;
 - network access from the host to LDAP and the OIDC provider;
@@ -76,7 +80,8 @@ To install a downloaded package instead:
 sudo apt install ./pam-device-auth_<version>_amd64.deb
 ```
 
-On Rocky Linux 9 or 10, install the RPM release asset instead:
+On Rocky Linux 9 or 10 or Fedora 44 or newer, install the RPM release asset
+instead:
 
 ```bash
 sudo dnf install ./pam-device-auth-<version>.x86_64.rpm
@@ -144,6 +149,7 @@ sudo install -m600 /dev/stdin /etc/pam-device-auth/config.json <<'JSON'
   "sudo_role": "ssh-admin",
   "allowed_algorithms": ["RS256"],
   "ldap": {
+    "profile": "lldap",
     "uri": "ldaps://ldap.example.com:636",
     "base_dn": "dc=example,dc=com",
     "bind_dn": "uid=nss-ro,ou=people,dc=example,dc=com",
@@ -156,6 +162,9 @@ JSON
 ```
 
 Adjust `allowed_algorithms` to the signing algorithm used by your provider.
+`ldap.profile` is required: `lldap` for LLDAP, `ad` for an Active Directory.
+Without it `--setup-ldap`, `--check` and `--enable` stop with
+`config: ldap.profile is required ("lldap" or "ad")`.
 
 The LDAP bind password is stored in the root-only config and written to
 `/etc/sssd/sssd.conf` for SSSD. Use a read-only directory account.
@@ -174,6 +183,19 @@ sudo pam-device-auth --setup-ldap
 This command configures SSSD, NSS, automatic home creation, sudo and the sshd
 drop-in. It can be rerun after configuration changes, but always review its
 local-account migration output and warnings before continuing.
+
+Before it changes anything, it checks the config, the login shell of
+directory users (`ldap.shell`, `/bin/bash` when unset; it must exist and be
+executable), refreshes the package index (on Debian and Ubuntu `apt-get
+update`, which must succeed), installs and marks the SSSD packages and checks
+that `sss_ssh_authorizedkeys` and the SSSD InfoPipe responder are in place.
+Every later step is checked as well. A failed step aborts the setup with one
+`FAIL:` line: the failed command and its output, what happened to
+`/etc/sssd/sssd.conf` (the previous file restored, or the new one removed, and
+sssd restarted on it once it was running on the new file), and after
+`still in place on the host:` the changes the abort does not undo. A failed
+local-account migration keeps the new `sssd.conf`, because the migrated
+accounts resolve only through it. Fix the cause and run `--setup-ldap` again.
 
 Important: if a local account has the same name but a different UID from a
 directory user, `--setup-ldap` lists and migrates it. The local passwd/shadow
@@ -206,6 +228,7 @@ Directory (SSSD/NSS):
   [OK]   sssd service active
   [OK]   ldap.uri is a single URI, transport LDAPS (no cleartext bind)
   [OK]   profile lldap
+  [OK]   login shell /bin/bash is executable
   [OK]   access group "ssh-access" resolves via NSS (2 member(s)); SSSD↔LDAP↔CA path OK
   [WARN] 1 of 2 member(s) have NO sshPublicKey; locked out of non-root login until set: no-key-user
   [OK]   UIDs/GIDs of 2 directory user(s) exist in this host's ID map
@@ -238,10 +261,17 @@ Make sure the root recovery session is still open, then activate:
 sudo pam-device-auth --enable
 ```
 
-The command backs up `/etc/pam.d/sshd`, enables the PAM module and restarts
-sshd. If the backup fails, activation still proceeds with a loud
-`[WARN] could not back up` message. Investigate before making further
-changes, because the rollback copy `/etc/pam.d/sshd.original` is then missing.
+The command backs up `/etc/pam.d/sshd` to `/etc/pam.d/sshd.original`, enables
+the PAM module and restarts sshd (`ssh.service` on Debian and Ubuntu,
+`sshd.service` on Rocky Linux and Fedora). The backup is the first step: if it
+fails, `--enable` stops before it writes the sshd drop-in or the PAM stack,
+because without the rollback copy the package refuses to be removed (see
+[Uninstall](#uninstall)). A missing `/etc/pam.d/sshd`, one that already uses
+`pam_device_auth.so` while no backup exists, or an existing `sshd.original`
+that is empty, has no `auth` or `@include` line or uses `pam_device_auth.so`
+ends in
+`FAIL: cannot back up /etc/pam.d/sshd to /etc/pam.d/sshd.original: no pristine PAM config: …; nothing was changed: restore /etc/pam.d/sshd from your distribution's openssh-server package, remove any /etc/pam.d/sshd.original that is not a copy of it, then run 'pam-device-auth --enable' again`.
+A valid `sshd.original` from an earlier `--enable` is kept as it is.
 Open a new terminal and test before closing the root session:
 
 ```bash
@@ -278,14 +308,41 @@ sudo apt install --only-upgrade pam-device-auth
 sudo pam-device-auth --check
 ```
 
+On Rocky Linux and Fedora, install the new RPM release asset with
+`sudo dnf install ./pam-device-auth-<version>.x86_64.rpm`. On a distribution
+outside the supported list the upgrade stops in the pre-install script with
+the unsupported-distribution message, and the installed version stays.
+
 Keep a root session open until a fresh non-root login succeeds. Package upgrades
 preserve `config.json`, PAM configuration and the installed sshd drop-in.
 
-The package does not install or rewrite
+On every install or upgrade that finds a `config.json`, the package runs
+`pam-device-auth --migrate-config`. A config whose `ldap` block has no
+`profile` (or `null` or `""`) gets
+`"profile": "lldap"`; the original is kept as
+`/etc/pam-device-auth/config.json.pre-0.7.0` with the same owner and mode, and
+the package prints
+`config: set ldap.profile = "lldap" (backup /etc/pam-device-auth/config.json.pre-0.7.0)`.
+Indentation and key order of the rewritten file change (keys are sorted), the
+values do not. A config that already sets `profile`, for example every Active
+Directory host, is not touched. If the migration fails, the post-install
+script fails with the reason; the config stays as it was. Fix it (for example
+set `profile` by hand, or move an existing `config.json.pre-0.7.0` away), then
+complete the upgrade with `sudo dpkg --configure -a`, or on Rocky Linux and
+Fedora with `sudo dnf reinstall ./pam-device-auth-<version>.x86_64.rpm`
+(`sudo dnf reinstall pam-device-auth` from a repository). The same finish
+step applies when the post-install script fails for another reason: a missing
+`config.json` on upgrade, or, with PAM active, a failing `sshd -t` or sshd
+restart.
+
+The package does not install
 `/etc/ssh/sshd_config.d/10-pam-device-auth.conf`; only `--setup-ldap` writes
-it, and `--enable` re-renders it when it does not reference the resolved
+it, and `--enable` re-renders it when it does not reference the platform's
 `sss_ssh_authorizedkeys` path. Both validate it with `sshd -t` and roll back
-on rejection. Hosts installed before the
+on rejection. The package changes one line of it: in a drop-in with
+`LogLevel DEBUG1`, that line becomes `LogLevel VERBOSE` plus a `LogVerbose` line,
+validated with `sshd -t`; if sshd rejects it, the previous drop-in is put back
+and the post-install script fails. Hosts installed before the
 v0.5.4 `AuthorizedKeysFile none` hardening must run
 `sudo pam-device-auth --setup-ldap` again. The preflight warns when the old
 policy is still effective.
@@ -373,12 +430,37 @@ Remove the package and its managed configuration completely:
 sudo apt purge pam-device-auth
 ```
 
-Removal restores the original PAM sshd configuration, removes the managed sshd
-drop-in and the managed sudoers file (`/etc/sudoers.d/pam-device-auth`,
-including any `nopasswd_sudo_groups` rules), and restarts sshd. It deliberately
-does not undo directory-mode host configuration: `/etc/sssd/sssd.conf`, NSS
-`sss` entries, pam_mkhomedir, directory identities and home directories
-remain. Review and remove those separately only when decommissioning the host.
+On Rocky Linux and Fedora: `sudo dnf remove pam-device-auth` (there is no
+separate purge).
+
+Removal restores the original PAM sshd configuration from
+`/etc/pam.d/sshd.original`, removes the managed sshd drop-in and the managed
+sudoers file (`/etc/sudoers.d/pam-device-auth`, including any
+`nopasswd_sudo_groups` rules), validates the sshd config with `sshd -t` and
+restarts sshd. Removal and purge validate and restart sshd only when they
+removed the drop-in or restored `/etc/pam.d/sshd`: a host that was never set
+up or enabled, and a purge after a removal, leave sshd alone.
+It deliberately does not undo directory-mode host configuration:
+`/etc/sssd/sssd.conf`, NSS `sss` entries, pam_mkhomedir, directory identities
+and home directories remain. Review and remove those separately only when
+decommissioning the host.
+
+The removal is refused while `/etc/pam.d/sshd` uses `pam_device_auth.so` and no
+valid `/etc/pam.d/sshd.original` exists (missing, empty, without an `auth` or
+`@include` line, or itself containing `pam_device_auth.so`):
+
+```text
+pam-device-auth: /etc/pam.d/sshd uses pam_device_auth.so and no valid /etc/pam.d/sshd.original exists; restore /etc/pam.d/sshd from your distribution's openssh-server package, then remove pam-device-auth
+```
+
+The package and sshd stay as they are. Restore `/etc/pam.d/sshd` from the
+distribution's `openssh-server` package, then remove pam-device-auth again.
+
+If `sshd -t` or the sshd restart fails during the removal, the removal fails
+with the sshd error. Fix the sshd config and run
+`sudo systemctl restart ssh.service` (`sshd.service` on Rocky Linux and
+Fedora); with dpkg, run `sudo apt remove pam-device-auth` again to finish the
+removal.
 
 ## Build from source
 
@@ -393,7 +475,7 @@ make deb
 sudo apt install ./build/packages/pam-device-auth_<version>_amd64.deb
 ```
 
-On Rocky Linux, install the equivalent build dependencies with
+On Rocky Linux or Fedora, install the equivalent build dependencies with
 `sudo dnf install pam-devel gcc golang` and run `make rpm` instead of `make deb`.
 
 Using the package is safer than copying the binary and PAM module by hand because
@@ -427,7 +509,7 @@ Start with:
 ```bash
 sudo pam-device-auth --check
 sudo tail -f /var/log/pam-device-auth.log
-sudo journalctl -u ssh -f
+sudo journalctl -u ssh -f    # -u sshd on Rocky Linux and Fedora
 ```
 
 If the preflight is green but login still fails, capture the helper log and SSH

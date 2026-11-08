@@ -6,6 +6,7 @@ pam-device-auth \- two-factor SSH login (directory key + OIDC device grant)
 [\fB\-\-check\fR]
 [\fB\-\-setup\-ldap\fR]
 [\fB\-\-enable\fR]
+[\fB\-\-migrate\-config\fR]
 [\fB\-\-debug\fR]
 [\fB\-\-version\fR]
 [\fB\-\-help\fR]
@@ -62,6 +63,33 @@ directory users, not just the ones with an allowlist set.
 Works on OpenSSH 10.2+, which refuses PAM for users not resolvable via
 .BR getpwnam (3).
 Directory users resolve through NSS, so they always exist.
+.PP
+.BR \-\-check ,
+.B \-\-setup\-ldap
+and
+.B \-\-enable
+first check the platform (see REQUIREMENTS) and refuse every other
+distribution before they read the config or change the host:
+.PP
+.RS
+.nf
+unsupported distribution "<ID> <VERSION_ID>" (supported: ubuntu >= 24.04,
+debian >= 13, rocky 9/10, fedora >= 44)
+.fi
+.RE
+.PP
+All three refuse an
+.I ldap
+block without
+.I profile
+(a [FAIL] item in
+.BR \-\-check ):
+.PP
+.RS
+.nf
+config: ldap.profile is required ("lldap" or "ad")
+.fi
+.RE
 .SH OPTIONS
 .TP
 .B \-\-check
@@ -85,12 +113,19 @@ is a single
 or
 .B ldap://
 (StartTLS) URI and which transport it gives, that
+.I ldap.profile
+is set, that the login shell
+.RI ( ldap.shell ,
+.I /bin/bash
+when unset) is executable, that
 .I ldap.ca_file
 and the Kerberos keytab are in place, that the UIDs and GIDs of directory
 users exist in the host's ID map, root's sshd policy (including its
 AuthorizedKeysFile) for every
 .I root_login_sources
-address, and that the AuthorizedKeysCommand binary exists. Local accounts that
+address, and that the AuthorizedKeysCommand binary and, when
+.I sssd.conf
+enables it, the InfoPipe responder exist at the platform's path. Local accounts that
 shadow a directory user are listed as warnings with what
 .B \-\-setup\-ldap
 will do (migrate or skip).
@@ -110,26 +145,86 @@ to nsswitch, enable
 install the sudoers rules for the admin and NOPASSWD sudo groups, write the
 sshd drop-in, and migrate any pre-existing local accounts that shadow a
 directory user (no process is killed; an account with running processes is
-skipped with a warning). The
+skipped with a warning). The required
 .I ldap.profile
 selects LLDAP
-.RB ( lldap ,
-default) or Active Directory
+.RB ( lldap )
+or Active Directory
 .RB ( ad ).
-Distro-aware (apt/dnf, pam-auth-update/authselect, CA path,
+Uses the platform's tools and paths (apt/dnf, pam-auth-update/authselect, CA
+path,
 .BR sss_ssh_authorizedkeys
 path); it also installs the
 .B sssd-dbus
 package needed for the InfoPipe responder and, with
 .IR ldap.kerberos ,
-the SSSD Kerberos provider and the SASL GSSAPI plugin. Does not restart sshd.
-Idempotent. Requires root.
+the SSSD Kerberos provider and the SASL GSSAPI plugin. Before the first change
+to the host it checks the config, the login shell of directory users
+.RI ( ldap.shell ,
+.I /bin/bash
+when unset), the package index refresh
+.RB ( "apt-get update"
+on Debian and Ubuntu), the package install and marking the packages as
+manually installed, and that
+.B sss_ssh_authorizedkeys
+and the InfoPipe responder are present. Every later step is checked too. A
+failed step aborts with one
+.B FAIL:
+line naming the command and its output, what the rollback did (the previous
+.I sssd.conf
+restored or the new one removed, and sssd restarted on it once it was running
+on the new file), and the changes still in place on the host. A failed
+local-account migration keeps the new
+.IR sssd.conf .
+Does not restart sshd. Idempotent. Requires root.
 .TP
 .B \-\-enable
 Activate PAM authentication. Backs up
 .IR /etc/pam.d/sshd ,
-installs the PAM config, copies the sshd PAM template, and restarts sshd.
-Requires root.
+installs the PAM config, copies the sshd PAM template, and restarts sshd
+.RB ( ssh.service
+on Debian and Ubuntu,
+.B sshd.service
+on Rocky Linux and Fedora). Runs the
+.B \-\-check
+preflight first and refuses to activate on a blocker. The backup to
+.I /etc/pam.d/sshd.original
+comes before any write: when it fails, or when no pristine PAM config is
+left to save (a missing
+.IR /etc/pam.d/sshd ,
+or one that uses
+.B pam_device_auth.so
+while no valid backup exists), it exits 1 without changing the host. Requires
+root.
+.TP
+.B \-\-migrate\-config
+Set
+.B \(dqprofile\(dq: \(dqlldap\(dq
+in the
+.I ldap
+block of
+.I /etc/pam-device-auth/config.json
+when it has no
+.I profile
+(or
+.B null
+or
+.BR \(dq\(dq ).
+The original is kept as
+.I config.json.pre\-0.7.0
+with the same owner and mode; the new file is written atomically with the
+original's owner and mode, with sorted keys, and checked with the loader of
+.BR \-\-check .
+A config without an
+.I ldap
+block, or with
+.B lldap
+or
+.BR ad ,
+is not touched. Any other profile, duplicate keys that the loader would read
+differently after the rewrite, a symlink, an existing backup or unreadable
+JSON is an error that leaves the file as it is (exit 1). Run by the package's
+post-install script on every install or upgrade that finds a config.
 .TP
 .B \-\-debug
 Enable verbose logging to
@@ -144,7 +239,30 @@ Print usage and exit.
 An additional
 .B \-\-pam\-acct
 mode exists for the PAM account phase to enforce the IP allowlist; it is
-invoked internally by the PAM stack and not meant to be run by hand.
+invoked internally by the PAM stack and not meant to be run by hand. It exits
+0 (allow), 1 (deny for this user) or 3 when it cannot open its log, or the log
+is not 0640 and cannot be set to 0640: then it denies every non-root user and
+reports the reason to syslog
+.RB ( authpriv ).
+The PAM module logs exit 3 as an infrastructure failure and denies the login.
+A log that already is 0640 is not changed.
+.PP
+The authentication phase denies the login in the same case and reports it to
+syslog
+.RB ( authpriv ,
+tag
+.BR pam-device-auth ),
+for a 0644 log made append-only with
+.B "chattr +a"
+for example:
+.PP
+.RS
+.nf
+pam-device-auth: cannot set log file mode 0640: chmod
+/var/log/pam-device-auth.log: operation not permitted; denying login
+(fail closed)
+.fi
+.RE
 .SH CONFIGURATION
 Configuration file:
 .IR /etc/pam-device-auth/config.json .
@@ -169,9 +287,16 @@ ldap	setup	\-	Directory block for \-\-setup\-ldap (see below)
 .PP
 The
 .I ldap
-block (used only by
-.BR \-\-setup\-ldap )
+block (used by
+.B \-\-setup\-ldap
+and
+.BR \-\-check )
 holds
+.I profile
+.RB ( lldap
+or
+.BR ad ,
+required),
 .IR uri ", " base_dn ", " bind_dn ", " bind_password
 (or
 .IR bind_password_file ,
@@ -184,7 +309,7 @@ plus two opt-in lists:
 (directory groups whose members log in key-only, with no OIDC step) and
 .I nopasswd_sudo_groups
 (groups granted passwordless sudo). Optional keys:
-.IR profile ", " ca_file ", " attributes ", " id_mapping ", " id_range ,
+.IR ca_file ", " attributes ", " id_mapping ", " id_range ,
 .IR home ", " shell ", " kerberos ", " user_search_base
 and
 .IR group_search_base .
@@ -209,6 +334,12 @@ auth_timeout can be overridden via environment variables prefixed with
 .TP
 .I /etc/pam-device-auth/config.json
 OIDC provider and directory configuration.
+.TP
+.I /etc/pam-device-auth/config.json.pre\-0.7.0
+Copy of the config from before
+.B \-\-migrate\-config
+set
+.IR ldap.profile .
 .TP
 .I /usr/lib/security/pam_device_auth.so
 C PAM shared library (deb; rpm installs to
@@ -299,8 +430,31 @@ See
 in the source repository for the full threat model.
 .SH REQUIREMENTS
 .PP
-Ubuntu 24.04+, Debian 13+, or Rocky Linux 9 or 10 (amd64); other RHEL-family
-distributions are generally compatible. OpenSSH >= 9.6p1.
+amd64 and one of: Ubuntu 24.04 or later, Debian 13 or later, Rocky Linux 9 or
+10, Fedora 44 or later (the
+.B ID
+and
+.B VERSION_ID
+of
+.IR /etc/os-release ).
+Every other distribution is refused by the package pre-install script and by
+.BR \-\-check ,
+.B \-\-setup\-ldap
+and
+.BR \-\-enable .
+OpenSSH >= 9.6p1.
+.PP
+Removing the package is refused while
+.I /etc/pam.d/sshd
+uses
+.B pam_device_auth.so
+and no valid
+.I /etc/pam.d/sshd.original
+exists; restore
+.I /etc/pam.d/sshd
+from the distribution's openssh-server package first. A failing
+.B "sshd \-t"
+or sshd restart fails the package script that runs it.
 SSH client auto-detection (QR code display) needs the
 .B LogVerbose
 line of the managed sshd drop-in, which journals the client version.

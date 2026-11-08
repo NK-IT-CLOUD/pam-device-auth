@@ -85,7 +85,7 @@ the system bundle. SSSD reads the file itself, so the user SSSD runs as must be
 able to read it: on distributions where `sssd_be` runs as user `sssd`, a file
 below the 0700 directory `/etc/pam-device-auth` is not readable. Put it in
 `/usr/local/share/ca-certificates/` (Debian, Ubuntu) or
-`/etc/pki/ca-trust/source/anchors/` (RHEL family). `--check` verifies only that
+`/etc/pki/ca-trust/source/anchors/` (Rocky Linux, Fedora). `--check` verifies only that
 `ca_file` is a regular file. Keep the bind password out of `config.json` with
 `bind_password_file`: a regular file (no symlink) owned by root with mode 0600,
 the password on one line, at most 4096 bytes. `bind_dn` may be a DN
@@ -110,7 +110,7 @@ whose UPN suffix is the lower-case DNS domain authenticate for sudo and
 
 With `kerberos`, `--setup-ldap` also installs the SSSD Kerberos provider and the
 SASL GSSAPI plugin (`sssd-krb5` and `libsasl2-modules-gssapi-mit` on Debian and
-Ubuntu, `sssd-krb5` and `cyrus-sasl-gssapi` on the RHEL family). `--check`
+Ubuntu, `sssd-krb5` and `cyrus-sasl-gssapi` on Rocky Linux and Fedora). `--check`
 reports the realm and the KDC and warns when the KDC name does not resolve.
 
 For a keytab bind, create the keytab for the service account on a DC (Windows:
@@ -221,6 +221,7 @@ Lines of `--check` that belong to this setup, for the example above:
     ...
       [OK]   ldap.uri is a single URI, transport LDAPS (no cleartext bind)
       [OK]   profile ad
+      [OK]   login shell /bin/bash is executable
       [OK]   ldap.ca_file is a regular file: /usr/local/share/ca-certificates/example-ad-ca.crt
       [OK]   Kerberos realm EXAMPLE.COM, KDC dc1.example.com (sudo and passwd via krb5)
       [OK]   access group "ssh-access" resolves via NSS (2 member(s)); SSSD↔LDAP↔CA path OK

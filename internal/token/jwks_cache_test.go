@@ -8,11 +8,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,7 +84,7 @@ func TestFetchJWKSCachedMissFetchesAndWrites(t *testing.T) {
 	dir := setupCacheDir(t)
 	srv, hits := jwksServer(t, rsaJWKSDoc(map[string]*rsa.PrivateKey{"k1": newRSAKey(t)}))
 
-	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatalf("FetchJWKSCached() error: %v", err)
 	}
@@ -115,10 +117,10 @@ func TestFetchJWKSCachedHitSkipsHTTP(t *testing.T) {
 	setupCacheDir(t)
 	srv, hits := jwksServer(t, rsaJWKSDoc(map[string]*rsa.PrivateKey{"k1": newRSAKey(t)}))
 
-	if _, _, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil); err != nil {
+	if _, _, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatalf("second FetchJWKSCached() error: %v", err)
 	}
@@ -139,7 +141,7 @@ func TestFetchJWKSCachedExpiredRefetches(t *testing.T) {
 	body, _ := json.Marshal(rsaJWKSDoc(map[string]*rsa.PrivateKey{"stale": newRSAKey(t)}))
 	plantJWKSCache(t, time.Now().Add(-oidccache.TTL-time.Minute).Unix(), cacheTestIssuer, body)
 
-	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +163,7 @@ func TestFetchJWKSCachedCorruptRefetches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	_, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +178,7 @@ func TestFetchJWKSCachedIssuerMismatchRefetches(t *testing.T) {
 	body, _ := json.Marshal(rsaJWKSDoc(map[string]*rsa.PrivateKey{"foreign": newRSAKey(t)}))
 	plantJWKSCache(t, time.Now().Unix(), "https://other.example.com/realms/x", body)
 
-	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +197,7 @@ func TestFetchJWKSCachedInvalidBodyRefetches(t *testing.T) {
 	srv, hits := jwksServer(t, rsaJWKSDoc(map[string]*rsa.PrivateKey{"k1": newRSAKey(t)}))
 	plantJWKSCache(t, time.Now().Unix(), cacheTestIssuer, []byte(`{"keys":[{"kty":"RSA","kid":"","n":"AQAB","e":"AQAB"}]}`))
 
-	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +225,7 @@ func TestRefreshJWKSOverwritesCache(t *testing.T) {
 	}
 
 	// The cache now holds the new set, so a cached load serves "new" not "old".
-	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil)
+	keys, cached, err := FetchJWKSCached(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,6 +237,35 @@ func TestRefreshJWKSOverwritesCache(t *testing.T) {
 	}
 	if _, ok := keys["new"]; !ok {
 		t.Error("new key missing after refresh")
+	}
+}
+
+// A cache that cannot be written is reported at WARN with its path; the
+// validated live keys are still returned (the cache is no authentication source).
+func TestRefreshJWKSCacheWriteFailureWarns(t *testing.T) {
+	// Point the cache at a path under a regular file so MkdirAll fails even as
+	// root (a mode-0500 dir would not stop root).
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	orig := oidccache.Dir
+	oidccache.Dir = filepath.Join(blocker, "oidc")
+	t.Cleanup(func() { oidccache.Dir = orig })
+
+	srv, hits := jwksServer(t, rsaJWKSDoc(map[string]*rsa.PrivateKey{"k1": newRSAKey(t)}))
+	var warned []string
+	warnf := func(format string, v ...interface{}) { warned = append(warned, fmt.Sprintf(format, v...)) }
+	keys, err := RefreshJWKS(context.Background(), srv.Client(), srv.URL, cacheTestIssuer, warnf)
+	if err != nil {
+		t.Fatalf("cache write failure must not fail the refresh: %v", err)
+	}
+	if _, ok := keys["k1"]; !ok || *hits != 1 {
+		t.Errorf("expected the live key k1 with 1 request, got %v / %d", keys, *hits)
+	}
+	path := filepath.Join(oidccache.Dir, oidccache.JWKSFile)
+	if len(warned) != 1 || !strings.Contains(warned[0], path) {
+		t.Errorf("WARN lines = %q, want one naming %s", warned, path)
 	}
 }
 

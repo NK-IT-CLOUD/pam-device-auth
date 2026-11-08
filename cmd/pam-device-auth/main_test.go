@@ -8,33 +8,50 @@ import (
 	"testing"
 
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
-	"github.com/NK-IT-CLOUD/pam-device-auth/internal/distro"
 )
 
-func TestPamTemplateName(t *testing.T) {
-	cases := []struct {
-		name   string
-		family string
-		want   string
-	}{
-		{"rhel", "rhel", "pam-sshd-device-auth-rhel"},
-		{"debian", "debian", "pam-sshd-device-auth"},
-		{"unknown falls back to debian template", "", "pam-sshd-device-auth"},
+func TestCheckSSSAuthKeysMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sss_ssh_authorizedkeys")
+	err := checkSSSAuthKeys(path)
+	if err == nil {
+		t.Fatal("checkSSSAuthKeys(missing) = nil, want an error")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := pamTemplateName(distro.Profile{Family: tc.family})
-			if got != tc.want {
-				t.Errorf("pamTemplateName(Family=%q) = %q, want %q", tc.family, got, tc.want)
-			}
-		})
+	for _, want := range []string{path, "sssd-common"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+func TestCheckSSSAuthKeysOK(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sss_ssh_authorizedkeys")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkSSSAuthKeys(path); err != nil {
+		t.Errorf("checkSSSAuthKeys(0755 file) = %v, want nil", err)
+	}
+}
+
+func TestCheckSSSAuthKeysRefusesNonExecutableAndNonRegular(t *testing.T) {
+	dir := t.TempDir()
+	noExec := filepath.Join(dir, "noexec")
+	if err := os.WriteFile(noExec, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"not executable": noExec, "directory": dir} {
+		err := checkSSSAuthKeys(path)
+		if err == nil || !strings.Contains(err.Error(), path) {
+			t.Errorf("%s: checkSSSAuthKeys(%s) = %v, want an error naming the path", name, path, err)
+		}
 	}
 }
 
 func TestBackupFile(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "sshd")
-	if err := os.WriteFile(src, []byte("original config"), 0644); err != nil {
+	const original = "auth required pam_unix.so\n"
+	if err := os.WriteFile(src, []byte(original), 0644); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 
@@ -48,8 +65,8 @@ func TestBackupFile(t *testing.T) {
 		t.Error("backupFile() didBackup = false, want true on first backup")
 	}
 	got, _ := os.ReadFile(dst)
-	if string(got) != "original config" {
-		t.Errorf("backup content = %q, want %q", got, "original config")
+	if string(got) != original {
+		t.Errorf("backup content = %q, want %q", got, original)
 	}
 
 	// Second call: dst already exists → must not overwrite, no error.
@@ -64,8 +81,8 @@ func TestBackupFile(t *testing.T) {
 		t.Error("backupFile() didBackup = true, want false when backup exists")
 	}
 	got, _ = os.ReadFile(dst)
-	if string(got) != "original config" {
-		t.Errorf("backup overwritten: %q, want preserved %q", got, "original config")
+	if string(got) != original {
+		t.Errorf("backup overwritten: %q, want preserved %q", got, original)
 	}
 
 	// Write failure: parent dir of dst does not exist → error surfaced.
@@ -219,7 +236,7 @@ func TestLDAPProfileCheck(t *testing.T) {
 		ok      bool
 		msg     string
 	}{
-		{"", true, "profile lldap"},
+		{"", false, `config: ldap.profile is required ("lldap" or "ad")`},
 		{"lldap", true, "profile lldap"},
 		{"ad", true, "profile ad"},
 		{"openldap", false, `ldap.profile must be "lldap" or "ad", got "openldap"`},
@@ -233,6 +250,29 @@ func TestLDAPProfileCheck(t *testing.T) {
 		if ok != c.ok || msg != c.msg {
 			t.Errorf("profile %q: ok=%v msg=%q, want ok=%v msg=%q", c.profile, ok, msg, c.ok, c.msg)
 		}
+	}
+}
+
+// --check reports the login shell of directory users (ldap.shell or the
+// default) by the rule --setup-ldap enforces.
+func TestLDAPShellCheck(t *testing.T) {
+	dir := t.TempDir()
+	sh := filepath.Join(dir, "sh")
+	if err := os.WriteFile(sh, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if ok, okMsg, _ := ldapShellCheck(&config.LDAPConfig{Shell: sh}); !ok || okMsg != "login shell "+sh+" is executable" {
+		t.Errorf("valid shell: ok=%v msg=%q", ok, okMsg)
+	}
+	missing := filepath.Join(dir, "missing")
+	if ok, _, badMsg := ldapShellCheck(&config.LDAPConfig{Shell: missing}); ok || !strings.HasPrefix(badMsg, "login shell "+missing+" (ldap.shell): ") {
+		t.Errorf("missing shell: ok=%v msg=%q", ok, badMsg)
+	}
+	// A relative path that resolves from the working directory of --check is
+	// still refused, as --setup-ldap refuses it.
+	t.Chdir(dir)
+	if ok, _, badMsg := ldapShellCheck(&config.LDAPConfig{Shell: "sh"}); ok || badMsg != `ldap.shell must be an absolute path without whitespace, got "sh"` {
+		t.Errorf("relative shell: ok=%v msg=%q", ok, badMsg)
 	}
 }
 

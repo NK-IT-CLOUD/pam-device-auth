@@ -1,9 +1,11 @@
 package logger
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -98,6 +100,67 @@ func TestNewLogger_InvalidFile(t *testing.T) {
 	_, err := NewLogger("/nonexistent/path/to/log.log", false)
 	if err == nil {
 		t.Error("NewLogger should fail for invalid file path")
+	}
+}
+
+// NewLogger sets the log to 0640 only when its mode is wrong. A log with the
+// right mode is never chmod-ed, so an append-only log (chattr +a, where chmod
+// fails) with the right mode keeps working. A wrong mode that cannot be
+// corrected is a misconfiguration, not something to log PII into anyway.
+func TestNewLoggerChmodOnlyWhenModeWrong(t *testing.T) {
+	// The error os.File.Chmod returns for an append-only file.
+	eperm := func(f *os.File) error { return &os.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM} }
+	realChmod := func(f *os.File) error { return f.Chmod(0640) }
+	for _, c := range []struct {
+		name      string
+		mode      os.FileMode
+		chmod     func(*os.File) error
+		wantCalls int
+		wantErr   bool
+	}{
+		{"right mode, chmod would fail", 0640, eperm, 0, false},
+		{"wrong mode, chmod fails", 0644, eperm, 1, true},
+		{"wrong mode, chmod ok", 0644, realChmod, 1, false},
+		{"stricter mode is corrected too", 0600, realChmod, 1, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			orig := chmodLog
+			t.Cleanup(func() { chmodLog = orig })
+			calls := 0
+			chmodLog = func(f *os.File) error { calls++; return c.chmod(f) }
+
+			path := filepath.Join(t.TempDir(), "mode.log")
+			if err := os.WriteFile(path, nil, c.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, c.mode); err != nil { // umask
+				t.Fatal(err)
+			}
+			log, err := NewLogger(path, false)
+			if calls != c.wantCalls {
+				t.Errorf("chmod calls = %d, want %d", calls, c.wantCalls)
+			}
+			if !c.wantErr {
+				if err != nil {
+					t.Fatalf("NewLogger: %v", err)
+				}
+				log.Close()
+				if fi, _ := os.Stat(path); fi.Mode().Perm() != 0640 {
+					t.Errorf("mode = %v, want 0640", fi.Mode().Perm())
+				}
+				return
+			}
+			if err == nil {
+				log.Close()
+				t.Fatal("NewLogger succeeded although the wrong mode could not be corrected")
+			}
+			if !errors.Is(err, ErrLogMode) || !errors.Is(err, syscall.EPERM) {
+				t.Errorf("error %q is not ErrLogMode wrapping EPERM", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "chmod") || strings.Count(msg, path) != 1 {
+				t.Errorf("error %q must name chmod and the path exactly once", msg)
+			}
+		})
 	}
 }
 

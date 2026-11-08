@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -107,15 +108,17 @@ func reownedHome(home string) (string, bool) {
 // migrateShadowedAccount removes the local entry (home kept), puts the
 // directory user back into the recorded local groups and re-owns only the
 // files that belonged to the old IDs: the home below /home, the mail spool and
-// the crontab. It sends no signal. It returns the problems for the summary.
-func migrateShadowedAccount(a shadowedAccount, run commandRunner, exists func(string) bool) []string {
+// the crontab. It sends no signal. A failed userdel stops before any change.
+// After userdel every remaining step still runs, so the account is left as
+// complete as possible, and every failure is part of the returned error.
+func migrateShadowedAccount(a shadowedAccount, run commandRunner, exists func(string) bool) error {
 	if out, err := run("userdel", a.Name); err != nil {
-		return []string{fmt.Sprintf("userdel %s failed, not migrated: %s", a.Name, strings.TrimSpace(string(out)))}
+		return fmt.Errorf("userdel %s: %s: %w (%w)", a.Name, strings.TrimSpace(string(out)), err, errNotMigrated)
 	}
 	var problems []string
 	for _, g := range a.Groups {
 		if out, err := run("gpasswd", "-a", a.Name, g); err != nil {
-			problems = append(problems, fmt.Sprintf("re-adding %s to group %s failed: %s", a.Name, g, strings.TrimSpace(string(out))))
+			problems = append(problems, fmt.Sprintf("gpasswd -a %s %s: %s: %v", a.Name, g, strings.TrimSpace(string(out)), err))
 		}
 	}
 	var paths []string
@@ -133,11 +136,14 @@ func migrateShadowedAccount(a shadowedAccount, run commandRunner, exists func(st
 			{"-R", "--from=:" + strconv.Itoa(a.LocalGID), ":" + strconv.Itoa(a.DirGID), p},
 		} {
 			if out, err := run("chown", args...); err != nil {
-				problems = append(problems, fmt.Sprintf("chown %s failed: %s", strings.Join(args, " "), strings.TrimSpace(string(out))))
+				problems = append(problems, fmt.Sprintf("chown %s: %s: %v", strings.Join(args, " "), strings.TrimSpace(string(out)), err))
 			}
 		}
 	}
-	return problems
+	if len(problems) > 0 {
+		return fmt.Errorf("%s (the local entry of %s is already removed; finish these steps by hand)", strings.Join(problems, "; "), a.Name)
+	}
+	return nil
 }
 
 // sssPasswdLookup resolves name through SSSD only (getent -s sss), the
@@ -156,22 +162,33 @@ func sssPasswdLookup(name string) (uid, gid int, ok bool) {
 	return uid, gid, err1 == nil && err2 == nil
 }
 
+// errNotMigrated marks a migration that failed before the account's local
+// entry was removed: nothing about the account changed.
+var errNotMigrated = errors.New("account not migrated")
+
+// localEntryRemoved reports, from the result of migrateShadowedAccounts,
+// whether a local entry was removed: an account was migrated, or one failed
+// after its userdel.
+func localEntryRemoved(migrated int, err error) bool {
+	return migrated > 0 || (err != nil && !errors.Is(err, errNotMigrated))
+}
+
 // migrateLocalShadowing migrates every shadowing local account that has no
-// running process; the others stay untouched and are reported as warnings.
-func migrateLocalShadowing() {
+// running process; the others stay untouched and are reported as warnings. A
+// failed read or migration is an error; removed reports whether a local
+// entry was removed before it.
+func migrateLocalShadowing() (removed bool, err error) {
 	passwd, err := os.ReadFile("/etc/passwd")
 	if err != nil {
-		setupWarnf("cannot read /etc/passwd, local accounts that shadow directory users were NOT checked: %v", err)
-		return
+		return false, fmt.Errorf("read /etc/passwd: %w; local accounts that shadow directory users were NOT checked", err)
 	}
 	group, err := os.ReadFile("/etc/group")
 	if err != nil {
-		setupWarnf("cannot read /etc/group, local accounts that shadow directory users were NOT migrated: %v", err)
-		return
+		return false, fmt.Errorf("read /etc/group: %w; local accounts that shadow directory users were NOT checked", err)
 	}
 	accounts := findShadowedAccounts(passwd, group, sssPasswdLookup)
 	if len(accounts) == 0 {
-		return
+		return false, nil
 	}
 	fmt.Println("------------------------------------------------------------")
 	fmt.Printf("%d local account(s) shadow a directory user:\n", len(accounts))
@@ -179,8 +196,9 @@ func migrateLocalShadowing() {
 		fmt.Printf("  - %s: local uid %d -> directory uid %d, keeps groups %v, home %s\n", a.Name, a.LocalUID, a.DirUID, a.Groups, a.Home)
 	}
 	fmt.Println("------------------------------------------------------------")
-	migrated := migrateShadowedAccounts(accounts, "/proc", execRunner, pathExists)
+	migrated, err := migrateShadowedAccounts(accounts, "/proc", execRunner, pathExists)
 	fmt.Printf("Migrated %d of %d local account(s).\n", migrated, len(accounts))
+	return localEntryRemoved(migrated, err), err
 }
 
 // pathExists reports whether p exists without following a final symlink; the
@@ -188,26 +206,23 @@ func migrateLocalShadowing() {
 func pathExists(p string) bool { _, err := os.Lstat(p); return err == nil }
 
 // migrateShadowedAccounts migrates each account that has no process under
-// procRoot and returns how many lost their local entry. An account with a
-// running process is left untouched (no signal, no userdel) and becomes a
-// setup warning, as does every problem of a migration.
-func migrateShadowedAccounts(accounts []shadowedAccount, procRoot string, run commandRunner, exists func(string) bool) int {
+// procRoot and returns how many were migrated. An account with a running
+// process is left untouched (no signal, no userdel) and becomes a setup
+// warning. The first failed migration stops the run and is returned.
+func migrateShadowedAccounts(accounts []shadowedAccount, procRoot string, run commandRunner, exists func(string) bool) (int, error) {
 	migrated := 0
 	for _, a := range accounts {
 		if n := processCount(procRoot, a.LocalUID); n > 0 {
 			setupWarnf("local account %s shadows the directory user but has %d running process(es); stop them and re-run --setup-ldap", a.Name, n)
 			continue
 		}
-		problems := migrateShadowedAccount(a, run, exists)
-		for _, p := range problems {
-			setupWarnf("%s", p)
+		if err := migrateShadowedAccount(a, run, exists); err != nil {
+			return migrated, fmt.Errorf("migrate local account %s: %w", a.Name, err)
 		}
-		if len(problems) == 0 || !strings.HasPrefix(problems[0], "userdel") {
-			migrated++
-			fmt.Printf("Migrated %s to directory uid %d\n", a.Name, a.DirUID)
-		}
+		migrated++
+		fmt.Printf("Migrated %s to directory uid %d\n", a.Name, a.DirUID)
 	}
-	return migrated
+	return migrated, nil
 }
 
 // migrationPreview describes, one line per account, what --setup-ldap would do

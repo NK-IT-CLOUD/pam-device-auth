@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/oidccache"
@@ -58,9 +59,9 @@ func FetchJWKS(ctx context.Context, client *http.Client, jwksURI string) (map[st
 // fresh entry for issuer exists, otherwise calls RefreshJWKS. A cached body
 // goes through ParseJWKS exactly like a live response. cached reports whether
 // the keys came from disk, so the caller can decide that an unknown kid
-// warrants one live refetch. debugf receives non-fatal cache diagnostics;
-// nil disables them.
-func FetchJWKSCached(ctx context.Context, client *http.Client, jwksURI, issuer string, debugf func(string, ...interface{})) (keys map[string]crypto.PublicKey, cached bool, err error) {
+// warrants one live refetch. debugf receives non-fatal cache diagnostics and
+// warnf a failed cache write (see RefreshJWKS); nil disables either.
+func FetchJWKSCached(ctx context.Context, client *http.Client, jwksURI, issuer string, debugf, warnf func(string, ...interface{})) (keys map[string]crypto.PublicKey, cached bool, err error) {
 	if debugf == nil {
 		debugf = func(string, ...interface{}) {}
 	}
@@ -76,15 +77,17 @@ func FetchJWKSCached(ctx context.Context, client *http.Client, jwksURI, issuer s
 		debugf("JWKS cache failed validation, fetching live: %v", err)
 	}
 
-	keys, err = RefreshJWKS(ctx, client, jwksURI, issuer, debugf)
+	keys, err = RefreshJWKS(ctx, client, jwksURI, issuer, warnf)
 	return keys, false, err
 }
 
 // RefreshJWKS fetches the key set live and overwrites the on-disk cache with
-// the validated body best-effort. A failed fetch or parse is never cached.
-func RefreshJWKS(ctx context.Context, client *http.Client, jwksURI, issuer string, debugf func(string, ...interface{})) (map[string]crypto.PublicKey, error) {
-	if debugf == nil {
-		debugf = func(string, ...interface{}) {}
+// the validated body. A failed fetch or parse is never cached. A failed cache
+// write goes to warnf with the cache path and the live keys are still
+// returned: the cache is no authentication source. nil warnf disables it.
+func RefreshJWKS(ctx context.Context, client *http.Client, jwksURI, issuer string, warnf func(string, ...interface{})) (map[string]crypto.PublicKey, error) {
+	if warnf == nil {
+		warnf = func(string, ...interface{}) {}
 	}
 
 	body, err := FetchJWKSRaw(ctx, client, jwksURI)
@@ -96,7 +99,7 @@ func RefreshJWKS(ctx context.Context, client *http.Client, jwksURI, issuer strin
 		return nil, err
 	}
 	if err := oidccache.Save(oidccache.JWKSFile, issuer, body); err != nil {
-		debugf("JWKS cache write failed (non-fatal): %v", err)
+		warnf("JWKS cache write to %s failed, using the live key set: %v", filepath.Join(oidccache.Dir, oidccache.JWKSFile), err)
 	}
 	return keys, nil
 }

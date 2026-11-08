@@ -3,6 +3,188 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - unreleased
+
+No fallbacks: an unsupported platform, a missing file or a failed step is an
+error with a clear message, never a silent default. Upgrades from 0.6.x keep
+LLDAP and Active Directory hosts working without a manual step, unless the
+host is not a supported platform, its log file has a mode other than `0640`
+that cannot be corrected, or its sshd config fails `sshd -t` (see Breaking).
+
+### Breaking
+- Supported platforms are exactly Ubuntu 24.04 or later, Debian 13 or later,
+  Rocky Linux 9 and 10, and Fedora 44 or later (amd64), matched on the
+  `ID` and `VERSION_ID` of `/etc/os-release`. Every other distribution or
+  version is refused, including AlmaLinux, CentOS, RHEL and other clones and a
+  match through `ID_LIKE` only. The package pre-install script refuses to
+  install or upgrade before any file is unpacked, so an installed version
+  stays as it is, and `--setup-ldap`, `--check` and `--enable` exit 1 before
+  they read the config or change the host. The message is
+  `unsupported distribution "<ID> <VERSION_ID>" (supported: ubuntu >= 24.04, debian >= 13, rocky 9/10, fedora >= 44)`.
+  Logins (the PAM authentication and account phases) do not check the
+  platform.
+- `ldap.profile` is required (`"lldap"` or `"ad"`). A config with an `ldap`
+  block without it fails `--check`, `--enable` and `--setup-ldap` with
+  `config: ldap.profile is required ("lldap" or "ad")`. On upgrade the package
+  runs the new `pam-device-auth --migrate-config` once, which sets
+  `"profile": "lldap"` where 0.6.x read an unset, `null` or `""` profile as
+  `lldap`; see Added. Configs that set `profile` (every Active Directory
+  install) are not touched. If the migration fails, the post-install script
+  fails with the reason and the step that completes the upgrade, and the
+  config stays as it was.
+- Package removal is refused while `/etc/pam.d/sshd` uses `pam_device_auth.so`
+  and no valid `/etc/pam.d/sshd.original` exists (`.deb` and `.rpm`):
+  `pam-device-auth: /etc/pam.d/sshd uses pam_device_auth.so and no valid /etc/pam.d/sshd.original exists; restore /etc/pam.d/sshd from your distribution's openssh-server package, then remove pam-device-auth`.
+  The package and sshd stay as they are. Restore the file from the
+  distribution's `openssh-server` package, then remove the package again.
+- `--enable` backs up `/etc/pam.d/sshd` to `/etc/pam.d/sshd.original` as its
+  first step and stops before it writes the sshd drop-in or the PAM stack when
+  that fails; 0.6.x printed `[WARN] could not back up` and activated anyway.
+  A missing `/etc/pam.d/sshd`, one that uses `pam_device_auth.so` while no
+  backup exists, and an existing `sshd.original` that is empty, has no `auth`
+  or `@include` line or uses `pam_device_auth.so` (the rule the package
+  removal applies) are errors that name the restore from the
+  `openssh-server` package. A valid `sshd.original` from an earlier
+  `--enable` is kept.
+- Logins: a log file that opens with a mode other than `0640` and cannot be
+  set to `0640` (append-only with `chattr +a`, a filesystem without `chmod`)
+  denies the login like a log that cannot be opened (for example immutable
+  with `chattr +i`); 0.6.x ignored a failed `chmod`. The helper calls `chmod`
+  only when the mode differs, so a log that already is `0640` keeps working
+  when it is append-only. A host with an append-only log of another mode
+  loses every non-root OIDC login after the upgrade until the flag is removed
+  (`chattr -a`) or the mode is `0640`. The reason goes to syslog (`authpriv`,
+  tag `pam-device-auth`), for example
+  `pam-device-auth: cannot set log file mode 0640: chmod /var/log/pam-device-auth.log: operation not permitted; denying login (fail closed)`.
+  Root's key-only login does not run the helper.
+- `--pam-acct` denies non-root users, including key-only service accounts,
+  when its log cannot be opened, or has another mode and cannot be set to
+  `0640` (as above), and sends the reason to
+  syslog (`authpriv`), ending in `; denying`; 0.6.x decided with a
+  stderr-only logger. It exits 3, which the PAM module logs as
+  `acct_mgmt: helper exited 3 (infra failure) for user <user> from IP <ip> — denying login (fail-closed)`.
+  Root stays exempt.
+- `--setup-ldap` aborts when the package index refresh (`apt-get update`)
+  fails, for example on a dead third-party repository or an unreachable
+  proxy, before it changes the host.
+- Package upgrade with an active PAM configuration: a failing `sshd -t` or
+  `systemctl restart` of sshd fails the post-install script, where 0.6.x only
+  printed a warning. The message names the step that completes the upgrade
+  once the sshd config is fixed: `dpkg --configure -a`, or
+  `dnf reinstall ./pam-device-auth-<version>.x86_64.rpm` with the installed
+  version (`dnf reinstall pam-device-auth` from a repository).
+
+### Added
+- Fedora 44 and later, with the RHEL-family setup (`.rpm`, `authselect`,
+  `sshd.service`).
+- `--migrate-config`: if `/etc/pam-device-auth/config.json` has an `ldap`
+  block without `profile` (or with `null` or `""`), it writes
+  `"profile": "lldap"` and prints
+  `config: set ldap.profile = "lldap" (backup /etc/pam-device-auth/config.json.pre-0.7.0)`.
+  The original is kept as `config.json.pre-0.7.0` with the same owner and
+  mode; the new file is written atomically with the original's owner and mode
+  and checked with the loader `--check` uses. Values are carried over as
+  written; indentation and key order are not (keys come out sorted). A config
+  without an `ldap` block, or with `"lldap"` or `"ad"`, is not touched. Any
+  other profile, two keys that differ only in case, duplicate keys that the
+  loader would read differently after the rewrite (it merges duplicate
+  objects, the rewrite keeps the last one), a symlink, an existing backup file
+  or unreadable JSON is an error and leaves the file as it is.
+  The package's post-install script runs it on every install or upgrade that
+  finds an existing config.
+- `--setup-ldap` and `--check` check the login shell of directory users
+  (`ldap.shell`, `/bin/bash` when unset): it must be an absolute path to a
+  regular file that others may execute. `--setup-ldap` refuses before its
+  first change to the host; `--check` reports a `[FAIL]`, also for a relative
+  path that resolves from its working directory.
+- Package pre-install and pre-remove scripts for the `.deb` and the `.rpm`
+  (see Breaking).
+
+### Changed
+- `--setup-ldap` checks every step, and a failed step aborts the setup.
+  Before the first file is written: the package index refresh (`apt-get
+  update`, see Breaking), the package install, marking the packages as manually installed
+  (`apt-mark manual`, `dnf mark install`, `dnf -y mark user`) and the presence
+  of `sss_ssh_authorizedkeys` and the SSSD InfoPipe responder. After
+  `sssd.conf` is written: the sync of its directory (the message says the new
+  file was in place), its `chown`, the home directory wiring
+  (`pam-auth-update --enable mkhomedir`, or `authselect select sssd
+  with-mkhomedir --force` and `systemctl enable --now oddjobd`), nsswitch,
+  sudoers, the sshd drop-in, masking the SSSD socket units, `systemctl enable
+  --now sssd`, `sss_cache -E`, `systemctl restart sssd` and `systemctl
+  reset-failed 'sssd-*'`. Each of these failures restores the previous
+  `sssd.conf` (or removes the new one) and, once sssd runs on the new file,
+  restarts sssd on the restored one. A failed local account migration
+  (`userdel`, `gpasswd`, `chown`) stops the migration and keeps the new
+  `sssd.conf`, because a migrated account resolves only through the
+  directory. The `FAIL:` line names the failed command with its output, what
+  the rollback did, and the changes that stay on the host
+  (`still in place on the host: …`, for example the mkhomedir wiring, `sss` in
+  `/etc/nsswitch.conf`, the sudoers and sshd drop-ins). After a failed
+  `systemctl enable --now sssd` the list says `sssd enabled` only when
+  `systemctl is-enabled sssd` answers `enabled`, nothing about it on
+  `disabled`,
+  ``sssd is masked (not enabled; `systemctl unmask sssd` to use it)`` on
+  `masked`, and
+  ``enable state of sssd unknown (check `systemctl is-enabled sssd`)`` on any
+  other answer.
+- A failed write of the discovery or JWKS cache is logged at WARN with the
+  cache path (`Discovery cache write to /run/pam-device-auth/oidc/discovery.json failed, using the live document: …`,
+  `JWKS cache write to /run/pam-device-auth/oidc/jwks.json failed, using the live key set: …`);
+  the validated live data is used.
+- sshd is restarted through the platform's unit only: `ssh.service` on Debian
+  and Ubuntu, `sshd.service` on Rocky Linux and Fedora (`--enable` and the
+  package scripts). The `--enable` message for a failed restart names the unit.
+- Package post-remove: a failing `sshd -t` or `systemctl restart` fails the
+  script (remove, purge) instead of printing a warning; the message names
+  `systemctl restart <unit>`. The post-install side is under Breaking.
+- Package post-install: a missing `/etc/pam-device-auth/config.json` on
+  upgrade is an error (the template is installed on a first install only).
+  The migration of a drop-in with `LogLevel DEBUG1` to `LogLevel VERBOSE` plus
+  `LogVerbose` is an error when a step fails or `sshd -t` rejects the
+  migrated drop-in (the previous one is put back). PAM counts as active (sshd
+  is validated and restarted) only when `/etc/pam.d/sshd` uses
+  `pam_device_auth.so`; an existing `sshd.original` alone, for example after
+  an aborted `--enable`, no longer counts.
+- `--setup-ldap` and `--enable`: an existing `sssd.conf`, sshd drop-in or
+  sudoers drop-in that cannot be read is an error before it is replaced
+  (`cannot read the existing <path>: …; nothing was written`); 0.6.x treated
+  it as absent, so a rollback removed the file and its previous content was
+  lost. When the directory
+  sync after writing the sshd or sudoers drop-in fails, `sshd -t` or
+  `visudo -c` still runs, a rejected file is rolled back, and an accepted one
+  is reported as in place (`…; it passed sshd -t`).
+- Package post-remove: `/etc/pam.d/sshd` is restored only from a verified
+  `sshd.original`; a failed copy fails the removal and keeps the backup. A
+  removal or purge validates and restarts sshd only when it removed the
+  drop-in or restored `/etc/pam.d/sshd`; then a missing or failing sshd is an
+  error. A host where neither existed (no `--setup-ldap`, no `--enable`) is
+  removed without touching sshd.
+- `--check`, `--setup-ldap` and `--enable` use the platform's paths for
+  `sss_ssh_authorizedkeys` (`/usr/bin` on every supported platform) and the
+  SSSD InfoPipe responder (`/usr/libexec/sssd/sssd_ifp`). A missing binary is
+  a `[FAIL]` or an abort that names the path and the package (`sssd-common`,
+  `sssd-dbus`).
+- `make deb`, `make rpm` and `make release` fail outside a Git checkout, where
+  `git log` gives no commit time for `SOURCE_DATE_EPOCH`.
+
+### Removed
+- Platform detection through `ID_LIKE`, and the Debian profile for every
+  distribution it did not recognise.
+- The implicit `lldap` for an unset `ldap.profile`.
+- The search lists for `sss_ssh_authorizedkeys` and `sssd_ifp`.
+- The restart of `sshd.service` after a failed restart of `ssh.service` (and
+  the reverse).
+- The post-remove edit of `/etc/pam.d/sshd` without a valid backup (strip
+  `pam_device_auth.so`, insert `@include common-auth`/`system-auth` or
+  `auth required pam_unix.so`).
+- Skipping `sshd -t` or the restart in the package scripts when `sshd` or
+  `systemctl` was not found, and the post-install warning for old Ubuntu and
+  Debian versions (replaced by the pre-install refusal).
+- The stderr-only logger of `--pam-acct` when the log could not be opened.
+- The fixed `SOURCE_DATE_EPOCH` outside a Git checkout, and `unknown` as the
+  package version in post-install messages.
+
 ## [0.6.1] - 2026-11-08
 
 ### Security
@@ -316,9 +498,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   fails closed for exactly these users.
 - `--enable`: the sshd drop-in is rendered from the resolved
   `sss_ssh_authorizedkeys` path, with `sshd -t` validation and rollback,
-  instead of copying the packaged template. The template hardcodes
-  `/usr/bin`, which does not exist on RHEL-family hosts
-  (`/usr/libexec/sssd`).
+  instead of copying the packaged template.
 - `--setup-ldap` and `--check`: `ldap.uri` must use `ldaps://` with a host.
   The generated `sssd.conf` never enables StartTLS, so a plain `ldap://` URI
   would have sent `bind_password` in clear text.

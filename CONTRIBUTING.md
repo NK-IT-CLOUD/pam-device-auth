@@ -16,7 +16,7 @@ cd pam-device-auth
 # Ubuntu/Debian:
 sudo apt install build-essential libpam0g-dev
 
-# Rocky Linux/RHEL:
+# Rocky Linux/Fedora:
 sudo dnf install gcc pam-devel
 
 # Build everything

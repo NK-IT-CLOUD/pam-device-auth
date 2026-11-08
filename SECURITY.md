@@ -4,7 +4,8 @@
 
 Only the latest stable point release receives security fixes. Upgrade with
 `apt install --only-upgrade pam-device-auth` on Debian/Ubuntu, or
-`sudo dnf upgrade pam-device-auth` on Rocky Linux/RHEL.
+`sudo dnf install ./pam-device-auth-<version>.x86_64.rpm` with the new release
+asset on Rocky Linux and Fedora.
 
 | Version | Supported |
 |---------|-----------|

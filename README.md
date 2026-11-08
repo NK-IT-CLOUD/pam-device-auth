@@ -104,13 +104,23 @@ and is cleared on reboot.
 - A preflight check (`--check`) that reports what would lock someone out before
   you activate anything.
 - Packages for Debian and Ubuntu (`.deb`, APT repository) and for Rocky Linux
-  (`.rpm`). The Go helper is a static binary without CGO.
+  and Fedora (`.rpm`). The Go helper is a static binary without CGO.
 
 ## What you need
 
-- Ubuntu 24.04+, Debian 13+ or Rocky Linux 9 or 10 on amd64, with OpenSSH 9.6+.
-  Other amd64 distributions with OpenSSH 9.6+ and SSSD may work, but they are not
-  tested or packaged.
+- One of the supported platforms on amd64, with OpenSSH 9.6+:
+
+  | Distribution | Versions |
+  |---|---|
+  | Ubuntu | 24.04 and later |
+  | Debian | 13 and later |
+  | Rocky Linux | 9 and 10 |
+  | Fedora | 44 and later |
+
+  Every other distribution or version is refused, including AlmaLinux, CentOS
+  and other RHEL clones: the package does not install, and `--setup-ldap`, `--check` and
+  `--enable` stop with
+  `unsupported distribution "<ID> <VERSION_ID>" (supported: ubuntu >= 24.04, debian >= 13, rocky 9/10, fedora >= 44)`.
 - An LDAP directory such as LLDAP, or an Active Directory, holding each user's
   group membership and SSH public key. LLDAP users also need a Unix ID; for
   Active Directory, SSSD derives it from the objectSid by default.
@@ -175,8 +185,8 @@ sudo apt install pam-device-auth
 ```
 
 Or install a downloaded package: `sudo apt install ./pam-device-auth_<version>_amd64.deb`.
-On Rocky Linux 9 or 10, install the RPM release asset instead:
-`sudo dnf install ./pam-device-auth-<version>.x86_64.rpm`.
+On Rocky Linux 9 or 10 or Fedora 44 or later, install the RPM release asset
+instead: `sudo dnf install ./pam-device-auth-<version>.x86_64.rpm`.
 
 ### 3. Configure
 
@@ -191,6 +201,7 @@ sudo install -m600 /dev/stdin /etc/pam-device-auth/config.json <<'JSON'
   "sudo_role": "ssh-admin",
   "allowed_algorithms": ["RS256"],
   "ldap": {
+    "profile": "lldap",
     "uri": "ldaps://ldap.example.com:636",
     "base_dn": "dc=example,dc=com",
     "bind_dn": "uid=nss-ro,ou=people,dc=example,dc=com",
@@ -204,7 +215,8 @@ sudo install -m600 /dev/stdin /etc/pam-device-auth/config.json <<'JSON'
 JSON
 ```
 
-The last two `ldap` fields are optional. Members of `service_account_groups` log
+`profile` is required: `lldap` for LLDAP, `ad` for an Active Directory. The
+last two `ldap` fields are optional. Members of `service_account_groups` log
 in with a directory key only, without the OIDC step, which suits automation
 accounts. Members of `nopasswd_sudo_groups` get passwordless sudo. Leave both out
 if you do not use those tiers.
@@ -233,8 +245,13 @@ block and can be intentional, for example an access-group member who is
 deliberately not provisioned with an SSH key. The
 [preflight example](INSTALL.md#5-preflight-check) shows the full output.
 
-Commands: `--check`, `--setup-ldap`, `--enable`, `--pam-acct` (internal, used by
-the PAM account phase), `--debug`, `--version`, `--help`.
+Commands: `--check`, `--setup-ldap`, `--enable`, `--migrate-config` (run by the
+package on upgrade), `--pam-acct` (internal, used by the PAM account phase),
+`--debug`, `--version`, `--help`.
+
+Every step of `--setup-ldap` is checked. A failed step aborts the setup with a
+`FAIL:` line that names the command and its output, what the rollback of
+`/etc/sssd/sssd.conf` did, and the changes that stay on the host.
 
 ## Configuration
 
@@ -253,7 +270,7 @@ the PAM account phase), `--debug`, `--version`, `--help`.
 | `root_login` | no | `key` (default) keeps root's local SSH key as the emergency path; `disabled` refuses every SSH login of root, so root is reachable only through a console |
 | `required_acr` | no | accepted values of the token's `acr` claim (exact match); a token without `acr` or with another value is denied |
 | `root_login_sources` | no | client IPs for which `--check` evaluates root's sshd policy (`Match Address` blocks) |
-| `ldap` | setup/check | directory settings for `--setup-ldap` and the directory preflight: `uri`, `base_dn`, `bind_dn`, `bind_password` or `bind_password_file` (none with a Kerberos keytab), `access_group`, `admin_group`; optional `profile` (`lldap` or `ad`), `ca_file`, `attributes`, `id_mapping`, `id_range`, `home`, `shell`, `kerberos`, `user_search_base`, `group_search_base`, `service_account_groups`, `nopasswd_sudo_groups` |
+| `ldap` | setup/check | directory settings for `--setup-ldap` and the directory preflight: `profile` (`lldap` or `ad`), `uri`, `base_dn`, `bind_dn`, `bind_password` or `bind_password_file` (none with a Kerberos keytab), `access_group`, `admin_group`; optional `ca_file`, `attributes`, `id_mapping`, `id_range`, `home`, `shell`, `kerberos`, `user_search_base`, `group_search_base`, `service_account_groups`, `nopasswd_sudo_groups` |
 
 `--setup-ldap` reads `ldap.bind_password` or the file in
 `ldap.bind_password_file` and writes the password into the root-only
@@ -289,8 +306,8 @@ The check fails closed: if the InfoPipe lookup for a directory user errors out,
 that login is denied. An SSSD or InfoPipe outage therefore denies all directory
 users, not only those with a `clients` value. `--check` reports both the IP-pin
 posture and the InfoPipe health, so you can catch this before production. The
-InfoPipe responder needs the `sssd-dbus` package on Debian, Ubuntu and the RHEL
-family, and `--setup-ldap` installs it. The whole pipeline is described in
+InfoPipe responder needs the `sssd-dbus` package on Debian, Ubuntu, Rocky Linux
+and Fedora, and `--setup-ldap` installs it. The whole pipeline is described in
 [docs/ip-allowlist.md](docs/ip-allowlist.md).
 
 ## Documentation
@@ -348,10 +365,11 @@ ES, 256/384/512), a required `kid`, and no `none` or HMAC.
   and never through a symlink.
 - **Root break-glass.** Key-only, independent of OIDC, SSSD and LDAP. Switch it off
   with `root_login: disabled`.
-- **Uninstall.** Removing the package restores the original `/etc/pam.d/sshd`,
-  removes the sshd drop-in and deletes the managed `/etc/sudoers.d/pam-device-auth`
-  file, so no `NOPASSWD` grant stays behind. This applies to the `.deb` and the
-  `.rpm`.
+- **Uninstall.** Removing the package restores the original `/etc/pam.d/sshd`
+  from `/etc/pam.d/sshd.original`, removes the sshd drop-in and deletes the
+  managed `/etc/sudoers.d/pam-device-auth` file, so no `NOPASSWD` grant stays
+  behind. Without a valid `sshd.original` the removal is refused while
+  `/etc/pam.d/sshd` uses the module. This applies to the `.deb` and the `.rpm`.
 
 [SECURITY.md](SECURITY.md) has the threat model and how to report a
 vulnerability.

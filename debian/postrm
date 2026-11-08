@@ -2,93 +2,130 @@
 set -e
 
 PKG="pam-device-auth"
+ORIG=/etc/pam.d/sshd.original
+DROPIN=/etc/ssh/sshd_config.d/10-pam-device-auth.conf
+# Set by restore_pam when it wrote /etc/pam.d/sshd.
+PAM_RESTORED=
+# Set by undo_sshd_config when it changed a file sshd reads.
+SSHD_CHANGED=
 
 log() { echo "[${PKG}] $*"; }
+err() { echo "[${PKG}] ERROR: $*" >&2; }
 
+# ssh_service: the systemd unit of sshd, by os-release ID (internal/distro
+# Profile.SSHService). preinst only installs on these IDs.
+ssh_service() {
+    if [ ! -r /etc/os-release ]; then
+        err "cannot read /etc/os-release"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    _id=$(. /etc/os-release && printf '%s' "${ID-}") || {
+        err "cannot read ID from /etc/os-release"
+        return 1
+    }
+    case "$_id" in
+        ubuntu | debian) echo ssh.service ;;
+        rocky | fedora) echo sshd.service ;;
+        *)
+            err "unsupported distribution ID \"${_id}\" (supported: ubuntu, debian, rocky, fedora); cannot tell the sshd unit"
+            return 1
+            ;;
+    esac
+}
+
+# restart_ssh: validate the sshd config, then restart the platform's unit.
+# Any failure is an error: sshd must not keep running with a PAM stack or
+# drop-in that no longer matches the installed files.
 restart_ssh() {
-    if ! command -v systemctl >/dev/null 2>&1; then
+    _unit=$(ssh_service) || return 1
+    # Capture stderr in a variable — no temp file, so no predictable-path
+    # symlink-clobber vector when this runs as root.
+    if ! _sshd_err=$(sshd -t 2>&1); then
+        err "sshd -t failed — NOT restarting ${_unit}. Fix the sshd config, then run: systemctl restart ${_unit}"
+        err "$_sshd_err"
+        return 1
+    fi
+    if ! systemctl restart "$_unit"; then
+        err "systemctl restart ${_unit} failed"
+        return 1
+    fi
+}
+
+# valid_backup: sshd.original is non-empty, looks like a PAM config and is not
+# itself a pam-device-auth stack. The Debian default authenticates via
+# '@include common-auth' and has no literal 'auth' line, so '^@include' counts.
+# Same rule as check_removal in prerm.
+valid_backup() {
+    [ -s "$ORIG" ] && grep -qE '^(auth|@include)' "$ORIG" && ! grep -q 'pam_device_auth.so' "$ORIG"
+}
+
+# restore_pam puts the verified sshd.original back. prerm refuses the removal
+# when /etc/pam.d/sshd uses the module and no valid backup exists, so that
+# state here is an error, never a reason to edit /etc/pam.d/sshd.
+restore_pam() {
+    if valid_backup; then
+        if ! cp -p "$ORIG" /etc/pam.d/sshd; then
+            err "could not write /etc/pam.d/sshd from ${ORIG}; copy it back by hand (${ORIG} is kept)"
+            return 1
+        fi
+        PAM_RESTORED=1
+        rm -f "$ORIG"
+        log "Restored original PAM config from sshd.original"
         return 0
     fi
-    if command -v sshd >/dev/null 2>&1; then
-        # Capture stderr in a variable — no temp file, so no predictable-path
-        # symlink-clobber vector when this runs as root.
-        sshd_err=$(sshd -t 2>&1) || {
-            log "ERROR: sshd config invalid — NOT restarting SSH. Fix and restart manually:"
-            log "$sshd_err"
-            return 1
-        }
-    fi
-    systemctl restart ssh.service 2>/dev/null || \
-    systemctl restart sshd.service 2>/dev/null || \
-    log "WARNING: Could not restart SSH (manual restart may be needed)"
-}
-
-restore_pam() {
-    # Determine the distro-native PAM stack include token: Debian/Ubuntu use
-    # 'common-auth', RHEL-family (rhel/fedora/centos/rocky/almalinux, via
-    # ID/ID_LIKE) use 'system-auth'.
-    _pam_token="common-auth"
-    if [ -f /etc/os-release ]; then
-        _id_like=$(. /etc/os-release; echo "$ID $ID_LIKE")
-        case "$_id_like" in
-            *rhel*|*fedora*|*centos*|*rocky*|*almalinux*) _pam_token="system-auth" ;;
+    if [ -e /etc/pam.d/sshd ]; then
+        _rc=0
+        grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?
+        case "$_rc" in
+            0)
+                err "/etc/pam.d/sshd uses pam_device_auth.so and no valid ${ORIG} exists; restore /etc/pam.d/sshd from your distribution's openssh-server package"
+                return 1
+                ;;
+            1) ;;
+            *)
+                err "cannot read /etc/pam.d/sshd (grep exit $_rc)"
+                return 1
+                ;;
         esac
     fi
-
-    ORIG=/etc/pam.d/sshd.original
-    # A usable backup is: non-empty, looks like a PAM config, and is NOT itself a
-    # pam-device-auth config. The distro default authenticates via '@include
-    # common-auth' (or 'system-auth' on RHEL) and has NO literal 'auth' line, so
-    # we accept '^auth' OR '^@include'.
-    if [ -s "$ORIG" ] && grep -qE '^(auth|@include)' "$ORIG" && ! grep -q 'pam_device_auth.so' "$ORIG"; then
-        # cp is the left operand of && and so is exempt from `set -e`; check it
-        # explicitly and fall through to the strip fallback on failure, otherwise
-        # a failed restore would silently leave the now-dangling module in place.
-        if cp -p "$ORIG" /etc/pam.d/sshd; then
-            rm -f "$ORIG"
-            log "Restored original PAM config from sshd.original"
-            return
-        fi
-        log "WARNING: could not write /etc/pam.d/sshd from sshd.original — applying safe fallback"
+    if [ -e "$ORIG" ]; then
+        rm -f "$ORIG"
+        log "Removed unusable ${ORIG} (/etc/pam.d/sshd does not use pam_device_auth.so)"
     fi
-    # No usable backup (or restore failed): make /etc/pam.d/sshd safe anyway — drop our
-    # module so it is not left dangling, and ensure a real authenticator (@include
-    # $_pam_token) remains (the pam-device-auth template has no $_pam_token, so
-    # stripping alone is unsafe).
-    if grep -q 'pam_device_auth.so' /etc/pam.d/sshd 2>/dev/null; then
-        sed -i '/pam_device_auth\.so/d' /etc/pam.d/sshd
-        # Ensure a real authenticator remains. Prefer '@include $_pam_token',
-        # but only if that file actually exists — on a non-@include / flattened
-        # PAM stack the include resolves to nothing and would deny ALL non-root
-        # logins. Fall back to a concrete module there.
-        if ! grep -q "$_pam_token" /etc/pam.d/sshd; then
-            if [ -f "/etc/pam.d/${_pam_token}" ]; then
-                sed -i "1i @include ${_pam_token}" /etc/pam.d/sshd
-                log "WARNING: no usable sshd.original — stripped pam_device_auth.so and ensured @include ${_pam_token}"
-            else
-                sed -i '1i auth required pam_unix.so' /etc/pam.d/sshd
-                log "WARNING: no usable sshd.original and no ${_pam_token} — stripped pam_device_auth.so and inserted 'auth required pam_unix.so'"
-            fi
-        else
-            log "WARNING: no usable sshd.original — stripped pam_device_auth.so (${_pam_token} already present)"
-        fi
-    fi
-    rm -f "$ORIG"
 }
 
-case "$1" in
-    remove|0)
-        log "Removing ${PKG}"
+# undo_sshd_config removes the sshd drop-in and restores /etc/pam.d/sshd
+# (restore_pam). It sets SSHD_CHANGED only when that changed a file sshd
+# reads: the caller validates and restarts sshd only then, and then a missing
+# or failing sshd is an error. A removal that finds neither (openssh-server
+# may be gone already) leaves sshd alone.
+undo_sshd_config() {
+    if [ -e "$DROPIN" ] || [ -L "$DROPIN" ]; then
+        rm -f "$DROPIN"
+        SSHD_CHANGED=1
+    fi
+    restore_pam
+    if [ -n "$PAM_RESTORED" ]; then
+        SSHD_CHANGED=1
+    fi
+}
 
-        # Remove SSH daemon config
-        rm -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf
+# deb: remove | purge | upgrade <new-version> | failed-upgrade <old> <new> |
+#      abort-install [<old> <new>] | abort-upgrade <old> <new> | disappear ...
+# rpm %postun: 0 = erase, 1 = upgrade (this old version was replaced)
+case "$1" in
+    remove | 0)
+        log "Removing ${PKG}"
 
         # Roll back the tool-managed sudoers (incl. any NOPASSWD groups) — a
         # leftover NOPASSWD:ALL grant after uninstall is a privilege-escalation risk.
         rm -f /etc/sudoers.d/pam-device-auth
 
-        # Restore original PAM config (robust against @include-based defaults)
-        restore_pam
+        # Remove the SSH daemon config and restore the PAM stack. A host
+        # where --setup-ldap and --enable never ran has neither, and sshd is
+        # left alone.
+        undo_sshd_config
 
         # Remove logrotate + tmpfiles
         rm -f /etc/logrotate.d/${PKG}
@@ -98,39 +135,46 @@ case "$1" in
         # would otherwise survive until the next reboot clears the tmpfs.
         rm -rf /run/${PKG}
 
-        restart_ssh || true
+        if [ -n "$SSHD_CHANGED" ]; then
+            restart_ssh
+        fi
         log "Removal complete"
         ;;
 
     purge)
         log "Purging ${PKG}"
 
-        # Remove SSH daemon config (if remove didn't run)
-        rm -f /etc/ssh/sshd_config.d/10-pam-device-auth.conf
-
         # Roll back the tool-managed sudoers (incl. any NOPASSWD groups) — a
         # leftover NOPASSWD:ALL grant after uninstall is a privilege-escalation risk.
         rm -f /etc/sudoers.d/pam-device-auth
 
-        # Restore original PAM config (robust against @include-based defaults)
-        restore_pam
+        # A purge from the config-files state usually finds nothing sshd reads
+        # (remove already did that), and openssh-server may be gone by then.
+        undo_sshd_config
 
         # Remove all config, cache, logs
-        rm -rf /etc/${PKG}
+        rm -rf "/etc/${PKG:?}"
         rm -rf /run/${PKG}
         rm -f /var/log/${PKG}.log
         rm -f /var/log/${PKG}-uninstall.log
         rm -f /etc/logrotate.d/${PKG}
         rm -f /etc/tmpfiles.d/${PKG}.conf
 
-        restart_ssh || true
+        if [ -n "$SSHD_CHANGED" ]; then
+            restart_ssh
+        fi
         log "Purge complete"
         ;;
 
-    1|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    upgrade | failed-upgrade | abort-install | abort-upgrade | disappear | 1)
         # deb upgrade ("upgrade" etc.) and rpm upgrade (numeric "1", meaning
         # a newer version is being installed) must NOT restore/remove — the
         # new version's postinst still needs the config in place.
+        ;;
+
+    *)
+        err "postrm called with unknown argument \"$1\""
+        exit 1
         ;;
 esac
 

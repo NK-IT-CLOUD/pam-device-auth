@@ -4,8 +4,117 @@ Symptom-first index. For each issue: likely cause and the commands to
 confirm it.
 
 First stop: `/var/log/pam-device-auth.log` (Go helper) and
-`journalctl -u ssh -f` (PAM module via sshd). Both should be tailing
-during an auth attempt.
+`journalctl -u ssh -f` (PAM module via sshd; `-u sshd` on Rocky Linux and
+Fedora). Both should be tailing during an auth attempt.
+
+## Setup and package scripts
+
+### `unsupported distribution "<ID> <VERSION_ID>" (supported: …)`
+
+The host is not one of the supported platforms: Ubuntu 24.04 or later, Debian
+13 or later, Rocky Linux 9 and 10, Fedora 44 or later, matched on `ID` and
+`VERSION_ID` in `/etc/os-release`. Every other distribution is refused, also
+one whose `ID_LIKE` names a supported one (AlmaLinux, CentOS and other RHEL
+clones). The package pre-install script refuses before any file is unpacked
+(an installed version stays as it is), and `--setup-ldap`, `--check` and
+`--enable` exit 1 before they read the config.
+
+```bash
+grep -E '^(ID|VERSION_ID)=' /etc/os-release
+```
+
+### `config: ldap.profile is required ("lldap" or "ad")`
+
+The `ldap` block has no `profile`. Set `"profile": "lldap"` for LLDAP or
+`"profile": "ad"` for an Active Directory. The package sets `lldap` on install
+and upgrade through `pam-device-auth --migrate-config` when the block has no
+profile; run it by hand (`sudo pam-device-auth --migrate-config`) for a config
+you copied onto the host afterwards. The original stays in
+`config.json.pre-0.7.0`. If that file already exists, for example from the
+package upgrade, `--migrate-config` refuses
+(`backup /etc/pam-device-auth/config.json.pre-0.7.0 already exists; …`) and
+changes nothing: set `"profile"` in `config.json` by hand instead, or move the
+old backup away first.
+
+### `--migrate-config failed` during a package upgrade
+
+The post-install script stopped with
+`ERROR: /usr/local/bin/pam-device-auth --migrate-config failed for /etc/pam-device-auth/config.json (reason above); …`.
+The line above it starts with `FAIL:` and names the reason, for example
+`backup /etc/pam-device-auth/config.json.pre-0.7.0 already exists; move it
+away and run --migrate-config again`, an `ldap.profile` other than `lldap` or
+`ad`, two keys that differ only in case, duplicate keys
+(`the config loader would read more than ldap.profile differently after the migration …`,
+for example a second `ldap` or `attributes` object, which the loader merges
+and the rewrite would not), a config that is a symlink or not valid JSON. The
+config is unchanged. Fix it, then finish the upgrade with
+`sudo dpkg --configure -a` (Debian, Ubuntu) or
+`sudo dnf reinstall ./pam-device-auth-<version>.x86_64.rpm` (Rocky Linux,
+Fedora; `sudo dnf reinstall pam-device-auth` from a repository).
+
+### Package upgrade fails at the sshd restart
+
+With PAM active the post-install script runs `sshd -t` and restarts
+`ssh.service` (`sshd.service` on Rocky Linux and Fedora). If either fails, the
+script fails and prints the sshd error, so the new module is not left behind
+an sshd that was never restarted. Fix the sshd config (`sudo sshd -t`), then
+run the finish step the message names (`dpkg --configure -a`, or the `dnf
+reinstall` above).
+
+### Package removal is refused
+
+```text
+pam-device-auth: /etc/pam.d/sshd uses pam_device_auth.so and no valid /etc/pam.d/sshd.original exists; restore /etc/pam.d/sshd from your distribution's openssh-server package, then remove pam-device-auth
+```
+
+The removal would leave sshd pointing at a missing `pam_device_auth.so`.
+`sshd.original` is missing, empty, has no `auth` or `@include` line, or itself
+contains `pam_device_auth.so` (for example after a failed backup during an
+`--enable` of 0.6.x, which only warned, or removed by hand later; `--enable`
+of 0.7.0 refuses to activate without a valid backup). Restore `/etc/pam.d/sshd` from the distribution's `openssh-server`
+package, check that it no longer names `pam_device_auth.so`, then remove
+pam-device-auth again. On Debian and Ubuntu, extract it from the package file:
+
+```bash
+cd "$(mktemp -d)"
+apt-get download openssh-server
+dpkg-deb --fsys-tarfile openssh-server_*.deb | tar -xOf - ./etc/pam.d/sshd > sshd
+sudo install -m 0644 -o root -g root sshd /etc/pam.d/sshd
+```
+
+On Rocky Linux and Fedora, extract it from the `openssh-server` RPM
+(`dnf download` needs the `dnf-plugins-core` package on Rocky Linux, `cpio`
+may have to be installed):
+
+```bash
+cd "$(mktemp -d)"
+dnf download openssh-server
+rpm2cpio openssh-server-*.rpm | cpio -i --quiet --to-stdout ./etc/pam.d/sshd > sshd
+sudo install -m 0644 -o root -g root sshd /etc/pam.d/sshd
+```
+
+If a removal fails at `sshd -t` or the sshd restart, fix the sshd config, run
+`sudo systemctl restart ssh.service` (`sshd.service` on Rocky Linux and
+Fedora), and with dpkg run the removal again.
+
+### `--setup-ldap` aborts with `FAIL:`
+
+Every step of `--setup-ldap` is checked. The `FAIL:` line has three parts: the
+failed command with its output (for example `apt-get update: …` when a
+third-party repository or the proxy is unreachable, or `authselect select
+sssd with-mkhomedir --force: …`), in parentheses what happened to
+`/etc/sssd/sssd.conf` (`restored previous sssd.conf`, `removed the new
+sssd.conf (none existed before)`, `… and restarted sssd` once sssd was running
+on the new file, or `could NOT roll back sssd.conf: …`), and after
+`still in place on the host:` the changes the abort does not undo (the
+mkhomedir wiring, `sss` in `/etc/nsswitch.conf`, the sudoers and sshd drop-ins,
+masked SSSD socket units, an enabled sssd). Failures before `sssd.conf` is
+written (package index, package install, marking the packages, a missing
+`sss_ssh_authorizedkeys`, `sssd_ifp` or login shell) write no configuration
+file; packages installed so far stay installed. A failed
+local-account migration keeps the new `sssd.conf` (`kept the new sssd.conf:
+…`) and names the steps to finish by hand. Fix the cause and run
+`--setup-ldap` again.
 
 ## Auth fails for every user
 
@@ -40,20 +149,24 @@ not yet enabled (so it would once you run `--enable`).
 ### `--setup-ldap` fails or sssd will not start ("[ifp]" section)
 
 `--setup-ldap` renders an `[ifp]` responder block into `sssd.conf` because
-the account-phase IP gate needs it. On Debian, Ubuntu and the RHEL
-family, the `ifp` responder ships in a separate `sssd-dbus` package, not in the
+the account-phase IP gate needs it. On Debian, Ubuntu, Rocky Linux and
+Fedora, the `ifp` responder ships in a separate `sssd-dbus` package, not in the
 base `sssd` package.
-`--setup-ldap` installs `sssd-dbus` itself as part of its
-package step, so a failed or interrupted run (network hiccup during `apt
-install`, package held back, `sssd.conf` edited by hand afterward pointing
-at a host that later had the package removed) can leave `sssd.conf`
-referencing `[ifp]` with the package missing. sssd then refuses to start.
+`--setup-ldap` installs `sssd-dbus` itself as part of its package step and
+checks that `/usr/libexec/sssd/sssd_ifp` exists before it writes `sssd.conf`.
+A failed install aborts the setup with the error of the package manager
+(`apt-get install -y …: …` or `dnf install -y …: …`); a responder that is still
+missing after the install aborts it with
+`SSSD InfoPipe responder /usr/libexec/sssd/sssd_ifp: …; install the sssd-dbus package`.
+Both happen before any configuration file is written. A package removed later (by hand, or as an
+unneeded dependency) leaves `sssd.conf` referencing `[ifp]` with the package
+missing. sssd then refuses to start.
 
 Confirm the package is present and check sssd's own error:
 
 ```bash
 dpkg -s sssd-dbus            # Debian/Ubuntu; expect "Status: install ok installed"
-rpm -q sssd-dbus             # RHEL family
+rpm -q sssd-dbus             # Rocky Linux, Fedora
 sudo systemctl status sssd -l
 sudo journalctl -u sssd -n 50 --no-pager
 ```
@@ -62,11 +175,11 @@ If the package is missing, install it and restart sssd:
 
 ```bash
 sudo apt-get install sssd-dbus     # Debian/Ubuntu
-sudo dnf install sssd-dbus         # RHEL family
+sudo dnf install sssd-dbus         # Rocky Linux, Fedora
 sudo systemctl restart sssd
 ```
 
-On a RHEL-family host set up with release 0.5.10 or earlier, `sssd-dbus` is installed
+On a Rocky Linux or Fedora host set up with release 0.5.10 or earlier, `sssd-dbus` is installed
 only as a dependency, not as a package you asked for. `dnf remove pam-device-auth`
 then removes it too, and the next restart of sssd fails with `Could not restart
 critical service [ifp]`. Run `sudo dnf mark install sssd-dbus` (Fedora, dnf5:
@@ -264,13 +377,31 @@ sudo rm -f /run/pam-device-auth/<user>.json  # force full device auth next login
 
 ### Every login is denied and the auth log has no entries
 
-If the helper cannot open `/var/log/pam-device-auth.log` (full disk, wrong
-permissions, missing directory) it denies the login on purpose: no audit log,
-no login. sshd discards the helper's stderr, so the reason goes to syslog:
-`journalctl -t pam-device-auth` (or `grep pam-device-auth /var/log/auth.log`)
-shows `cannot open /var/log/pam-device-auth.log: ...; denying login (fail
-closed)`. Fix the log file and the next login works. Root's key-only break-glass
-login is unaffected.
+If the helper cannot open `/var/log/pam-device-auth.log` (missing directory, a
+symlink, an immutable file, a read-only filesystem, no space to create a
+missing log) or finds a mode other than `0640` that it cannot correct (an
+append-only file, a filesystem without `chmod`), it denies the login on
+purpose: no audit log, no login. A log that already is `0640` is not changed,
+so an append-only log with that mode works. An existing log on a full disk
+still opens. sshd discards the helper's stderr, so
+the reason goes to syslog (`authpriv`): `journalctl -t pam-device-auth` (or
+`grep pam-device-auth /var/log/auth.log`) shows
+`pam-device-auth: cannot open /var/log/pam-device-auth.log: ...; denying login (fail closed)`
+or
+`pam-device-auth: cannot set log file mode 0640: chmod /var/log/pam-device-auth.log: ...; denying login (fail closed)`.
+The account phase (`--pam-acct`) denies every non-root user in the same case,
+including key-only service accounts: syslog shows the same text ending in
+`; denying`, and the PAM module logs
+`acct_mgmt: helper exited 3 (infra failure) for user <user> from IP <ip> — denying login (fail-closed)`.
+Check and fix the file, and the next login works:
+
+```bash
+sudo ls -l /var/log/pam-device-auth.log   # expect 0640 root:adm
+sudo lsattr /var/log/pam-device-auth.log  # an "a" or "i" flag blocks it
+sudo chattr -a -i /var/log/pam-device-auth.log
+```
+
+Root's key-only break-glass login is unaffected.
 
 ### Root cannot log in over SSH
 
@@ -293,14 +424,15 @@ per address ([configuration reference](configuration-reference.md#root_login_sou
 (`/etc/ssh/sshd_config.d/10-pam-device-auth.conf`) and validates it with
 `sshd -t`, but it does not restart or reload sshd. The running sshd
 process keeps using whatever config it already loaded until `--enable`
-runs (which restarts `sshd.service`) or you reload sshd by hand. This is
+runs (which restarts `ssh.service` on Debian and Ubuntu, `sshd.service` on
+Rocky Linux and Fedora) or you reload sshd by hand. This is
 why a fresh `--setup-ldap` run can look like it did nothing: the drop-in
 is on disk and valid, sshd just has not picked it up yet.
 
 ```bash
 sudo pam-device-auth --enable            # activates PAM and restarts sshd
 # or, without touching PAM state:
-sudo systemctl reload sshd
+sudo systemctl reload ssh.service        # sshd.service on Rocky Linux and Fedora
 ```
 
 ### `Permission denied (publickey,keyboard-interactive)` on known-good user
@@ -362,7 +494,7 @@ Manual override in `config.json`:
 { "show_qr": false }
 ```
 
-Link + code are always displayed as text fallback.
+Link and code are always displayed as text, with or without the QR.
 
 ### Device-auth URL never appears
 
@@ -425,9 +557,11 @@ sudo chmod 0640 /var/log/pam-device-auth.log
 sudo chown root:adm /var/log/pam-device-auth.log
 ```
 
-The Go helper re-asserts `0640` on open; the C module uses `O_NOFOLLOW`
-and mode `0640`. logrotate creates new files with `0640 root adm` after
-the v0.3.5+ postinst.
+The Go helper checks the mode every time it opens the log, sets `0640` when
+the mode differs, and denies non-root logins when that fails (see
+[Every login is denied and the auth log has no entries](#every-login-is-denied-and-the-auth-log-has-no-entries));
+the C module uses `O_NOFOLLOW` and mode `0640`. logrotate creates new files
+with `0640 root adm`.
 
 ## Observability
 
@@ -438,8 +572,8 @@ sudo grep "Authentication attempt" /var/log/pam-device-auth.log   # PAM side
 sudo grep "Auth OK\|Access denied\|failed"  /var/log/pam-device-auth.log  # Go side
 ```
 
-The PAM side uses the `[PAM]` prefix; the Go side uses `[AUTH]`. The file
-is append-only and shared between both.
+The PAM side uses the `[PAM]` prefix; the Go side uses `[AUTH]`. Both append
+to the same file.
 
 ## Escalation checklist
 

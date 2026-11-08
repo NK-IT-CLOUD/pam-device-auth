@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,12 +37,17 @@ func Fetch(ctx context.Context, client *http.Client, issuerURL string) (*Endpoin
 
 // FetchCached serves the discovery document from the on-disk metadata cache
 // when a fresh entry for issuerURL exists, otherwise fetches live and caches
-// the validated body best-effort. A cached body goes through Parse exactly
+// the validated body; a failed cache write is logged at WARN. A cached body goes through Parse exactly
 // like a live response, so a cache hit never bypasses validation. debugf
-// receives non-fatal cache diagnostics; nil disables them.
-func FetchCached(ctx context.Context, client *http.Client, issuerURL string, debugf func(string, ...interface{})) (*Endpoints, error) {
+// receives non-fatal cache diagnostics; warnf a failed cache write with the
+// cache path, after which the validated live document is still returned (the
+// cache is no authentication source). nil disables either.
+func FetchCached(ctx context.Context, client *http.Client, issuerURL string, debugf, warnf func(string, ...interface{})) (*Endpoints, error) {
 	if debugf == nil {
 		debugf = func(string, ...interface{}) {}
+	}
+	if warnf == nil {
+		warnf = func(string, ...interface{}) {}
 	}
 
 	if body, err := oidccache.Load(oidccache.DiscoveryFile, issuerURL); err != nil {
@@ -64,7 +70,7 @@ func FetchCached(ctx context.Context, client *http.Client, issuerURL string, deb
 		return nil, err
 	}
 	if err := oidccache.Save(oidccache.DiscoveryFile, issuerURL, body); err != nil {
-		debugf("Discovery cache write failed (non-fatal): %v", err)
+		warnf("Discovery cache write to %s failed, using the live document: %v", filepath.Join(oidccache.Dir, oidccache.DiscoveryFile), err)
 	}
 	return ep, nil
 }

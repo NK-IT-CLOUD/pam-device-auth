@@ -391,7 +391,7 @@ func TestLoad_NewFieldsParse(t *testing.T) {
 		t.Errorf("RootLoginSources = %v", got)
 	}
 	l := cfg.LDAP
-	if l.ProfileName() != LDAPProfileAD || l.CAFile != "/etc/ssl/ad-ca.pem" || l.BindPasswordFile == "" {
+	if l.Profile != LDAPProfileAD || l.CAFile != "/etc/ssl/ad-ca.pem" || l.BindPasswordFile == "" {
 		t.Errorf("ldap basics = %+v", l)
 	}
 	if l.Attributes.Clients != "extensionAttribute1" || l.IDMapping == nil || !*l.IDMapping || l.IDRange.Max != 60000 {
@@ -399,12 +399,6 @@ func TestLoad_NewFieldsParse(t *testing.T) {
 	}
 	if l.Kerberos == nil || l.Kerberos.Realm != "EXAMPLE.COM" || l.Kerberos.Keytab != "/etc/krb5.sssd.keytab" {
 		t.Errorf("kerberos = %+v", l.Kerberos)
-	}
-}
-
-func TestLDAPConfig_ProfileNameDefaultsToLLDAP(t *testing.T) {
-	if got := (&LDAPConfig{}).ProfileName(); got != LDAPProfileLLDAP {
-		t.Fatalf("ProfileName() = %q, want %q", got, LDAPProfileLLDAP)
 	}
 }
 

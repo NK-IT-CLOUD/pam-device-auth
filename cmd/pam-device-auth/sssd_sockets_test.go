@@ -100,7 +100,9 @@ func TestMaskConflictingSSSDSockets_MasksOnceAndIsIdempotent(t *testing.T) {
 	failed := map[string]bool{"sssd-pam.socket": true}
 	calls := fakeSystemctl(t, enabled, failed, false)
 
-	maskConflictingSSSDSockets(responderConf)
+	if err := maskConflictingSSSDSockets(responderConf); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
 	var changes []string
 	for _, c := range *calls {
 		if strings.HasPrefix(c, "disable ") || strings.HasPrefix(c, "mask ") {
@@ -117,7 +119,9 @@ func TestMaskConflictingSSSDSockets_MasksOnceAndIsIdempotent(t *testing.T) {
 	}
 
 	*calls = nil
-	maskConflictingSSSDSockets(responderConf)
+	if err := maskConflictingSSSDSockets(responderConf); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
 	for _, c := range *calls {
 		if strings.HasPrefix(c, "disable ") || strings.HasPrefix(c, "mask ") {
 			t.Errorf("second run changed units again: %q", c)
@@ -128,21 +132,68 @@ func TestMaskConflictingSSSDSockets_MasksOnceAndIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestMaskConflictingSSSDSockets_FailureIsAWarning(t *testing.T) {
-	setupWarnings = nil
-	t.Cleanup(func() { setupWarnings = nil })
-	fakeSystemctl(t, map[string]string{"sssd-nss.socket": "enabled"}, map[string]bool{}, true)
+func TestMaskSocketsFailureIsError(t *testing.T) {
+	t.Run("mask fails", func(t *testing.T) {
+		setupWarnings = nil
+		t.Cleanup(func() { setupWarnings = nil })
+		calls := fakeSystemctl(t, map[string]string{"sssd-nss.socket": "enabled", "sssd-ssh.socket": "enabled"}, map[string]bool{}, true)
 
-	maskConflictingSSSDSockets(responderConf)
-	if len(setupWarnings) != 1 || !strings.Contains(setupWarnings[0], "mask sssd-nss.socket failed") {
-		t.Errorf("warnings = %v, want one about masking sssd-nss.socket", setupWarnings)
-	}
+		err := maskConflictingSSSDSockets(responderConf)
+		if err == nil || !strings.Contains(err.Error(), "systemctl mask sssd-nss.socket") || !strings.Contains(err.Error(), "Failed to mask unit") {
+			t.Fatalf("err = %v, want the failed mask of sssd-nss.socket with its output", err)
+		}
+		// The first failure stops the step: sssd-ssh.socket is not touched.
+		for _, c := range *calls {
+			if strings.HasSuffix(c, "sssd-ssh.socket") && !strings.HasPrefix(c, "is-") {
+				t.Errorf("unit changed after the failure: %q", c)
+			}
+		}
+		if len(setupWarnings) != 0 {
+			t.Errorf("failure reported as a warning: %v", setupWarnings)
+		}
+	})
+	t.Run("disable fails", func(t *testing.T) {
+		orig := systemctl
+		t.Cleanup(func() { systemctl = orig })
+		var calls []string
+		systemctl = func(args ...string) (string, error) {
+			calls = append(calls, strings.Join(args, " "))
+			switch args[0] {
+			case "is-enabled":
+				return "enabled", nil
+			case "disable":
+				return "Access denied", errors.New("exit status 1")
+			}
+			return "", nil
+		}
+		err := maskConflictingSSSDSockets("[sssd]\nservices = nss\n")
+		if err == nil || !strings.Contains(err.Error(), "systemctl disable --now sssd-nss.socket") || !strings.Contains(err.Error(), "Access denied") {
+			t.Fatalf("err = %v, want the failed disable with its output", err)
+		}
+		for _, c := range calls {
+			if strings.HasPrefix(c, "mask ") {
+				t.Errorf("masked after a failed disable: %q", c)
+			}
+		}
+	})
 }
 
 func TestResetFailedSSSDUnits_CoversAllSSSDUnits(t *testing.T) {
 	calls := fakeSystemctl(t, map[string]string{}, map[string]bool{}, false)
-	resetFailedSSSDUnits()
+	if err := resetFailedSSSDUnits(); err != nil {
+		t.Fatalf("resetFailedSSSDUnits: %v", err)
+	}
 	if want := []string{"reset-failed sssd-*"}; !reflect.DeepEqual(*calls, want) {
 		t.Errorf("calls = %v, want %v", *calls, want)
+	}
+}
+
+func TestResetFailedSSSDUnitsFailureIsError(t *testing.T) {
+	orig := systemctl
+	t.Cleanup(func() { systemctl = orig })
+	systemctl = func(args ...string) (string, error) { return "Access denied", errors.New("exit status 1") }
+	err := resetFailedSSSDUnits()
+	if err == nil || !strings.Contains(err.Error(), "systemctl reset-failed sssd-*") || !strings.Contains(err.Error(), "Access denied") {
+		t.Fatalf("err = %v, want the failed reset-failed with its output", err)
 	}
 }

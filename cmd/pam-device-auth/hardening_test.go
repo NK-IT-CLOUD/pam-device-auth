@@ -151,9 +151,13 @@ func TestBackupFile_RefusesUnusableRollbackCopies(t *testing.T) {
 		t.Errorf("unreadable src: did=%v err=%v; want an error", did, err)
 	}
 
-	// Missing source stays "nothing to back up".
-	if did, err := backupFile(filepath.Join(dir, "missing"), filepath.Join(dir, "pam-d.original")); err != nil || did {
-		t.Errorf("missing src: did=%v err=%v; want false, nil", did, err)
+	// A missing source is an error: openssh-server ships /etc/pam.d/sshd on
+	// every supported platform, so there is no "nothing to back up".
+	if did, err := backupFile(filepath.Join(dir, "missing"), filepath.Join(dir, "pam-d.original")); err == nil || did {
+		t.Errorf("missing src: did=%v err=%v; want an error", did, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "pam-d.original")); !os.IsNotExist(err) {
+		t.Error("backup written for a missing source")
 	}
 
 	// Pristine source is saved.
@@ -203,6 +207,7 @@ func TestWriteSshdDropin_RollsBackOnRejection(t *testing.T) {
 }
 
 func TestWriteSSSDConfAt_RestoreReportsFailure(t *testing.T) {
+	stubChownRoot(t, nil)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sssd.conf")
 	if err := os.WriteFile(path, []byte("[old]\n"), 0600); err != nil {
@@ -212,7 +217,7 @@ func TestWriteSSSDConfAt_RestoreReportsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restore(); err != nil {
+	if _, err := restore(); err != nil {
 		t.Fatalf("restore() = %v", err)
 	}
 	if got, _ := os.ReadFile(path); string(got) != "[old]\n" {
@@ -231,7 +236,7 @@ func TestWriteSSSDConfAt_RestoreReportsFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(dir, 0700) })
-	if err := restore(); err == nil {
+	if _, err := restore(); err == nil {
 		t.Fatal("restore() = nil although the rollback write must fail")
 	}
 }

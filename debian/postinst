@@ -2,7 +2,7 @@
 set -e
 
 PKG="pam-device-auth"
-PKG_VERSION=$(dpkg-query -W -f='${Version}' "$PKG" 2>/dev/null || echo "unknown")
+BIN="/usr/local/bin/${PKG}"
 SHARE_DIR="/usr/share/${PKG}"
 CONFIG_DIR="/etc/${PKG}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -10,6 +10,7 @@ LOG_FILE="/var/log/${PKG}.log"
 CACHE_DIR="/run/${PKG}"
 
 log() { echo "[${PKG}] $*"; }
+err() { echo "[${PKG}] ERROR: $*" >&2; }
 
 setup_logrotate() {
     cat > /etc/logrotate.d/${PKG} << 'EOF'
@@ -33,159 +34,249 @@ EOF
     chmod 700 "${CACHE_DIR}"
 }
 
-check_os() {
-    if [ -f /etc/os-release ]; then
-        # Subshell: os-release exports VERSION, ID, etc. — don't pollute our namespace
-        _os_warn=$(
-            . /etc/os-release
-            case "$ID" in
-                ubuntu)
-                    if [ "${VERSION_ID%%.*}" -lt 24 ] 2>/dev/null; then
-                        echo "WARNING: Ubuntu 24.04+ recommended (found ${VERSION_ID})"
-                    fi
-                    ;;
-                debian)
-                    if [ "${VERSION_ID%%.*}" -lt 13 ] 2>/dev/null; then
-                        echo "WARNING: Debian 13+ required — OpenSSH >= 9.6 needed (found ${VERSION_ID})"
-                    fi
-                    ;;
-            esac
-        )
-        [ -n "$_os_warn" ] && log "$_os_warn"
+# ssh_service: the systemd unit of sshd, by os-release ID (internal/distro
+# Profile.SSHService). preinst only installs on these IDs.
+ssh_service() {
+    if [ ! -r /etc/os-release ]; then
+        err "cannot read /etc/os-release"
+        return 1
     fi
-    return 0
-}
-
-restart_ssh() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        return 0
-    fi
-    if command -v sshd >/dev/null 2>&1; then
-        # Capture stderr in a variable — no temp file, so no predictable-path
-        # symlink-clobber vector when this runs as root.
-        sshd_err=$(sshd -t 2>&1) || {
-            log "ERROR: sshd config invalid — NOT restarting SSH. Fix and restart manually:"
-            log "$sshd_err"
-            return 1
-        }
-    fi
-    systemctl restart ssh.service 2>/dev/null || \
-    systemctl restart sshd.service 2>/dev/null || {
-        log "ERROR: systemctl could not restart the SSH service."
+    # shellcheck source=/dev/null
+    _id=$(. /etc/os-release && printf '%s' "${ID-}") || {
+        err "cannot read ID from /etc/os-release"
         return 1
     }
+    case "$_id" in
+        ubuntu | debian) echo ssh.service ;;
+        rocky | fedora) echo sshd.service ;;
+        *)
+            err "unsupported distribution ID \"${_id}\" (supported: ubuntu, debian, rocky, fedora); cannot tell the sshd unit"
+            return 1
+            ;;
+    esac
+}
+
+# restart_ssh: validate the sshd config, then restart the platform's unit.
+# Any failure is an error: the upgraded module must not be left behind a
+# running sshd that was never restarted.
+restart_ssh() {
+    _unit=$(ssh_service) || return 1
+    # Capture stderr in a variable — no temp file, so no predictable-path
+    # symlink-clobber vector when this runs as root.
+    if ! _sshd_err=$(sshd -t 2>&1); then
+        err "sshd -t failed — NOT restarting ${_unit}. Fix the sshd config, then run: ${FINISH}"
+        err "$_sshd_err"
+        return 1
+    fi
+    if ! systemctl restart "$_unit"; then
+        err "systemctl restart ${_unit} failed; fix the cause, then run: ${FINISH}"
+        return 1
+    fi
+}
+
+# pam_active: the live sshd PAM stack uses the module. Only its content
+# counts: --enable writes a valid sshd.original as its first step, so an
+# aborted --enable leaves the backup without PAM being active.
+pam_active() {
+    [ -e /etc/pam.d/sshd ] || return 1
+    _rc=0
+    grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?
+    case "$_rc" in
+        0) return 0 ;;
+        1) return 1 ;;
+    esac
+    err "cannot read /etc/pam.d/sshd (grep exit $_rc)"
+    exit 1
+}
+
+# migrate_config: an existing config may come from 0.6.x, where an unset
+# ldap.profile meant lldap; 0.7.0 requires it. --migrate-config sets it once
+# (backup config.json.pre-0.7.0) and leaves lldap/ad configs untouched.
+migrate_config() {
+    if ! "$BIN" --migrate-config; then
+        err "${BIN} --migrate-config failed for ${CONFIG_FILE} (reason above); fix the config, then run: ${FINISH}"
+        return 1
+    fi
 }
 
 # Drop-ins rendered before 0.5.13 set "LogLevel DEBUG1" for the QR client
 # detection. Replace that line with what current versions render: LogLevel
 # VERBOSE plus a LogVerbose override for the client version line.
-# Validated with sshd -t; the old file is put back if sshd rejects the new one.
+# Validated with sshd -t; if sshd rejects the new one, the old file is put
+# back and the migration is an error.
 migrate_sshd_loglevel() {
     _dropin=/etc/ssh/sshd_config.d/10-pam-device-auth.conf
     [ -f "$_dropin" ] || return 0
-    grep -qx 'LogLevel DEBUG1' "$_dropin" || return 0
+    _rc=0
+    grep -qx 'LogLevel DEBUG1' "$_dropin" || _rc=$?
+    case "$_rc" in
+        0) ;;
+        1) return 0 ;;
+        *)
+            err "cannot read ${_dropin} (grep exit $_rc)"
+            return 1
+            ;;
+    esac
     # Render next to the drop-in with its owner and mode, then rename it into
     # place: sshd never sees a truncated or half-written file.
     _new="${_dropin}.dpkg-new"
-    awk '$0 == "LogLevel DEBUG1" { print "LogLevel VERBOSE"; print "LogVerbose kex.c:kex_exchange_identification():*"; next } { print }' \
+    if ! { awk '$0 == "LogLevel DEBUG1" { print "LogLevel VERBOSE"; print "LogVerbose kex.c:kex_exchange_identification():*"; next } { print }' \
         "$_dropin" > "$_new" &&
         chown --reference="$_dropin" "$_new" &&
-        chmod --reference="$_dropin" "$_new" || { rm -f "$_new"; return 0; }
-    cp -p "$_dropin" "${_dropin}.dpkg-old"
-    mv "$_new" "$_dropin"
-    if command -v sshd >/dev/null 2>&1 && ! sshd -t >/dev/null 2>&1; then
-        mv "${_dropin}.dpkg-old" "$_dropin"
-        log "WARNING: sshd rejected the LogVerbose line; kept LogLevel DEBUG1 in $_dropin"
-        return 0
+        chmod --reference="$_dropin" "$_new"; }; then
+        rm -f "$_new"
+        err "could not render ${_new} from ${_dropin} (LogLevel DEBUG1 migration); ${_dropin} is unchanged"
+        return 1
+    fi
+    if ! cp -p "$_dropin" "${_dropin}.dpkg-old"; then
+        rm -f "$_new"
+        err "could not back up ${_dropin} (LogLevel DEBUG1 migration); ${_dropin} is unchanged"
+        return 1
+    fi
+    if ! mv "$_new" "$_dropin"; then
+        rm -f "$_new" "${_dropin}.dpkg-old"
+        err "could not install ${_new} as ${_dropin} (LogLevel DEBUG1 migration); ${_dropin} is unchanged"
+        return 1
+    fi
+    # openssh-server is a Depends: sshd is always there to validate with.
+    if ! _sshd_err=$(sshd -t 2>&1); then
+        if ! mv "${_dropin}.dpkg-old" "$_dropin"; then
+            err "sshd -t rejected ${_dropin} and the previous drop-in could not be put back from ${_dropin}.dpkg-old; restore it by hand"
+            err "$_sshd_err"
+            return 1
+        fi
+        err "sshd -t failed with the migrated ${_dropin} (LogLevel VERBOSE + LogVerbose); the previous drop-in (LogLevel DEBUG1) is restored. Fix the sshd config, then run: ${FINISH}"
+        err "$_sshd_err"
+        return 1
     fi
     rm -f "${_dropin}.dpkg-old"
     log "sshd drop-in: LogLevel DEBUG1 replaced by LogLevel VERBOSE + LogVerbose (client version line)"
 }
 
+# deb: configure <most-recently-configured-version> (empty on a first install)
+#      | abort-upgrade <new-version> | abort-remove [in-favour ...]
+#      | abort-deconfigure in-favour ...
+# rpm %post: 1 = install, 2 = upgrade
+# FINISH is the package-manager step that completes the setup after a failure
+# here: dpkg re-runs the postinst of a half-configured package; rpm never
+# re-runs a failed %post, so the package has to be reinstalled: from the
+# package file it was installed from, or by name from a repository. The rpm
+# step names the installed version, so it is set after --version below.
 case "$1" in
-    configure|1|2)
-        check_os
-
-        mkdir -p /etc/ssh/sshd_config.d
-        mkdir -p "${CONFIG_DIR}"
-        # config.json and any migrated predecessor config hold secrets
-        # (OIDC client_secret, LDAP bind_password). Keep the directory
-        # root-only so stray/migrated files are never world-traversable.
-        chown root:root "${CONFIG_DIR}"
-        chmod 700 "${CONFIG_DIR}"
-
-        # Migrate from keycloak-ssh-auth if present
-        if [ -d /etc/keycloak-ssh-auth ]; then
-            log "Migrating from keycloak-ssh-auth..."
-            rm -f /etc/logrotate.d/keycloak-ssh-auth
-            rm -f /usr/lib/tmpfiles.d/keycloak-ssh-auth.conf
-            rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf
-            if [ -f /etc/keycloak-ssh-auth/keycloak-pam.json ]; then
-                cp /etc/keycloak-ssh-auth/keycloak-pam.json "${CONFIG_DIR}/keycloak-pam.json.migrated"
-                # That file historically held an OIDC client_secret / LDAP
-                # bind_password. cp creates it 0644 (world-readable) under the
-                # default umask — lock it down to root, like config.json.
-                chown root:root "${CONFIG_DIR}/keycloak-pam.json.migrated"
-                chmod 600 "${CONFIG_DIR}/keycloak-pam.json.migrated"
-                log "Old config preserved at ${CONFIG_DIR}/keycloak-pam.json.migrated (root-only)"
-            fi
-            rm -rf /etc/keycloak-ssh-auth
-        fi
-
-        setup_logrotate
-        setup_tmpfiles
-
-        # The sshd drop-in (10-pam-device-auth.conf) is NOT installed here:
-        # --setup-ldap and --enable render it from the resolved
-        # sss_ssh_authorizedkeys path and validate it with sshd -t.
-        migrate_sshd_loglevel
-
-        # Install default config template (does NOT activate PAM)
-        if [ ! -f "${CONFIG_FILE}" ]; then
-            cp "${SHARE_DIR}/config/config.json" "${CONFIG_FILE}"
-            log "Installed default config template"
-        fi
-
-        # --- Permissions ---
-        chmod 755 /usr/local/bin/pam-device-auth
-        for _so in /usr/lib/security/pam_device_auth.so /usr/lib64/security/pam_device_auth.so; do
-            [ -f "$_so" ] && chmod 755 "$_so"
-        done
-        chown root:root "${CONFIG_FILE}"
-        chmod 600 "${CONFIG_FILE}"
-        touch "${LOG_FILE}"
-        # Log contains PII (usernames, emails, IPs, roles) — restrict to root+adm
-        chmod 640 "${LOG_FILE}"
-        if getent group adm >/dev/null 2>&1; then
-            chown root:adm "${LOG_FILE}"
-        fi
-
-        # Check if PAM is already activated (upgrade scenario): either the backup
-        # sentinel exists, or the live sshd PAM still references our module (covers
-        # a manually-deleted sshd.original while the module is active).
-        if [ -f /etc/pam.d/sshd.original ] || grep -q pam_device_auth.so /etc/pam.d/sshd 2>/dev/null; then
-            # PAM was previously activated — restart sshd for binary update
-            if restart_ssh; then
-                log "${PKG} ${PKG_VERSION} upgraded successfully."
-            else
-                log "WARNING: ${PKG} ${PKG_VERSION} was upgraded, but sshd was NOT restarted;"
-                log "WARNING: fix the sshd config (sshd -t) and run: systemctl restart ssh (or sshd)"
-            fi
-        else
-            # Fresh install — do NOT activate PAM automatically
-            log "${PKG} ${PKG_VERSION} installed."
-            log ""
-            log "Next steps (identity from LDAP via SSSD, OIDC as 2nd factor):"
-            log "  1. Edit ${CONFIG_FILE}: OIDC settings + \"ldap\": {...} block"
-            log "  2. Run: sudo pam-device-auth --setup-ldap  (SSSD/NSS/sudo/sshd)"
-            log "  3. Run: sudo pam-device-auth --check"
-            log "  4. Run: sudo pam-device-auth --enable"
-            log ""
-            log "  Prereq: each SSH user has uidNumber (< 65536 on LXC), gidNumber"
-            log "  and sshPublicKey in the directory; directory CA trusted on host."
-            log ""
-        fi
+    configure)
+        if [ -n "${2-}" ]; then MODE=upgrade; else MODE=install; fi
+        FINISH="dpkg --configure -a"
+        ;;
+    1 | 2)
+        if [ "$1" = 2 ]; then MODE=upgrade; else MODE=install; fi
+        ;;
+    abort-upgrade | abort-remove | abort-deconfigure)
+        # dpkg undoes a failed upgrade/removal/deconfiguration (e.g. prerm
+        # refused the removal); the installed files and config stay as they
+        # are, there is nothing to configure.
+        exit 0
+        ;;
+    *)
+        err "postinst called with unknown argument \"$1\""
+        exit 1
         ;;
 esac
+
+if ! VERSION_LINE=$("$BIN" --version); then
+    err "${BIN} --version failed"
+    exit 1
+fi
+# --version prints "pam-device-auth <version>"; the release's rpm file is
+# pam-device-auth-<version>.x86_64.rpm (makefile target rpm).
+PKG_VERSION=${VERSION_LINE#"${PKG} "}
+if [ -z "$PKG_VERSION" ] || [ "$PKG_VERSION" = "$VERSION_LINE" ]; then
+    err "unexpected output of ${BIN} --version: \"${VERSION_LINE}\""
+    exit 1
+fi
+case "$1" in
+    1 | 2)
+        FINISH="dnf reinstall ./${PKG}-${PKG_VERSION}.x86_64.rpm (the package file you installed; from a repository: dnf reinstall ${PKG})"
+        ;;
+esac
+
+mkdir -p /etc/ssh/sshd_config.d
+mkdir -p "${CONFIG_DIR}"
+# config.json and any migrated predecessor config hold secrets
+# (OIDC client_secret, LDAP bind_password). Keep the directory
+# root-only so stray/migrated files are never world-traversable.
+chown root:root "${CONFIG_DIR}"
+chmod 700 "${CONFIG_DIR}"
+
+# Migrate from keycloak-ssh-auth if present
+if [ -d /etc/keycloak-ssh-auth ]; then
+    log "Migrating from keycloak-ssh-auth..."
+    rm -f /etc/logrotate.d/keycloak-ssh-auth
+    rm -f /usr/lib/tmpfiles.d/keycloak-ssh-auth.conf
+    rm -f /etc/ssh/sshd_config.d/10-keycloak-auth.conf
+    if [ -f /etc/keycloak-ssh-auth/keycloak-pam.json ]; then
+        cp /etc/keycloak-ssh-auth/keycloak-pam.json "${CONFIG_DIR}/keycloak-pam.json.migrated"
+        # That file historically held an OIDC client_secret / LDAP
+        # bind_password. cp creates it 0644 (world-readable) under the
+        # default umask — lock it down to root, like config.json.
+        chown root:root "${CONFIG_DIR}/keycloak-pam.json.migrated"
+        chmod 600 "${CONFIG_DIR}/keycloak-pam.json.migrated"
+        log "Old config preserved at ${CONFIG_DIR}/keycloak-pam.json.migrated (root-only)"
+    fi
+    rm -rf /etc/keycloak-ssh-auth
+fi
+
+setup_logrotate
+setup_tmpfiles
+
+# The sshd drop-in (10-pam-device-auth.conf) is NOT installed here:
+# --setup-ldap and --enable render it from the resolved
+# sss_ssh_authorizedkeys path and validate it with sshd -t.
+migrate_sshd_loglevel
+
+# Config: an existing one (upgrade, or a reinstall over the config a removal
+# kept) is migrated; a first install gets the default template (does NOT
+# activate PAM); an upgrade without a config is an error.
+if [ -e "${CONFIG_FILE}" ]; then
+    migrate_config
+elif [ "$MODE" = install ]; then
+    cp "${SHARE_DIR}/config/config.json" "${CONFIG_FILE}"
+    log "Installed default config template"
+else
+    err "${CONFIG_FILE} is missing on upgrade; restore it (the template is ${SHARE_DIR}/config/config.json), then run: ${FINISH}"
+    exit 1
+fi
+
+# --- Permissions ---
+chmod 755 "$BIN"
+for _so in /usr/lib/security/pam_device_auth.so /usr/lib64/security/pam_device_auth.so; do
+    [ -f "$_so" ] && chmod 755 "$_so"
+done
+chown root:root "${CONFIG_FILE}"
+chmod 600 "${CONFIG_FILE}"
+touch "${LOG_FILE}"
+# Log contains PII (usernames, emails, IPs, roles) — restrict to root+adm
+chmod 640 "${LOG_FILE}"
+if getent group adm >/dev/null 2>&1; then
+    chown root:adm "${LOG_FILE}"
+fi
+
+if pam_active; then
+    # PAM was previously activated — restart sshd for binary update
+    restart_ssh
+    log "${VERSION_LINE} upgraded successfully."
+else
+    # Not activated — do NOT activate PAM automatically
+    log "${VERSION_LINE} installed."
+    log ""
+    log "Next steps (identity from LDAP via SSSD, OIDC as 2nd factor):"
+    log "  1. Edit ${CONFIG_FILE}: OIDC settings + \"ldap\": {...} block"
+    log "  2. Run: sudo pam-device-auth --setup-ldap  (SSSD/NSS/sudo/sshd)"
+    log "  3. Run: sudo pam-device-auth --check"
+    log "  4. Run: sudo pam-device-auth --enable"
+    log ""
+    log "  Prereq: each SSH user has uidNumber (< 65536 on LXC), gidNumber"
+    log "  and sshPublicKey in the directory; directory CA trusted on host."
+    log ""
+fi
 
 exit 0

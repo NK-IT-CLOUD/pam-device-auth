@@ -30,7 +30,7 @@ returns `PAM_AUTH_ERR`.
 | [`root_login`](#root_login) | string | no | `"key"` | `"key"` keeps root's own SSH key as the emergency path. `"disabled"` refuses every SSH login of root. Applied by `--setup-ldap` and `--enable`. |
 | [`required_acr`](#required_acr) | string[] | no | `[]` (no check) | Accepted values of the access token's `acr` claim, exact match. A token without `acr` or with another value is denied. |
 | [`root_login_sources`](#root_login_sources) | string[] | no | `[]` | Client IP addresses for which `--check` evaluates root's sshd policy (`Match Address` blocks). Used by `--check` only. |
-| [`ldap`](#ldap) | object | setup only | (none) | Directory wiring consumed by `--setup-ldap` to write `/etc/sssd/sssd.conf`. Not used by the auth runtime. |
+| [`ldap`](#ldap) | object | setup only | (none) | Directory wiring consumed by `--setup-ldap` to write `/etc/sssd/sssd.conf`, and checked by `--check`. `ldap.profile` is required in it. Not used by the auth runtime. |
 
 Unknown fields are ignored; extra fields do not fail validation. (Configs from
 older releases that still carry `create_user`, `user_groups`, `admin_groups`,
@@ -276,15 +276,18 @@ everyone else, and only its own `Match User root` block (with `root_login`
 
 ### `ldap`
 
-Consumed only by `pam-device-auth --setup-ldap`, which writes
-`/etc/sssd/sssd.conf` (0600 root). Not read by the auth runtime (SSSD owns the
-bind), so it may be absent in the deployed runtime config.
+Consumed by `pam-device-auth --setup-ldap`, which writes
+`/etc/sssd/sssd.conf` (0600 root), and checked by `--check` and `--enable`.
+Not read by the auth runtime (SSSD owns the bind), so it may be absent in the
+deployed runtime config; `--check` then warns, and `--setup-ldap` refuses to
+run.
 
 For an Active Directory, set `profile` to `"ad"`; see
 [active-directory-setup.md](active-directory-setup.md).
 
 | Key | Description |
 |---|---|
+| `profile` | `"lldap"` (rfc2307bis, `ldap_access_filter`) or `"ad"` (`ldap_schema = ad`, SSSD's simple access provider, nested groups, groups in any OU). There is no default: without it `--setup-ldap`, `--check` and `--enable` fail with `config: ldap.profile is required ("lldap" or "ad")`, and any other value is a config error. On install and upgrade the package runs `pam-device-auth --migrate-config`, which sets `"lldap"` in an `ldap` block without `profile` (or with `null` or `""`) and keeps the original as `config.json.pre-0.7.0`; see [INSTALL.md](../INSTALL.md#upgrade). |
 | `uri` | Directory URL: one `ldaps://<host>[:port]` or `ldap://<host>[:port]` (for example `ldaps://ldap.example.com:636`). `ldap://` means StartTLS: the generated `sssd.conf` sets `ldap_id_use_start_tls = true`, and SSSD does not talk to the server without TLS. With `kerberos.keytab`, `uri` must be `ldap://`: the bind uses GSSAPI with SASL sealing (`ldap_sasl_minssf = 56`) instead of TLS, and `sssd.conf` sets `ldap_id_use_start_tls = false`; `--setup-ldap` and `--check` reject a keytab with `ldaps://` or with an IP address as the host (GSSAPI uses the `ldap/<host>` service principal). There is no cleartext option. LLDAP does not offer StartTLS, so use `ldaps://` with LLDAP. A comma- or whitespace-separated URI list is rejected, because SSSD would treat it as a failover list. `--setup-ldap` and `--check` both enforce this. |
 | `base_dn` | Directory base DN, e.g. `dc=example,dc=com`. |
 | `bind_dn` | Read-only bind identity for SSSD lookups: a DN, a UPN (`svc-sssd@example.com`) or a down-level logon name (`EXAMPLE\svc-sssd`). With `kerberos.keytab` the Kerberos principal, for example `svc-sssd@EXAMPLE.COM`. |
@@ -300,8 +303,7 @@ Optional keys for the directory layout, the password file and Kerberos:
 
 | Key | Default | Description |
 |---|---|---|
-| `profile` | `"lldap"` | `"lldap"` (rfc2307bis, `ldap_access_filter`) or `"ad"` (`ldap_schema = ad`, SSSD's simple access provider, nested groups, groups in any OU). Anything else is a config error. |
-| `ca_file` | distro CA bundle | Absolute path of the CA bundle written to `ldap_tls_cacert`. `--setup-ldap` and `--check` fail when it does not exist or is not a regular file. It must be readable by the user SSSD runs as: on distributions where `sssd_be` runs as user `sssd`, a file below the 0700 directory `/etc/pam-device-auth` is not readable. Use `/usr/local/share/ca-certificates/` (Debian, Ubuntu) or `/etc/pki/ca-trust/source/anchors/` (RHEL family). |
+| `ca_file` | distro CA bundle | Absolute path of the CA bundle written to `ldap_tls_cacert`. `--setup-ldap` and `--check` fail when it does not exist or is not a regular file. It must be readable by the user SSSD runs as: on distributions where `sssd_be` runs as user `sssd`, a file below the 0700 directory `/etc/pam-device-auth` is not readable. Use `/usr/local/share/ca-certificates/` (Debian, Ubuntu) or `/etc/pki/ca-trust/source/anchors/` (Rocky Linux, Fedora). |
 | `bind_password_file` | (none) | Absolute path of a file that holds the bind password on one line; one trailing newline is stripped. It must be a regular file (no symlink) owned by root, without access for group or others (mode 0600), and at most 4096 bytes long; `--setup-ldap` fails on a longer file. |
 | `attributes.username` | `uid` (`lldap`), `sAMAccountName` (`ad`) | LDAP attribute of the login name (`ldap_user_name`). |
 | `attributes.ssh_key` | `sshPublicKey` (`lldap`); required for `ad` | LDAP attribute with the SSH public keys (`ldap_user_ssh_public_key`). |
@@ -309,7 +311,7 @@ Optional keys for the directory layout, the password file and Kerberos:
 | `id_mapping` | `true` | `ad` only. `true` derives UIDs and GIDs from the objectSid; `false` reads `uidNumber` and `gidNumber` from the directory. |
 | `id_range` | (none: SSSD maps from 200000) | `ad` only, needs `id_mapping`. `{"min": 10000, "max": 60000}` with `1000 <= min < max` sets `ldap_idmap_range_min`, `ldap_idmap_range_max` and `ldap_idmap_range_size = max - min` (one ID slice, one domain). Needed in unprivileged containers. |
 | `home` | `/home/%u` | Home directory (`override_homedir`). `%u`, `%d` and `%f` are passed to SSSD. |
-| `shell` | `/bin/bash` | Login shell (`default_shell`). |
+| `shell` | `/bin/bash` | Login shell (`default_shell`). It must be an absolute path to a regular file that others may execute (directory users are neither its owner nor in its group): `--setup-ldap` refuses before its first change to the host, `--check` reports a `[FAIL]`. The same check applies to the default. |
 | `kerberos.realm` | (none) | Upper-case realm, e.g. `EXAMPLE.COM`. A `kerberos` block switches `auth_provider` and `chpass_provider` to `krb5`: sudo and `passwd` talk to the KDC, the user password never goes over LDAP. With it, `--setup-ldap` also installs the SSSD Kerberos provider and the SASL GSSAPI plugin. Without it, the `ad` profile sets `chpass_provider = none` (AD does not implement the LDAP password modify operation). Applies to both profiles. With the `ad` profile it also sets `krb5_use_enterprise_principal = true` and `ldap_force_upper_case_realm = true`, as SSSD's own ad provider does: SSSD treats the UPN as an enterprise principal and upper-cases its realm, so users whose UPN suffix is the lower-case DNS domain (`alice@example.com`) authenticate for sudo and `passwd`. |
 | `kerberos.kdc` | (none) | KDC host name or address, optionally with a port (`krb5_server`). Required in a `kerberos` block. `--check` warns when it does not resolve. |
 | `kerberos.kpasswd` | (none) | Optional password-change server (`krb5_kpasswd`). |
@@ -350,7 +352,7 @@ invisible to the access filter and sudoers rules.
 `--setup-ldap` also renders the `ifp` (InfoPipe) responder into
 `sssd.conf`, which the PAM account-phase IP gate (`--pam-acct`) depends on
 to read the `clients` attribute. That responder needs the
-`sssd-dbus` package on Debian, Ubuntu and the RHEL family, and `--setup-ldap`
+`sssd-dbus` package on Debian, Ubuntu, Rocky Linux and Fedora, and `--setup-ldap`
 installs it. `pam-device-auth --check` reports IP-pin
 posture and InfoPipe health.
 
@@ -397,6 +399,7 @@ templating, emergency overrides via `/etc/default/<service>`.
   "allowed_algorithms": ["RS256"],
   "auth_timeout": 180,
   "ldap": {
+    "profile": "lldap",
     "uri": "ldaps://ldap.example.com:636",
     "base_dn": "dc=example,dc=com",
     "bind_dn": "uid=nss-ro,ou=people,dc=example,dc=com",

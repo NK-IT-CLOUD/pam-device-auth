@@ -75,8 +75,8 @@ func TestMigrateShadowedAccount_Commands(t *testing.T) {
 	}
 	exists := func(p string) bool { return p == "/home/alice" || p == "/var/spool/cron/crontabs/alice" }
 	a := shadowedAccount{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker"}}
-	if problems := migrateShadowedAccount(a, run, exists); len(problems) != 0 {
-		t.Fatalf("problems: %v", problems)
+	if err := migrateShadowedAccount(a, run, exists); err != nil {
+		t.Fatalf("migrateShadowedAccount: %v", err)
 	}
 	want := []string{
 		"userdel alice",
@@ -156,9 +156,38 @@ func TestMigrateShadowedAccount_UserdelFailureStops(t *testing.T) {
 		return nil, nil
 	}
 	a := shadowedAccount{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker"}}
-	problems := migrateShadowedAccount(a, run, func(string) bool { return false })
-	if len(problems) != 1 || len(calls) != 1 {
-		t.Fatalf("problems=%v calls=%v", problems, calls)
+	err := migrateShadowedAccount(a, run, func(string) bool { return false })
+	if err == nil || !strings.Contains(err.Error(), "userdel alice") || !strings.Contains(err.Error(), "currently used by process 4711") ||
+		!strings.Contains(err.Error(), "not migrated") || len(calls) != 1 {
+		t.Fatalf("err=%v calls=%v", err, calls)
+	}
+}
+
+// After userdel the local entry is gone: every re-own step still runs, and each
+// failure is part of the error, which says that the local entry is removed.
+func TestMigrateShadowedAccount_FailureAfterUserdelIsError(t *testing.T) {
+	var calls []string
+	run := func(name string, args ...string) ([]byte, error) {
+		call := name + " " + strings.Join(args, " ")
+		calls = append(calls, call)
+		if call == "gpasswd -a alice docker" {
+			return []byte("gpasswd: group 'docker' does not exist"), os.ErrNotExist
+		}
+		return nil, nil
+	}
+	a := shadowedAccount{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker"}}
+	err := migrateShadowedAccount(a, run, func(p string) bool { return p == "/home/alice" })
+	if err == nil {
+		t.Fatal("migrateShadowedAccount = nil although gpasswd failed")
+	}
+	for _, want := range []string{"gpasswd -a alice docker", "does not exist", "local entry of alice is already removed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+	if want := []string{"userdel alice", "gpasswd -a alice docker",
+		"chown -R --from=1000 10001 /home/alice", "chown -R --from=:1000 :6000 /home/alice"}; !reflect.DeepEqual(calls, want) {
+		t.Errorf("calls = %q, want %q", calls, want)
 	}
 }
 
@@ -181,16 +210,66 @@ func TestMigrateShadowedAccounts_RunningProcessSkipsAccount(t *testing.T) {
 		{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker"}},
 		{Name: "bob", Home: "/srv/bob", LocalUID: 1001, LocalGID: 1001, DirUID: 10002, DirGID: 6000},
 		{Name: "carol", Home: "/home/carol", LocalUID: 1002, LocalGID: 1002, DirUID: 10003, DirGID: 6000},
+		{Name: "dave", Home: "/home/dave", LocalUID: 1003, LocalGID: 1003, DirUID: 10004, DirGID: 6000},
 	}
-	if got := migrateShadowedAccounts(accounts, proc, run, func(string) bool { return false }); got != 1 {
+	got, err := migrateShadowedAccounts(accounts, proc, run, func(string) bool { return false })
+	if got != 1 {
 		t.Fatalf("migrated = %d, want 1 (only bob)", got)
 	}
-	if want := []string{"userdel bob", "userdel carol"}; !reflect.DeepEqual(calls, want) {
-		t.Fatalf("calls = %q, want %q (nothing for alice, who has a running process)", calls, want)
+	// A failed migration is an error, not a warning.
+	if err == nil || !strings.Contains(err.Error(), "userdel carol") {
+		t.Fatalf("err = %v, want the failed userdel of carol", err)
 	}
-	if len(setupWarnings) != 2 || !strings.Contains(setupWarnings[0], "alice") || !strings.Contains(setupWarnings[0], "1 running process") ||
-		!strings.HasPrefix(setupWarnings[1], "userdel carol failed") {
-		t.Fatalf("setupWarnings = %q", setupWarnings)
+	if want := []string{"userdel bob", "userdel carol"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %q, want %q (nothing for alice, who has a running process, nothing after carol's failure)", calls, want)
+	}
+	if len(setupWarnings) != 1 || !strings.Contains(setupWarnings[0], "alice") || !strings.Contains(setupWarnings[0], "1 running process") {
+		t.Fatalf("setupWarnings = %q, want only the skipped alice", setupWarnings)
+	}
+}
+
+// Whether a local entry was removed decides the abort message: only then does
+// an account resolve through the new sssd.conf alone.
+func TestLocalEntryRemoved(t *testing.T) {
+	failAt := func(cmd string) commandRunner {
+		return func(name string, args ...string) ([]byte, error) {
+			if name+" "+strings.Join(args, " ") == cmd {
+				return nil, os.ErrPermission
+			}
+			return nil, nil
+		}
+	}
+	alice := shadowedAccount{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker"}}
+	bob := shadowedAccount{Name: "bob", Home: "/home/bob", LocalUID: 1001, LocalGID: 1001, DirUID: 10002, DirGID: 6000}
+	none := func(string) bool { return false }
+	proc := t.TempDir()
+	for _, c := range []struct {
+		name     string
+		accounts []shadowedAccount
+		run      commandRunner
+		want     bool
+	}{
+		{"first userdel fails: nothing removed", []shadowedAccount{alice, bob}, failAt("userdel alice"), false},
+		{"failure after userdel: entry removed", []shadowedAccount{alice}, failAt("gpasswd -a alice docker"), true},
+		{"one migrated, next userdel fails", []shadowedAccount{bob, alice}, failAt("userdel alice"), true},
+		{"all migrated", []shadowedAccount{alice}, failAt(""), true},
+		{"nothing to migrate", nil, failAt(""), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			migrated, err := migrateShadowedAccounts(c.accounts, proc, c.run, none)
+			if got := localEntryRemoved(migrated, err); got != c.want {
+				t.Errorf("localEntryRemoved(%d, %v) = %v, want %v", migrated, err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestKeptSSSDConf(t *testing.T) {
+	if got := keptSSSDConf(false); strings.Contains(got, "resolve only through") || !strings.Contains(got, "kept the new sssd.conf") {
+		t.Errorf("nothing removed: %q must keep sssd.conf without claiming migrated accounts", got)
+	}
+	if got := keptSSSDConf(true); !strings.Contains(got, "resolve only through the directory") {
+		t.Errorf("entry removed: %q must say why sssd.conf stays", got)
 	}
 }
 

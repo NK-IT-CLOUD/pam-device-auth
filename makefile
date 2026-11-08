@@ -87,20 +87,25 @@ package-prep: build-all
 	gzip -9nf $(BUILD_DIR)/man/pam-device-auth.8
 
 # nfpm produces byte-deterministic packages from nfpm.yaml when
-# SOURCE_DATE_EPOCH is set (pinned to the last commit time).
+# SOURCE_DATE_EPOCH is set (pinned to the last commit time). Outside a Git
+# checkout there is no commit time: the package and release targets fail
+# instead of stamping an arbitrary date.
 NFPM ?= nfpm
+SET_SOURCE_DATE_EPOCH = SOURCE_DATE_EPOCH=$$(git log -1 --format=%ct) && [ -n "$$SOURCE_DATE_EPOCH" ] || \
+	{ echo "error: cannot read the commit time for SOURCE_DATE_EPOCH (git log failed); build from a Git checkout" >&2; exit 1; }; \
+	export SOURCE_DATE_EPOCH
 
 deb: package-prep
 	@echo "Creating Debian package via nfpm..."
 	export VERSION=$(VERSION); \
-	export SOURCE_DATE_EPOCH=$$(git log -1 --format=%ct 2>/dev/null || echo 315532800); \
+	$(SET_SOURCE_DATE_EPOCH); \
 	$(NFPM) package --config nfpm.yaml --packager deb --target $(PACKAGES_DIR)/pam-device-auth_$(VERSION)_amd64.deb
 	@echo "Package created: $(PACKAGES_DIR)/pam-device-auth_$(VERSION)_amd64.deb"
 
 rpm: package-prep
 	@echo "Creating RPM package via nfpm..."
 	export VERSION=$(VERSION); \
-	export SOURCE_DATE_EPOCH=$$(git log -1 --format=%ct 2>/dev/null || echo 315532800); \
+	$(SET_SOURCE_DATE_EPOCH); \
 	$(NFPM) package --config nfpm.yaml --packager rpm --target $(PACKAGES_DIR)/pam-device-auth-$(VERSION).x86_64.rpm
 	@echo "Package created: $(PACKAGES_DIR)/pam-device-auth-$(VERSION).x86_64.rpm"
 
@@ -121,8 +126,9 @@ release:
 	  configs/pam-sshd-device-auth configs/pam-sshd-device-auth-rhel \
 	  $(RELEASES_DIR)/pam-device-auth-$(VERSION)/configs/
 	cp README.md $(RELEASES_DIR)/pam-device-auth-$(VERSION)/
+	$(SET_SOURCE_DATE_EPOCH); \
 	cd $(RELEASES_DIR) && tar --sort=name --owner=0 --group=0 --numeric-owner \
-	  --mtime="@$$(git -C $(CURDIR) log -1 --format=%ct 2>/dev/null || echo 0)" \
+	  --mtime="@$$SOURCE_DATE_EPOCH" \
 	  -czf pam-device-auth-$(VERSION).tar.gz pam-device-auth-$(VERSION)/
 	@echo "Release: $(RELEASES_DIR)/pam-device-auth-$(VERSION).tar.gz"
 

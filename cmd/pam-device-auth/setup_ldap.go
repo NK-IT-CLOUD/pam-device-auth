@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/netip"
 	"net/url"
 	"os"
@@ -18,47 +19,106 @@ import (
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/distro"
 )
 
-// writeSSSDConfAt atomically writes sssd.conf-style content to path (0600, and
-// chowned root:root for the real path) and returns a restore func that
-// reinstates the prior file — or removes a newly-created one — if a downstream
-// step (e.g. `systemctl restart sssd`) rejects the new config. A corrupt
-// sssd.conf takes down NSS identity and locks out all directory logins, so this
-// mirrors writeSshdDropin/writeSudoers: never leave a partial or rejected
-// config behind. Path-parameterized for testability.
-func writeSSSDConfAt(path, content string) (restore func() error, err error) {
-	prior, readErr := os.ReadFile(path) // readErr == nil => a file existed to restore
-	if err := atomicWriteFile(path, []byte(content), 0600); err != nil {
+// chownRoot makes path owned by root:root; a seam so tests (which may run as
+// non-root) replace it instead of the production path swallowing EPERM.
+var chownRoot = func(path string) error { return os.Chown(path, 0, 0) }
+
+// writeSSSDConfAt atomically writes sssd.conf-style content to path (0600,
+// root:root) and returns a restore func that reinstates the prior file — or
+// removes a newly-created one — if a downstream step (e.g. `systemctl restart
+// sssd`) rejects the new config. A corrupt sssd.conf takes down NSS identity
+// and locks out all directory logins, so this mirrors
+// writeSshdDropin/writeSudoers: never leave a partial or rejected config
+// behind. A failed chown is an error (sssd refuses a config it does not own)
+// and restores the prior file. An existing file that cannot be read is an
+// error before the write (readPrior). restore reports what it did, for the
+// abort message. When the write fails after the rename (errWrittenNotSynced), the
+// new file is in place: the error comes with a working restore, which the
+// caller must run (sssdConfWriteAbort). Path-parameterized for testability.
+func writeSSSDConfAt(path, content string) (restore func() (string, error), err error) {
+	prior, existed, err := readPrior(path)
+	if err != nil {
 		return nil, err
 	}
-	_ = os.Chown(path, 0, 0) // best-effort; no-op/EPERM off-target (tests)
 
-	restore = func() error {
-		if readErr == nil {
+	restore = func() (string, error) {
+		if existed {
 			// The rollback must be as crash-safe as the forward write: a
 			// truncate-then-write here could leave a partial sssd.conf —
 			// exactly the failure mode this function exists to prevent.
 			if err := atomicWriteFile(path, prior, 0600); err != nil {
-				return err
+				return "", err
 			}
-			_ = os.Chown(path, 0, 0)
-			return nil
+			if err := chownRoot(path); err != nil {
+				return "", err
+			}
+			return "restored previous " + filepath.Base(path), nil
 		}
-		return os.Remove(path)
+		if err := os.Remove(path); err != nil {
+			return "", err
+		}
+		return "removed the new " + filepath.Base(path) + " (none existed before)", nil
+	}
+	if err := atomicWriteFile(path, []byte(content), 0600); err != nil {
+		if errors.Is(err, errWrittenNotSynced) {
+			return restore, err
+		}
+		return nil, err
+	}
+	if err := chownRoot(path); err != nil {
+		did, rerr := restore()
+		if rerr != nil {
+			return nil, fmt.Errorf("%w (could NOT roll back %s: %v)", err, path, rerr)
+		}
+		return nil, fmt.Errorf("%w (%s)", err, did)
 	}
 	return restore, nil
 }
 
+// sssdConfWriteAbort is the abort message for a failed write of
+// /etc/sssd/sssd.conf. A non-nil restore (writeSSSDConfAt: the new file is in
+// place) is run first, and the message says what it did; sssd still runs on
+// its previous config, so it is not restarted.
+func sssdConfWriteAbort(err error, restore func() (string, error)) string {
+	msg := "write /etc/sssd/sssd.conf: " + err.Error()
+	if restore == nil {
+		return msg
+	}
+	return setupAbortMessage(msg, rollbackSSSD(execRunner, restore, false), nil)
+}
+
+// errWrittenNotSynced marks an atomicWriteFile error after the rename: the
+// new content is in place at the path, only the directory sync failed. A
+// caller that rolls back on errors must also roll back on this one.
+var errWrittenNotSynced = errors.New("the new file is in place, but syncing its directory failed")
+
+// syncDir fsyncs the directory dir, so a rename into it survives a crash; a
+// seam so tests can make the step after the rename fail.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
+}
+
 // atomicWriteFile writes content to path via a same-directory temp file and
 // rename, so the target is never observable in a truncated or partial state.
+// An error after the rename wraps errWrittenNotSynced.
 func atomicWriteFile(path string, content []byte, mode os.FileMode) (err error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
 		return fmt.Errorf("create temp for %s: %w", path, err)
 	}
 	tmpName := tmp.Name()
+	renamed := false
 	// Best-effort cleanup of the temp file on any failure before the rename.
 	defer func() {
-		if err != nil {
+		if err != nil && !renamed {
 			os.Remove(tmpName)
 		}
 	}()
@@ -80,16 +140,9 @@ func atomicWriteFile(path string, content []byte, mode os.FileMode) (err error) 
 	if err = os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("rename %s into place: %w", path, err)
 	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return fmt.Errorf("open parent directory for %s: %w", path, err)
-	}
-	if err = dir.Sync(); err != nil {
-		dir.Close()
-		return fmt.Errorf("sync parent directory for %s: %w", path, err)
-	}
-	if err = dir.Close(); err != nil {
-		return fmt.Errorf("close parent directory for %s: %w", path, err)
+	renamed = true
+	if err = syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("%s: %w: %w", path, errWrittenNotSynced, err)
 	}
 	return nil
 }
@@ -180,12 +233,15 @@ func keytabHostError(l *config.LDAPConfig) error {
 	return nil
 }
 
-// validateLDAPProfile accepts "lldap" (also when unset) and "ad". Shared by
-// --setup-ldap and --check.
+// validateLDAPProfile accepts "lldap" and "ad"; there is no implicit profile
+// (--migrate-config sets it on configs from 0.6.x). Shared by --setup-ldap,
+// --check and --migrate-config.
 func validateLDAPProfile(l *config.LDAPConfig) error {
-	switch l.ProfileName() {
+	switch l.Profile {
 	case config.LDAPProfileLLDAP, config.LDAPProfileAD:
 		return nil
+	case "":
+		return fmt.Errorf("config: ldap.profile is required (%q or %q)", config.LDAPProfileLLDAP, config.LDAPProfileAD)
 	default:
 		return fmt.Errorf("ldap.profile must be %q or %q, got %q", config.LDAPProfileLLDAP, config.LDAPProfileAD, l.Profile)
 	}
@@ -289,7 +345,7 @@ func validateLDAPConfig(l *config.LDAPConfig) error {
 			return fmt.Errorf("ldap.%s must be an LDAP attribute name [A-Za-z][A-Za-z0-9-]*, got %q", field, v)
 		}
 	}
-	if l.ProfileName() == config.LDAPProfileAD && (l.Attributes.SSHKey == "" || l.Attributes.Clients == "") {
+	if l.Profile == config.LDAPProfileAD && (l.Attributes.SSHKey == "" || l.Attributes.Clients == "") {
 		return fmt.Errorf("profile %q needs ldap.attributes.ssh_key and ldap.attributes.clients (AD has no standard attributes for them)", config.LDAPProfileAD)
 	}
 	for field, v := range map[string]string{"ca_file": l.CAFile, "bind_password_file": l.BindPasswordFile, "home": l.Home, "shell": l.Shell} {
@@ -298,7 +354,7 @@ func validateLDAPConfig(l *config.LDAPConfig) error {
 		}
 	}
 	if r := l.IDRange; r != nil {
-		if l.ProfileName() != config.LDAPProfileAD {
+		if l.Profile != config.LDAPProfileAD {
 			return fmt.Errorf("ldap.id_range applies to profile %q only", config.LDAPProfileAD)
 		}
 		if l.IDMapping != nil && !*l.IDMapping {
@@ -308,7 +364,7 @@ func validateLDAPConfig(l *config.LDAPConfig) error {
 			return fmt.Errorf("ldap.id_range needs 1000 <= min < max, got min=%d max=%d", r.Min, r.Max)
 		}
 	}
-	if l.IDMapping != nil && l.ProfileName() != config.LDAPProfileAD {
+	if l.IDMapping != nil && l.Profile != config.LDAPProfileAD {
 		return fmt.Errorf("ldap.id_mapping applies to profile %q only", config.LDAPProfileAD)
 	}
 	if k := l.Kerberos; k != nil {
@@ -432,7 +488,7 @@ func hasControlChar(s string) bool {
 // It is a plain data carrier so renderSSSDConf can be unit-tested without a
 // config.LDAPConfig or any filesystem/process access.
 type ldapRenderData struct {
-	Profile       string // config.LDAPProfileLLDAP (default) or config.LDAPProfileAD
+	Profile       string // config.LDAPProfileLLDAP or config.LDAPProfileAD (validated)
 	URI           string
 	BaseDN        string
 	UserBase      string
@@ -449,7 +505,7 @@ type ldapRenderData struct {
 	IDRangeMin    int    // ad only; 0 = SSSD default
 	IDRangeMax    int
 	Home          string // default /home/%u
-	Shell         string // default /bin/bash
+	Shell         string // default defaultLDAPShell
 	KrbRealm      string // non-empty switches auth/chpass to krb5
 	KrbKDC        string
 	KrbKpasswd    string
@@ -458,9 +514,6 @@ type ldapRenderData struct {
 // withDefaults fills the profile defaults into empty fields, so callers and
 // tests may leave them out.
 func (d ldapRenderData) withDefaults() ldapRenderData {
-	if d.Profile == "" {
-		d.Profile = config.LDAPProfileLLDAP
-	}
 	if d.UserNameAttr == "" {
 		d.UserNameAttr = "uid"
 		if d.Profile == config.LDAPProfileAD {
@@ -477,9 +530,43 @@ func (d ldapRenderData) withDefaults() ldapRenderData {
 		d.Home = "/home/%u"
 	}
 	if d.Shell == "" {
-		d.Shell = "/bin/bash"
+		d.Shell = defaultLDAPShell
 	}
 	return d
+}
+
+// defaultLDAPShell is the login shell sssd.conf gives directory users when
+// ldap.shell is empty.
+const defaultLDAPShell = "/bin/bash"
+
+// ldapShell returns the login shell sssd.conf gives directory users.
+func ldapShell(l *config.LDAPConfig) string {
+	if l.Shell != "" {
+		return l.Shell
+	}
+	return defaultLDAPShell
+}
+
+// checkLDAPShell verifies that path, the login shell of directory users, is an
+// absolute path by the rule validateLDAPConfig applies to ldap.shell (pathRe),
+// and a regular file they can execute (other-execute bit; they are neither its
+// owner nor in its group). Without it every directory login ends right after
+// authentication. Shared by --setup-ldap and --check, so --check never accepts
+// a relative path that happens to resolve from its working directory.
+func checkLDAPShell(path string) error {
+	if !pathRe.MatchString(path) {
+		return fmt.Errorf("ldap.shell must be an absolute path without whitespace, got %q", path)
+	}
+	fi, err := os.Stat(path)
+	switch {
+	case err != nil:
+		return fmt.Errorf("login shell %s (ldap.shell): %w", path, err)
+	case !fi.Mode().IsRegular():
+		return fmt.Errorf("login shell %s (ldap.shell) is not a regular file (%s)", path, fi.Mode().Type())
+	case fi.Mode().Perm()&0001 == 0:
+		return fmt.Errorf("login shell %s (ldap.shell) is not executable by directory users (mode %s)", path, fi.Mode().Perm())
+	}
+	return nil
 }
 
 // renderSSSDConf renders sssd.conf for the configured profile. caCertPath is
@@ -602,7 +689,7 @@ func renderSSSDConf(d ldapRenderData, caCertPath string) string {
 // bases default to ou=people/ou=groups under base_dn for lldap and to base_dn
 // itself for ad, where users and groups live in arbitrary OUs.
 func renderDataFor(l *config.LDAPConfig, bindPassword string) ldapRenderData {
-	ad := l.ProfileName() == config.LDAPProfileAD
+	ad := l.Profile == config.LDAPProfileAD
 	userBase, groupBase := l.UserSearchBase, l.GroupSearchBase
 	if userBase == "" {
 		userBase = "ou=people," + l.BaseDN
@@ -617,7 +704,7 @@ func renderDataFor(l *config.LDAPConfig, bindPassword string) ldapRenderData {
 		}
 	}
 	d := ldapRenderData{
-		Profile: l.ProfileName(), URI: l.URI, BaseDN: l.BaseDN, UserBase: userBase, GroupBase: groupBase,
+		Profile: l.Profile, URI: l.URI, BaseDN: l.BaseDN, UserBase: userBase, GroupBase: groupBase,
 		BindDN: l.BindDN, BindPassword: bindPassword, AccessGroup: l.AccessGroup,
 		ServiceGroups: l.ServiceAccountGroups, UserNameAttr: l.Attributes.Username,
 		SSHKeyAttr: l.Attributes.SSHKey, ClientsAttr: l.Attributes.Clients, Home: l.Home, Shell: l.Shell,
@@ -666,19 +753,20 @@ func lldapAccessFilter(access string, service []string, groupBase string) string
 // only here; it is written into the root-only /etc/sssd/sssd.conf for SSSD's
 // runtime use.
 //
-// Steps: validate config -> ensure SSSD packages (plus krb5 with
-// ldap.kerberos) -> write sssd.conf -> enable mkhomedir -> nsswitch (sss) ->
-// sudoers (%admin_group) -> sshd drop-in -> mask the socket units of the
-// configured responders -> restart sssd -> reset-failed -> migrate local
-// accounts that shadow a directory user.
+// Steps: supported platform -> validate config -> ensure SSSD packages (plus
+// krb5 with ldap.kerberos) -> sss_ssh_authorizedkeys present -> write
+// sssd.conf -> enable mkhomedir -> nsswitch (sss) -> sudoers (%admin_group) ->
+// sshd drop-in -> mask the socket units of the configured responders ->
+// restart sssd -> reset-failed -> migrate local accounts that shadow a
+// directory user.
 // (mkhomedir before nsswitch on RHEL: authselect owns nsswitch.conf too.)
 func runSetupLDAP() {
-	cfg, err := config.Load("")
+	prof := requirePlatform()
+	cfg, err := loadConfig("")
 	if err != nil {
 		fail("config error: %v", err)
 	}
 	l := cfg.LDAP
-	prof := distro.Detect()
 	// Single security choke point: validates every directory value before any
 	// of them is written into sssd.conf / sudoers (see validateLDAPConfig).
 	if err := validateLDAPConfig(l); err != nil {
@@ -698,54 +786,54 @@ func runSetupLDAP() {
 			fail("ldap.kerberos.keytab: %v", err)
 		}
 	}
+	// sssd.conf names this shell for every directory user; no package below
+	// provides it, so refuse before the first host write.
+	if err := checkLDAPShell(ldapShell(l)); err != nil {
+		fail("%v", err)
+	}
 
-	ensureSSSDPackages(prof, l.Kerberos != nil)
+	if err := ensureSSSDPackages(prof, l.Kerberos != nil, execRunner); err != nil {
+		fail("%v", err)
+	}
+
+	// The sshd drop-in (step 5) names the platform's sss_ssh_authorizedkeys as
+	// AuthorizedKeysCommand; a path that does not exist makes sshd serve no
+	// directory key. Refuse now, before sssd.conf or any other file is written.
+	if err := checkSSSAuthKeys(prof.SSSAuthKeysPath); err != nil {
+		fail("%v", err)
+	}
+	// sssd.conf enables the ifp responder; without its binary sssd does not start.
+	if err := checkSSSDIfp(prof.SSSDIfpPath); err != nil {
+		fail("%v", err)
+	}
 
 	// 1) /etc/sssd/sssd.conf (0600 root).
 	sssdConf := renderSSSDConf(renderDataFor(l, bindPassword), caCertFor(l, prof))
 
 	restoreSSSD, err := writeSSSDConfAt("/etc/sssd/sssd.conf", sssdConf)
 	if err != nil {
-		fail("write /etc/sssd/sssd.conf: %v", err)
+		fail("%s", sssdConfWriteAbort(err, restoreSSSD))
 	}
 	fmt.Println("Wrote /etc/sssd/sssd.conf (0600)")
-	// abort reports a failure after sssd.conf was replaced: it reinstates the
-	// previous sssd.conf first and says truthfully whether that worked, so the
-	// operator is never told about a rollback that did not happen.
+	// remaining lists the host changes made after sssd.conf; an abort does not
+	// undo them, so its message names them.
+	var remaining []string
+	// abort reports a failure of steps 2-6 (sssd still runs on its previous
+	// config): it reinstates the previous sssd.conf first and says truthfully
+	// whether that worked, so the operator is never told about a rollback that
+	// did not happen.
 	abort := func(format string, args ...any) {
-		msg := fmt.Sprintf(format, args...)
-		if rerr := restoreSSSD(); rerr != nil {
-			msg += fmt.Sprintf(" (could NOT restore previous sssd.conf: %v; fix /etc/sssd/sssd.conf manually)", rerr)
-		} else {
-			msg += " (restored previous sssd.conf)"
-		}
-		fail("%s", msg)
+		fail("%s", setupAbortMessage(fmt.Sprintf(format, args...), rollbackSSSD(execRunner, restoreSSSD, false), remaining))
 	}
 
 	// 2) auto-create home dirs on first login (directory provides no home).
 	//    On RHEL this is wired via authselect, which also owns nsswitch.conf —
 	//    ensureNsswitchSSS() below MUST run after this so authselect doesn't
 	//    clobber the 'sss' entries it just added.
-	switch prof.PamWiring {
-	case "authselect":
-		// `select sssd` (not just enable-feature) is required: on a minimal RHEL
-		// host no authselect profile is active, and it is what actually wires
-		// pam_sss into system-auth/password-auth (which our sshd PAM template
-		// includes) plus nsswitch. `with-mkhomedir` adds pam_oddjob_mkhomedir;
-		// --force overwrites any stock profile so directory login works headless.
-		if out, err := exec.Command("authselect", "select", "sssd", "with-mkhomedir", "--force").CombinedOutput(); err != nil {
-			setupWarnf("authselect select sssd with-mkhomedir failed (new users get no home directory): %s: %v", strings.TrimSpace(string(out)), err)
-		} else {
-			exec.Command("systemctl", "enable", "--now", "oddjobd").Run()
-			fmt.Println("SSSD PAM/nsswitch wired via authselect (with mkhomedir)")
-		}
-	default:
-		if out, err := exec.Command("pam-auth-update", "--enable", "mkhomedir").CombinedOutput(); err != nil {
-			setupWarnf("pam-auth-update mkhomedir failed (new users get no home directory): %s: %v", strings.TrimSpace(string(out)), err)
-		} else {
-			fmt.Println("pam_mkhomedir enabled")
-		}
+	if err := wireMkhomedir(prof, execRunner); err != nil {
+		abort("mkhomedir: %v", err)
 	}
+	remaining = append(remaining, "mkhomedir PAM wiring via "+prof.PamWiring)
 
 	// 3) nsswitch: ensure 'sss' on passwd/group/shadow. Must run after the
 	//    mkhomedir wiring above (see comment there) so authselect's nsswitch
@@ -754,6 +842,7 @@ func runSetupLDAP() {
 		abort("nsswitch: %v", err)
 	}
 	fmt.Println("nsswitch.conf: sss enabled for passwd/group/shadow")
+	remaining = append(remaining, "sss in /etc/nsswitch.conf")
 
 	// 4) sudoers: members of admin_group get sudo (password-prompted -> the
 	//    directory or, with ldap.kerberos, the KDC via pam_sss);
@@ -762,44 +851,34 @@ func runSetupLDAP() {
 		abort("sudoers: %v", err)
 	}
 	fmt.Printf("sudoers: %%%s may sudo (directory password)\n", l.AdminGroup)
+	remaining = append(remaining, "sudoers drop-in /etc/sudoers.d/pam-device-auth")
 
 	// 5) sshd drop-in: non-root needs key (from the directory via sss_ssh_authorizedkeys)
 	//    AND OIDC; root stays key-only (break-glass via local authorized_keys).
-	//    Prefer the ACTUAL on-disk path of sss_ssh_authorizedkeys (Rocky 9/10 ship
-	//    it in /usr/bin, older RHEL in /usr/libexec/sssd) over the profile default,
-	//    so the AuthorizedKeysCommand sshd runs really exists — a wrong path makes
-	//    sshd serve no directory key and silently falls back to password.
-	sssCmd := sssAuthorizedKeysCmd()
-	if sssCmd == "" {
-		sssCmd = prof.SSSAuthKeysPath // fall back to the distro default if not yet on disk
-	}
-	if err := writeSshdDropin(sssCmd, l.ServiceAccountGroups, cfg.RootLogin); err != nil {
+	//    The AuthorizedKeysCommand is the platform's path, checked above.
+	if err := writeSshdDropin(prof.SSSAuthKeysPath, l.ServiceAccountGroups, cfg.RootLogin); err != nil {
 		abort("sshd config: %v", err)
 	}
+	remaining = append(remaining, "sshd drop-in "+sshdDropinPath+" (active at the next sshd restart)")
 
 	// 6) The responders run from the services line: their socket units must not
 	//    start them a second time (Debian/Ubuntu enable them by preset).
-	maskConflictingSSSDSockets(sssdConf)
-
-	// 7) (re)start SSSD
-	if out, err := exec.Command("systemctl", "enable", "--now", "sssd").CombinedOutput(); err != nil {
-		setupWarnf("enable sssd failed: %s", strings.TrimSpace(string(out)))
+	if err := maskConflictingSSSDSockets(sssdConf); err != nil {
+		abort("sssd sockets: %v", err)
 	}
-	exec.Command("sss_cache", "-E").Run()
-	if out, err := exec.Command("systemctl", "restart", "sssd").CombinedOutput(); err != nil {
-		// New sssd.conf was rejected — reinstate the prior known-good config so
-		// directory identity (and thus non-root login) is not left broken.
-		rerr := restoreSSSD()
-		exec.Command("systemctl", "restart", "sssd").Run() // best-effort, on the restored config
-		if rerr != nil {
-			fail("restart sssd: %s: %v (could NOT restore previous sssd.conf: %v; fix /etc/sssd/sssd.conf manually)", strings.TrimSpace(string(out)), err, rerr)
-		}
-		fail("restart sssd: %s: %v (restored previous sssd.conf)", strings.TrimSpace(string(out)), err)
-	}
-	fmt.Println("sssd restarted")
-	resetFailedSSSDUnits()
+	remaining = append(remaining, "the SSSD socket units masked above (if any)")
 
-	migrateLocalShadowing()
+	// 7) (re)start SSSD and clear failed SSSD units; a failure restores
+	//    sssd.conf and restarts sssd on it.
+	if remaining, err = startSSSDStep(execRunner, restoreSSSD, remaining); err != nil {
+		fail("%v", err)
+	}
+
+	// 8) A migrated account resolves only through the directory, so from here
+	//    on a failure keeps the new sssd.conf instead of restoring it.
+	if removed, err := migrateLocalShadowing(); err != nil {
+		fail("%s", setupAbortMessage(err.Error(), keptSSSDConf(removed), remaining))
+	}
 
 	if len(setupWarnings) > 0 {
 		fmt.Printf("\nDirectory mode configured WITH %d WARNING(S) - review before enabling:\n", len(setupWarnings))
@@ -813,9 +892,179 @@ func runSetupLDAP() {
 	fmt.Printf("Then enable the OIDC SSH layer:  pam-device-auth --enable\n")
 }
 
-// ensureSSSDPackages installs the SSSD LDAP/NSS/PAM packages if sssd is
-// absent, using the distro profile's install command and package list.
-func ensureSSSDPackages(prof distro.Profile, kerberos bool) {
+// wireMkhomedir enables home directory creation on first login with the
+// platform's PAM wiring tool. On RHEL this is authselect, which also owns
+// nsswitch.conf, so it must run before ensureNsswitchSSS. Every failure is an
+// error: the caller aborts the setup.
+func wireMkhomedir(prof distro.Profile, run commandRunner) error {
+	switch prof.PamWiring {
+	case "pam-auth-update":
+		if out, err := run("pam-auth-update", "--enable", "mkhomedir"); err != nil {
+			return fmt.Errorf("pam-auth-update --enable mkhomedir: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		fmt.Println("pam_mkhomedir enabled")
+	case "authselect":
+		// `select sssd` (not just enable-feature) is required: on a minimal RHEL
+		// host no authselect profile is active, and it is what actually wires
+		// pam_sss into system-auth/password-auth (which our sshd PAM template
+		// includes) plus nsswitch. `with-mkhomedir` adds pam_oddjob_mkhomedir;
+		// --force overwrites any stock profile so directory login works headless.
+		if out, err := run("authselect", "select", "sssd", "with-mkhomedir", "--force"); err != nil {
+			return fmt.Errorf("authselect select sssd with-mkhomedir --force: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		// pam_oddjob_mkhomedir asks oddjobd to create the home directory.
+		// There is no authselect rollback: the error names the profile left behind.
+		if out, err := run("systemctl", "enable", "--now", "oddjobd"); err != nil {
+			return fmt.Errorf("systemctl enable --now oddjobd: %s: %w; the authselect profile \"sssd with-mkhomedir\" stays selected",
+				strings.TrimSpace(string(out)), err)
+		}
+		fmt.Println("SSSD PAM/nsswitch wired via authselect (with mkhomedir)")
+	default:
+		return fmt.Errorf("internal: unknown PamWiring %q", prof.PamWiring)
+	}
+	return nil
+}
+
+// sssdEnabledNote, sssdEnableUnknownNote and sssdMaskedNote are the entries
+// startSSSD reports for sssd's state in the abort message's list of what is
+// in place on the host.
+const (
+	sssdEnabledNote       = "sssd enabled"
+	sssdEnableUnknownNote = "enable state of sssd unknown (check `systemctl is-enabled sssd`)"
+	sssdMaskedNote        = "sssd is masked (not enabled; `systemctl unmask sssd` to use it)"
+)
+
+// sssdEnableState asks systemctl whether sssd is enabled after a failed
+// `enable --now`, which may have enabled the unit before its start failed.
+// Only the clear answers count: exit 0 with "enabled" is sssdEnabledNote,
+// exit 1 with "disabled" is "" (not enabled), exit 1 with "masked" is
+// sssdMaskedNote. Every other answer (another exit code or state, systemctl not running) is
+// sssdEnableUnknownNote, never a guess.
+func sssdEnableState(run commandRunner) string {
+	out, err := run("systemctl", "is-enabled", "sssd")
+	state := strings.TrimSpace(string(out))
+	var ee *exec.ExitError
+	switch {
+	case err == nil && state == "enabled":
+		return sssdEnabledNote
+	case errors.As(err, &ee) && ee.ExitCode() == 1 && state == "disabled":
+		return ""
+	case errors.As(err, &ee) && ee.ExitCode() == 1 && state == "masked":
+		return sssdMaskedNote
+	default:
+		return sssdEnableUnknownNote
+	}
+}
+
+// startSSSD enables and starts sssd, expires its cache and restarts it on the
+// new sssd.conf. Any failed step calls restore once, restarts sssd on the
+// restored config and returns one error that names the failed step and says
+// whether the restore and that restart worked. enabled is what the abort
+// message lists for sssd's enable state: sssdEnabledNote after a successful
+// `enable --now`, else sssdEnableState.
+func startSSSD(run commandRunner, restore func() (string, error)) (enabled string, err error) {
+	for i, step := range [][]string{
+		{"systemctl", "enable", "--now", "sssd"},
+		{"sss_cache", "-E"},
+		{"systemctl", "restart", "sssd"},
+	} {
+		out, serr := run(step[0], step[1:]...)
+		if i == 0 {
+			enabled = sssdEnabledNote
+			if serr != nil {
+				enabled = sssdEnableState(run)
+			}
+		}
+		if serr == nil {
+			continue
+		}
+		return enabled, fmt.Errorf("%s: %s: %w (%s)", strings.Join(step, " "), strings.TrimSpace(string(out)), serr,
+			rollbackSSSD(run, restore, true))
+	}
+	return enabled, nil
+}
+
+// startSSSDStep is step 7 of --setup-ldap: startSSSD, then reset-failed on
+// the SSSD units. It returns remaining (the host changes an abort leaves in
+// place) plus sssd's enable state from startSSSD ("sssd enabled", or that the
+// state is unknown), and on failure an error that is the complete abort
+// message, after sssd.conf was restored and sssd restarted on it.
+func startSSSDStep(run commandRunner, restore func() (string, error), remaining []string) ([]string, error) {
+	enabled, err := startSSSD(run, restore)
+	if enabled != "" {
+		remaining = append(remaining, enabled)
+	}
+	if err != nil {
+		return remaining, errors.New(setupAbortMessage("start sssd: "+err.Error(), "", remaining))
+	}
+	fmt.Println("sssd restarted")
+	if err := resetFailedSSSDUnits(); err != nil {
+		return remaining, errors.New(setupAbortMessage(err.Error(), rollbackSSSD(run, restore, true), remaining))
+	}
+	return remaining, nil
+}
+
+// rollbackSSSD undoes the sssd.conf write (restores the previous file, or
+// removes the new one when none existed) and, with restart (sssd runs on the
+// new one), restarts sssd. It returns what happened, for the abort message.
+func rollbackSSSD(run commandRunner, restore func() (string, error), restart bool) string {
+	did, err := restore()
+	if err != nil {
+		return fmt.Sprintf("could NOT roll back sssd.conf: %v; sssd not restarted; fix /etc/sssd/sssd.conf manually", err)
+	}
+	if !restart {
+		return did
+	}
+	if out, err := run("systemctl", "restart", "sssd"); err != nil {
+		return fmt.Sprintf("%s, but sssd did not restart: %s: %v", did, strings.TrimSpace(string(out)), err)
+	}
+	return did + " and restarted sssd"
+}
+
+// keptSSSDConf is the rollback note of a failed account migration: the new
+// sssd.conf stays, and when a local entry was already removed, that account
+// resolves only through it.
+func keptSSSDConf(removed bool) string {
+	if removed {
+		return "kept the new sssd.conf: the local accounts whose entry was removed resolve only through the directory"
+	}
+	return "kept the new sssd.conf; no local account was changed"
+}
+
+// setupAbortMessage appends the rollback state (if any) and the host changes
+// an abort leaves in place to msg.
+func setupAbortMessage(msg, rollback string, remaining []string) string {
+	if rollback != "" {
+		msg += " (" + rollback + ")"
+	}
+	if len(remaining) > 0 {
+		msg += "; still in place on the host: " + strings.Join(remaining, ", ")
+	}
+	return msg
+}
+
+// installPackages installs pkgs with the profile's install command. On apt the
+// package index is refreshed first; a failed refresh is an error, the install
+// does not run against a stale index.
+func installPackages(prof distro.Profile, run commandRunner, pkgs []string) error {
+	name, args := prof.InstallCmd, append([]string{"install", "-y"}, pkgs...)
+	if prof.InstallCmd == "apt-get" {
+		if out, err := run("apt-get", "update"); err != nil {
+			return fmt.Errorf("apt-get update: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		// debconf must not prompt: the setup runs unattended.
+		name, args = "env", append([]string{"DEBIAN_FRONTEND=noninteractive", "apt-get"}, args...)
+	}
+	if out, err := run(name, args...); err != nil {
+		return fmt.Errorf("%s install -y %s: %s: %w", prof.InstallCmd, strings.Join(pkgs, " "), strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// ensureSSSDPackages installs the SSSD LDAP/NSS/PAM packages using the distro
+// profile's install command and package list, and marks them as explicitly
+// installed. Every failed command is an error.
+func ensureSSSDPackages(prof distro.Profile, kerberos bool, run commandRunner) error {
 	// Install the SSSD (and, on RHEL, the mkhomedir) packages unconditionally.
 	// This is deliberately NOT gated on the `sssd` daemon already being present:
 	// on RHEL the daemon ships in sssd-common and can exist WITHOUT the LDAP
@@ -828,25 +1077,20 @@ func ensureSSSDPackages(prof distro.Profile, kerberos bool) {
 		pkgs = append(pkgs, prof.KrbPackages...)
 	}
 	fmt.Printf("Installing %s ...\n", strings.Join(pkgs, " "))
-	args := append([]string{"install", "-y"}, pkgs...)
-	cmd := exec.Command(prof.InstallCmd, args...)
-	if prof.InstallCmd == "apt-get" {
-		exec.Command("apt-get", "update").Run() // refresh stale index (best-effort)
-		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fail("%s install %s: %s: %v", prof.InstallCmd, strings.Join(pkgs, " "), strings.TrimSpace(string(out)), err)
+	if err := installPackages(prof, run, pkgs); err != nil {
+		return err
 	}
 	// Installing a package that is already present as a dependency leaves its
 	// install reason alone. Mark ours as explicitly installed so that removing
 	// pam-device-auth never takes sssd-dbus (the ifp responder sssd.conf enables)
 	// or the rest of the SSSD stack with it.
 	if mark := markManualCommand(prof, pkgs); mark != nil {
-		if out, err := exec.Command(mark[0], mark[1:]...).CombinedOutput(); err != nil {
-			setupWarnf("could not mark %s as explicitly installed (removing pam-device-auth may remove them): %s: %v",
-				strings.Join(pkgs, " "), strings.TrimSpace(string(out)), err)
+		if out, err := run(mark[0], mark[1:]...); err != nil {
+			return fmt.Errorf("%s (removing pam-device-auth may remove these packages): %s: %w",
+				strings.Join(mark, " "), strings.TrimSpace(string(out)), err)
 		}
 	}
+	return nil
 }
 
 // markManualCommand returns the command that marks pkgs as explicitly
@@ -910,41 +1154,76 @@ func renderSudoers(adminGroup string, nopasswdGroups []string) string {
 // has to reason about one path.
 func writeSudoers(prof distro.Profile, adminGroup string, nopasswdGroups []string) error {
 	if _, err := exec.LookPath("visudo"); err != nil {
-		args := append([]string{"install", "-y"}, prof.SudoInstall...)
-		cmd := exec.Command(prof.InstallCmd, args...)
-		if prof.InstallCmd == "apt-get" {
-			exec.Command("apt-get", "update").Run() // refresh stale index (best-effort)
-			cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-		}
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("install %s: %s: %w", strings.Join(prof.SudoInstall, " "), strings.TrimSpace(string(out)), err)
+		if err := installPackages(prof, execRunner, prof.SudoInstall); err != nil {
+			return err
 		}
 	}
 	if err := os.MkdirAll("/etc/sudoers.d", 0755); err != nil {
 		return fmt.Errorf("mkdir /etc/sudoers.d: %w", err)
 	}
-	path := "/etc/sudoers.d/pam-device-auth"
-	content := renderSudoers(adminGroup, nopasswdGroups)
-	prior, priorErr := os.ReadFile(path) // priorErr==nil means a drop-in existed to restore
-	if err := atomicWriteFile(path, []byte(content), 0440); err != nil {
+	return writeSudoersAt("/etc/sudoers.d/pam-device-auth", renderSudoers(adminGroup, nopasswdGroups), visudoCheck)
+}
+
+// visudoCheck validates the whole sudoers set; a seam so tests never run the
+// host's visudo against a temp file.
+var visudoCheck = func() ([]byte, error) { return exec.Command("visudo", "-c").CombinedOutput() }
+
+// writeSudoersAt writes the sudoers drop-in content to path (0440) and
+// validates the whole sudoers set with check (visudoCheck); a drop-in that
+// would break sudo is rolled back (writeValidated).
+func writeSudoersAt(path, content string, check func() ([]byte, error)) error {
+	return writeValidated(path, []byte(content), 0440, "visudo -c", "", check)
+}
+
+// readPrior reads the file a writer is about to replace, for its rollback.
+// existed is false only when there is none (fs.ErrNotExist). Every other read
+// error is returned before anything is written: a rollback cannot restore
+// what it could not read, and must never delete it instead.
+func readPrior(path string) (prior []byte, existed bool, err error) {
+	prior, err = os.ReadFile(path)
+	switch {
+	case err == nil:
+		return prior, true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("cannot read the existing %s: %w; nothing was written", path, err)
+}
+
+// writeValidated writes content to path atomically and validates it with
+// check (checkName in messages). A rejected file is rolled back: the previous
+// file is restored, or the new one removed when none existed; the error names
+// the rejection and, if the rollback failed, the manual fix (fixWhen is
+// appended to it). A write that is in place but whose directory sync failed
+// (errWrittenNotSynced) is still validated and rolled back on rejection; when
+// it passes, that error is returned and says the validated file is in place.
+func writeValidated(path string, content []byte, mode os.FileMode, checkName, fixWhen string, check func() ([]byte, error)) error {
+	prior, existed, err := readPrior(path)
+	if err != nil {
 		return err
 	}
-	// Validate the whole sudoers set; restore the previous drop-in (or remove
-	// ours) if it would break sudo — never leave a broken state behind.
-	if out, err := exec.Command("visudo", "-c").CombinedOutput(); err != nil {
-		var restoreErr error
-		if priorErr == nil {
-			restoreErr = atomicWriteFile(path, prior, 0440)
-		} else {
-			restoreErr = os.Remove(path)
-		}
-		if restoreErr != nil {
-			return fmt.Errorf("visudo -c rejected the drop-in (%s) AND restore failed (%v); fix %s manually: %w",
-				strings.TrimSpace(string(out)), restoreErr, path, err)
-		}
-		return fmt.Errorf("visudo -c rejected the drop-in (%s): %w", strings.TrimSpace(string(out)), err)
+	werr := atomicWriteFile(path, content, mode)
+	if werr != nil && !errors.Is(werr, errWrittenNotSynced) {
+		return werr
 	}
-	return nil
+	out, cerr := check()
+	if cerr == nil {
+		if werr != nil {
+			return fmt.Errorf("%w; it passed %s", werr, checkName)
+		}
+		return nil
+	}
+	var rerr error
+	if existed {
+		rerr = atomicWriteFile(path, prior, mode)
+	} else {
+		rerr = os.Remove(path)
+	}
+	if rerr != nil {
+		return fmt.Errorf("%s rejected the drop-in (%s) AND rollback failed (%v); fix %s manually%s: %w",
+			checkName, strings.TrimSpace(string(out)), rerr, path, fixWhen, cerr)
+	}
+	return fmt.Errorf("%s rejected the drop-in (%s): %w", checkName, strings.TrimSpace(string(out)), cerr)
 }
 
 // sshdLogVerbose makes sshd log the client's version line (kex.c, debug1) at
@@ -1017,9 +1296,11 @@ Match User root
 	return base
 }
 
-// setupWarnings collects non-fatal problems of a --setup-ldap run so the final
-// message cannot claim a clean success after, for example, a failed
-// mkhomedir wiring (logins would work but users get no home directory).
+// setupWarnings collects findings of a --setup-ldap run that need the
+// operator but changed nothing on the host (a shadowing local account skipped
+// because it has running processes), so the final message cannot claim a
+// clean success. A failed step that changes the host is never a warning: it
+// aborts the setup.
 var setupWarnings []string
 
 // setupWarnf prints a warning now and remembers it for the final summary.
@@ -1045,24 +1326,9 @@ var (
 // reverted on failure; it takes effect at the next sshd restart (performed by
 // `--enable`), avoiding a lockout window.
 func writeSshdDropin(sssAuthKeysPath string, serviceGroups []string, rootLogin string) error {
-	path := sshdDropinPath
-	backup, readErr := os.ReadFile(path) // readErr==nil means a file existed to restore
 	content := renderSshdDropin(sssAuthKeysPath, serviceGroups, rootLogin)
-	if err := atomicWriteFile(path, []byte(content), 0644); err != nil {
+	if err := writeValidated(sshdDropinPath, []byte(content), 0644, "sshd -t", " before restarting sshd", sshdTest); err != nil {
 		return err
-	}
-	if out, err := sshdTest(); err != nil {
-		var restoreErr error
-		if readErr == nil {
-			restoreErr = atomicWriteFile(path, backup, 0644)
-		} else {
-			restoreErr = os.Remove(path)
-		}
-		if restoreErr != nil {
-			return fmt.Errorf("sshd -t rejected drop-in (%s) AND rollback failed (%v); fix %s manually before restarting sshd: %w",
-				strings.TrimSpace(string(out)), restoreErr, path, err)
-		}
-		return fmt.Errorf("sshd -t rejected drop-in (%s): %w", strings.TrimSpace(string(out)), err)
 	}
 	fmt.Println("Wrote sshd drop-in: publickey,keyboard-interactive (2FA), local keys disabled for non-root")
 	return nil
