@@ -167,6 +167,7 @@ that cannot be corrected, or its sshd config fails `sshd -t` (see Breaking).
   `sssd-dbus`).
 - `make deb`, `make rpm` and `make release` fail outside a Git checkout, where
   `git log` gives no commit time for `SOURCE_DATE_EPOCH`.
+- Built with Go 1.27.3 (0.6.1: Go 1.26.10); govulncheck reports no findings.
 
 ### Removed
 - Platform detection through `ID_LIKE`, and the Debian profile for every
