@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.7.0] - unreleased
+## [0.7.0] - 2026-11-09
 
 No fallbacks: an unsupported platform, a missing file or a failed step is an
 error with a clear message, never a silent default. Upgrades from 0.6.x keep

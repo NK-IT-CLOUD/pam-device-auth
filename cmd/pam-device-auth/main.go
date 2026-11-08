@@ -19,7 +19,7 @@ import (
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/logger"
 )
 
-var VERSION = "0.7.0-rc2"
+var VERSION = "0.7.0"
 
 const (
 	logFile     = "/var/log/pam-device-auth.log"
