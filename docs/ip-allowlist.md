@@ -118,7 +118,7 @@ A mix of IPv4 and IPv6 entries is fine; the helper parses both.
 | `clients` present, client IP does NOT match | Deny (PAM account phase fails, login rejected) |
 | `clients` absent (attribute unset in LLDAP) | Allow (a directory user with no allowlist is unrestricted by design) |
 | SSSD/InfoPipe lookup fails (down, D-Bus unreachable, timeout) | Deny, fail closed. This denies every directory user, not only pinned ones, until InfoPipe recovers |
-| The helper cannot open its log or set it to `0640` | Deny every non-root user, fail closed: the helper exits 3 without reading `clients` and reports the reason to syslog (`authpriv`); the PAM module logs `helper exited 3 (infra failure)` |
+| The helper cannot open its log, finds no regular file there or cannot remove mode bits beyond `0640` | Deny every non-root user, fail closed: the helper exits 3 without reading `clients` and reports the reason to syslog (`authpriv`); the PAM module logs `helper exited 3 (infra failure)` |
 | User is root | Allow, exempt, never touches SSSD |
 | Local-only non-root user | Deny, fail closed (unsupported login tier; no InfoPipe identity) |
 | `clients` has malformed entries | Bad entries logged once per call, good entries still enforced |

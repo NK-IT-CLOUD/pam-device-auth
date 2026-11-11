@@ -225,7 +225,7 @@ sudo -u root ls -l /etc/pam-device-auth/config.json   # expect 0600 root:root
 sudo cat /etc/pam-device-auth/config.json | jq .      # expect valid JSON
 ```
 
-### `FAIL: OIDC discovery failed`
+### `[FAIL] discovery failed` in `--check`, `OIDC Discovery failed` in the log
 
 - `issuer_url` typo, wrong realm, or trailing path included
 - DNS / firewall blocks the helper from reaching Keycloak
@@ -240,7 +240,7 @@ curl -sSL https://sso.example.com/realms/myrealm/.well-known/openid-configuratio
 The returned `issuer` field must **exactly** match `issuer_url` in
 `config.json` (trailing-slash aside; the helper normalises that).
 
-### `FAIL: OIDC issuer mismatch`
+### `[FAIL] issuer mismatch` in `--check`, `OIDC issuer mismatch` in the log
 
 Discovery's `issuer` disagrees with `issuer_url`. Usually means Keycloak
 is behind a reverse proxy that rewrites the host: Keycloak's
@@ -248,34 +248,65 @@ is behind a reverse proxy that rewrites the host: Keycloak's
 Fix on the Keycloak side; `pam-device-auth` will not silently accept a
 mismatched issuer.
 
+### The login ends after two minutes (`Timeout before authentication`)
+
+sshd ends a login that is not complete when `LoginGraceTime` has passed since
+the connection was opened. The default is 120 seconds on every supported
+distribution, and it covers the whole login: the key exchange, the wait at the
+prompt and the wait for the approval. `auth_timeout` (default 180 seconds)
+only starts when the user presses Enter, so with the defaults sshd ends the
+login first. The client sees the connection close, sshd logs
+`Timeout before authentication`, and the helper log ends at
+`Directory: waiting for authorization (timeout: 180s)` without a result,
+because sshd stops the helper together with the login.
+
+```bash
+sudo sshd -T | grep logingracetime                              # logingracetime 120
+sudo journalctl -u ssh | grep 'Timeout before authentication'   # -u sshd on Rocky Linux and Fedora
+```
+
+Users who approve within two minutes are not affected. To give them more
+time, set `LoginGraceTime` in a file of its own in `/etc/ssh/sshd_config.d/`
+that sorts before `10-pam-device-auth.conf` (sshd keeps the first value it
+reads), for example `05-login-grace.conf`:
+
+```
+LoginGraceTime 240
+```
+
+Take `auth_timeout` plus a minute for opening the link and pressing Enter:
+240 for the default `auth_timeout` of 180, 300 for the maximum of 240. Then run
+`sudo sshd -t` and reload sshd. A connection that has not finished its login
+keeps its slot for that long; `MaxStartups` still limits how many there are.
+
 ### `Helper program timed out after 300s`
 
-The PAM module killed the helper after 5 minutes. Usually means:
-
-- Device-flow poll endpoint is unreachable mid-flow
-- User scanned the QR but never confirmed in the browser
-
-Check for partial writes in the helper log. Legitimate flows finish in
-well under 300 s; `auth_timeout` default is 180 s.
+The PAM module stops a helper that still runs 300 seconds after the OIDC step
+began. The wait at the prompt and the wait for the approval (`auth_timeout`,
+at most 240 seconds, counted from Enter) reach that only when a user leaves
+the prompt open for a while first. sshd's `LoginGraceTime` ends a login long
+before that unless it was raised (previous section), so the line appears only
+on hosts with a `LoginGraceTime` of 300 seconds or more.
 
 ## Auth fails for specific user
 
-### `User <x> lacks required role: <role>`
+### `Access denied: '<user>' lacks required role '<role>'.`
 
-The user's access token does not contain `required_role`. In Keycloak:
+The user's access token does not contain `required_role`. The user sees the
+line above; the log has
+`Directory: access denied for <user>: Access denied: …` after a device login,
+or `Directory: access revoked for <user> on known IP <address>: …` when the
+cached login finds the role gone. In Keycloak:
 
 - **Users → <user> → Role mapping**: role present?
 - If using groups: **Groups → <group> → Role mapping**: role mapped?
 - If using a custom `role_claim`: decode the token and check the path
   literally
 
-Verify with the `--debug` flag set in a one-off invocation context
-(manual repro from a shell where `PAM_USER` and `PAM_RHOST` are set):
-
-```bash
-sudo PAM_USER=alice PAM_RHOST=198.51.100.2 pam-device-auth --debug
-# logs will include: "Roles extracted: [...]"
-```
+A denied login does not list the roles the token carried; the line of a
+successful login does (`Directory auth OK: user=… email=… roles=[…]`). To see
+what the provider issues, decode a token
+([keycloak-setup.md](keycloak-setup.md#inspect-a-real-access-token)).
 
 ### `Access denied: the token carries no authentication level (acr)`
 
@@ -326,11 +357,26 @@ sudo -u root sss_ssh_authorizedkeys <account> # empty output = no key served
 Set `sshPublicKey` on the account in LLDAP and, if the change does not
 show up immediately, see the SSSD cache note below.
 
-### `Username mismatch: token=<x> ssh=<y>`
+### `Token validation failed: username mismatch: token="<x>" ssh="<y>"`
 
-User opened the device-auth URL and authorised as a **different account**
-than the SSH username. Exit 1, clear error printed. User must retry with
-the matching Keycloak account.
+The user opened the link and approved as a **different account** than the SSH
+login name: the token's `preferred_username` must be equal to it. The user
+sees `Authentication failed.`, the log has the line above, and the helper
+exits 1, so sshd offers the next attempt. The user must approve with the
+account of the same name. If the two names differ by design (another
+attribute, another case), fix the user name the identity provider puts into
+the token; see [SECURITY.md](../SECURITY.md#operator-responsibilities).
+
+### `Directory: user <name> does not resolve via NSS; denying` although `getent` finds the user
+
+The helper asks SSSD for the login name (`getent -s sss passwd -- <name>`) and
+accepts the answer only when the entry carries exactly that name. Two kinds of
+names get the entry of another name: an all-digit login name, which `getent`
+reads as a UID, and a login name in another case than the directory has it
+where the SSSD domain is not case-sensitive (the `ad` profile), for example
+`ssh Alice@host` for the account `alice`. The user sees
+`Access denied: no directory identity for this user.` Log in with the name as
+`getent` prints it in the first field.
 
 ### `getent -s sss passwd <user>` returns nothing
 
@@ -371,22 +417,26 @@ and the user's refresh-token cache to force immediate re-evaluation:
 
 ```bash
 sudo rm -f /run/pam-device-auth/<user>.json  # force full device auth next login
+# a name with other characters than letters, digits, _ and - is encoded: john.doe -> john%2Edoe.json
 ```
 
 ## SSH-level symptoms
 
 ### Every login is denied and the auth log has no entries
 
-If the helper cannot open `/var/log/pam-device-auth.log` (missing directory, a
-symlink, an immutable file, a read-only filesystem, no space to create a
-missing log) or finds a mode other than `0640` that it cannot correct (an
+If the helper cannot open `/var/log/pam-device-auth.log` (missing directory,
+an immutable file, a read-only filesystem, no space to create a missing log),
+finds something there that is no regular file (a symlink, a FIFO, a
+directory) or finds mode bits beyond `0640` that it cannot remove (an
 append-only file, a filesystem without `chmod`), it denies the login on
-purpose: no audit log, no login. A log that already is `0640` is not changed,
-so an append-only log with that mode works. An existing log on a full disk
-still opens. sshd discards the helper's stderr, so
+purpose: no audit log, no login. A log with mode `0640` or stricter is not
+changed, so an append-only log with such a mode works. An existing log on a
+full disk still opens. sshd discards the helper's stderr, so
 the reason goes to syslog (`authpriv`): `journalctl -t pam-device-auth` (or
 `grep pam-device-auth /var/log/auth.log`) shows
 `pam-device-auth: cannot open /var/log/pam-device-auth.log: ...; denying login (fail closed)`
+(for a path that is no regular file the reason reads
+`log path is not a regular file: /var/log/pam-device-auth.log is a symbolic link`)
 or
 `pam-device-auth: cannot set log file mode 0640: chmod /var/log/pam-device-auth.log: ...; denying login (fail closed)`.
 The account phase (`--pam-acct`) denies every non-root user in the same case,
@@ -503,8 +553,35 @@ The helper prints the URL to its stdout, which the PAM module buffers as
 terminal until a `PAM_PROMPT` follows. If a user presses Enter before the
 FLUSH prompt arrives, sshd may drop the info block.
 
-Confirm the helper log shows `FLUSH:Authorize in browser` and the
-subsequent `Token polling failed` on timeout.
+Confirm in the helper log how far the login got:
+`Directory: SSH client "<version>", QR <shown|hidden> (<reason>)` is written
+right before link, code and prompt go out,
+`Directory: waiting for authorization (timeout: <n>s)` after Enter, and
+`Token polling failed: device authorization timed out` when nobody approved in
+time. `Device flow: the SSH client went away at the prompt (…); aborting`
+means the client closed the connection without an answer.
+
+### The prompt appears only after several seconds
+
+The helper makes its requests to the identity provider before it prints the
+link. When the link takes about 5 seconds every time, look at DNS first. The
+helper is a static binary and resolves names with Go's resolver: no cache, the
+name servers of `/etc/resolv.conf` in order, and a wait of 5 seconds for a
+name server that does not answer properly before the next one is asked. The C
+library, and with it `curl`, `getent` and `dig`, moves on at once when a name
+server answers `REFUSED`, so these tools look fine on the same host.
+
+```bash
+sudo pam-device-auth --check          # [WARN] discovery took 5.03s (more than 2s): …
+dig @<first nameserver> <issuer host> # status: REFUSED, or no answer at all
+```
+
+Remove the name server that does not answer for this host from
+`/etc/resolv.conf` (or from what generates it), or put a working one first.
+A run by hand with `--debug`
+(`sudo PAM_USER=<user> PAM_RHOST=<address> pam-device-auth --debug`) logs how
+long each request took (`Discovery took …`, `Device code request took …`,
+`Token refresh took …`, `JWKS fetch took …`).
 
 ## Cache / state issues
 
@@ -557,11 +634,14 @@ sudo chmod 0640 /var/log/pam-device-auth.log
 sudo chown root:adm /var/log/pam-device-auth.log
 ```
 
-The Go helper checks the mode every time it opens the log, sets `0640` when
-the mode differs, and denies non-root logins when that fails (see
-[Every login is denied and the auth log has no entries](#every-login-is-denied-and-the-auth-log-has-no-entries));
-the C module uses `O_NOFOLLOW` and mode `0640`. logrotate creates new files
-with `0640 root adm`.
+The Go helper checks the file every time it opens the log: it must be a
+regular file, mode bits beyond `0640` are removed (a stricter mode stays), and
+non-root logins are denied when that fails (see
+[Every login is denied and the auth log has no entries](#every-login-is-denied-and-the-auth-log-has-no-entries)).
+The C module applies the same rule to the path (no symlink, no FIFO, a regular
+file) and creates the file with `0640`. The package prepares the log on
+install and upgrade through `pam-device-auth --prepare-log`, which works on
+the open file. logrotate creates new files with `0640 root adm`.
 
 ## Observability
 
@@ -569,7 +649,7 @@ Every helper run logs a clear marker sequence. Grep:
 
 ```bash
 sudo grep "Authentication attempt" /var/log/pam-device-auth.log   # PAM side
-sudo grep "Auth OK\|Access denied\|failed"  /var/log/pam-device-auth.log  # Go side
+sudo grep "auth OK\|Access denied\|failed"  /var/log/pam-device-auth.log  # Go side
 ```
 
 The PAM side uses the `[PAM]` prefix; the Go side uses `[AUTH]`. Both append
@@ -579,8 +659,11 @@ to the same file.
 
 If the above doesn't resolve:
 
-1. Reproduce with `PAM_DEVICE_AUTH_TIMEOUT=600` in the sshd environment
-   (requires an env block in the sshd unit override).
+1. Rule out a timeout: set `auth_timeout` in `config.json` to its maximum of
+   240 (range 30 to 240), raise sshd's `LoginGraceTime` to 300, which leaves
+   a minute for the key exchange and the prompt before the wait begins
+   ([The login ends after two minutes](#the-login-ends-after-two-minutes-timeout-before-authentication)),
+   and reproduce.
 2. Run `pam-device-auth --check` from the target host to pin down
    discovery vs. token-validation vs. role issues.
 3. Decode an affected user's access token and attach the payload JSON to

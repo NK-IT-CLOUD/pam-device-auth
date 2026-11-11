@@ -21,7 +21,12 @@ Active Directory, see [active-directory-setup.md](active-directory-setup.md).
    directory certificate's subject alternative names.
 4. **SSSD packages**: `sssd-ldap libnss-sss libpam-sss sssd-dbus sssd-tools` on Debian/Ubuntu,
    `sssd sssd-ldap sssd-tools sssd-dbus authselect oddjob-mkhomedir` on Rocky
-   Linux and Fedora (`--setup-ldap` installs them if missing). `sssd-dbus` provides the SSSD
+   Linux and Fedora (`--setup-ldap` installs them if missing). On Rocky Linux
+   and Fedora `--setup-ldap` wires PAM and NSS through authselect: when the
+   `sssd` profile is active it only adds the feature `with-mkhomedir`, so
+   features such as `with-faillock` stay; any other profile is replaced by
+   `sssd with-mkhomedir`, and the setup prints the profile it replaced.
+   `sssd-dbus` provides the SSSD
    InfoPipe (`ifp`) responder. Without it sssd does not start, because `--setup-ldap`
    enables `ifp` in `sssd.conf`; `--check` reports a missing responder as a blocker.
 
@@ -112,8 +117,9 @@ PAM account phase and involves no token claim; see [ip-allowlist.md](ip-allowlis
    confirm the pieces line up, and again after any config or LLDAP change.
 
 Login: `ssh <user>@host` triggers, on first connection or from a new IP, the OIDC
-device flow; from a known IP it is a silent cached refresh (re-validated
-server-side: role + IP allowlist). Service-account users skip OIDC entirely and
+device flow; from a known IP it is a silent cached refresh while the session at
+the identity provider lives (the refreshed token is validated again: role, and
+`acr` when required; the IP allowlist is checked at every login). Service-account users skip OIDC entirely and
 authenticate with the SSH key alone. `sudo` prompts for the LLDAP password unless
 the user is in a `nopasswd_sudo_groups` group.
 
@@ -153,15 +159,22 @@ hand-made account), the **local account shadows the directory one**:
 resolves through SSSD with another UID, then migrates it: it removes the local
 entry, keeps the home directory, re-owns the files that belonged to the old IDs
 (home below `/home`, mail spool, crontab) and puts the user back into its local
-groups except `sudo`, `admin` and `wheel`. An account with running processes is
+groups. Privileged groups are the exception: `sudo`, `admin`, `wheel`, `root`,
+`adm`, `shadow`, `disk`, `staff`, `docker`, `lxd`, `incus` and `libvirt` are
+not carried over, because what they grant is root or close to it and comes
+from the directory in this setup. The list of accounts names them
+(`not carried over (privileged): docker, sudo; …`); grant what is still
+needed through a directory group. An account with running processes is
 skipped with a warning; stop them and run `--setup-ldap` again. No process is
 killed. Genuine local-only accounts and same-uid entries are left untouched.
 
 `--check` shows this decision beforehand and changes nothing: one `[WARN]` per
 account, `local account <name> (uid <local>) shadows the directory user (uid
 <dir>); --setup-ldap will migrate it, keep groups [<groups>], re-own <home>`
-(`nothing to re-own (<home> missing)` for a home below `/home` that does not
-exist, `leave <home> as it is (outside /home)` for a home elsewhere), or `… but
+(with `not carry over the privileged groups [<groups>]` after the kept ones
+when the account is in any, `nothing to re-own (<home> missing)` for a home
+below `/home` that does not exist, `leave <home> as it is (outside /home)`
+for a home elsewhere), or `… but
 has <n> running process(es); --setup-ldap will skip it`. The warnings do
 not block `--enable`. `--check` looks the names up through SSSD, so it finds
 these accounts only where SSSD already resolves the directory: before a re-run

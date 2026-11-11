@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -18,10 +19,20 @@ type shadowedAccount struct {
 	LocalUID, LocalGID int
 	DirUID, DirGID     int
 	Groups             []string // local supplementary groups to keep
+	Dropped            []string // local privileged groups that are not carried over
 }
 
-// privilegedGroups never carry over: sudo comes from the directory.
-var privilegedGroups = map[string]bool{"sudo": true, "admin": true, "wheel": true}
+// privilegedGroups never carry over: what they grant comes from the directory
+// (sudo through admin_group) or is root in all but name (docker, lxd, incus
+// and libvirt start privileged workloads, disk reads every block device, adm
+// and shadow read logs and password hashes, staff writes /usr/local, root is
+// group 0). A local account that had them does not hand them to the
+// directory user of the same name; the migration lists them instead.
+var privilegedGroups = map[string]bool{
+	"sudo": true, "admin": true, "wheel": true, "root": true,
+	"adm": true, "shadow": true, "disk": true, "staff": true,
+	"docker": true, "lxd": true, "incus": true, "libvirt": true,
+}
 
 // findShadowedAccounts returns local accounts in the human UID range whose name
 // resolves in the directory with a different UID. Pure; lookup wraps getent.
@@ -41,34 +52,38 @@ func findShadowedAccounts(passwd, group []byte, lookup func(name string) (uid, g
 		if !ok || dUID == uid {
 			continue
 		}
+		kept, dropped := localSupplementaryGroups(group, f[0], gid)
 		out = append(out, shadowedAccount{
 			Name: f[0], Home: f[5], LocalUID: uid, LocalGID: gid, DirUID: dUID, DirGID: dGID,
-			Groups: localSupplementaryGroups(group, f[0], gid),
+			Groups: kept, Dropped: dropped,
 		})
 	}
 	return out
 }
 
 // localSupplementaryGroups lists the /etc/group groups that name user as a
-// member, without privileged groups and without the primary group.
-func localSupplementaryGroups(group []byte, user string, primaryGID int) []string {
-	var out []string
+// member, without the primary group: kept are the groups the directory user
+// is put back into, dropped the privileged ones (privilegedGroups) that are
+// not carried over.
+func localSupplementaryGroups(group []byte, user string, primaryGID int) (kept, dropped []string) {
 	for _, line := range strings.Split(string(group), "\n") {
 		f := strings.Split(line, ":")
-		if len(f) < 4 || privilegedGroups[f[0]] {
+		if len(f) < 4 {
 			continue
 		}
 		if gid, err := strconv.Atoi(f[2]); err != nil || gid == primaryGID {
 			continue
 		}
-		for _, m := range strings.Split(f[3], ",") {
-			if m == user {
-				out = append(out, f[0])
-				break
-			}
+		if !slices.Contains(strings.Split(f[3], ","), user) {
+			continue
+		}
+		if privilegedGroups[f[0]] {
+			dropped = append(dropped, f[0])
+		} else {
+			kept = append(kept, f[0])
 		}
 	}
-	return out
+	return kept, dropped
 }
 
 // processCount counts processes whose real or effective UID is uid, from the
@@ -150,7 +165,7 @@ func migrateShadowedAccount(a shadowedAccount, run commandRunner, exists func(st
 // directory side of findShadowedAccounts.
 func sssPasswdLookup(name string) (uid, gid int, ok bool) {
 	out, err := exec.Command("getent", "-s", "sss", "passwd", "--", name).Output()
-	if err != nil {
+	if err != nil || !nssAnswerMatches(out, name) {
 		return 0, 0, false
 	}
 	f := strings.Split(strings.TrimSpace(string(out)), ":")
@@ -194,6 +209,9 @@ func migrateLocalShadowing() (removed bool, err error) {
 	fmt.Printf("%d local account(s) shadow a directory user:\n", len(accounts))
 	for _, a := range accounts {
 		fmt.Printf("  - %s: local uid %d -> directory uid %d, keeps groups %v, home %s\n", a.Name, a.LocalUID, a.DirUID, a.Groups, a.Home)
+		if len(a.Dropped) > 0 {
+			fmt.Printf("    not carried over (privileged): %s; grant what is needed through the directory\n", strings.Join(a.Dropped, ", "))
+		}
 	}
 	fmt.Println("------------------------------------------------------------")
 	migrated, err := migrateShadowedAccounts(accounts, "/proc", execRunner, pathExists)
@@ -245,7 +263,11 @@ func migrationPreview(accounts []shadowedAccount, running map[string]int, homeEx
 				home = "nothing to re-own (" + h + " missing)"
 			}
 		}
-		out = append(out, fmt.Sprintf("%s; --setup-ldap will migrate it, keep groups [%s], %s", head, strings.Join(a.Groups, ", "), home))
+		groups := fmt.Sprintf("keep groups [%s]", strings.Join(a.Groups, ", "))
+		if len(a.Dropped) > 0 {
+			groups += fmt.Sprintf(", not carry over the privileged groups [%s]", strings.Join(a.Dropped, ", "))
+		}
+		out = append(out, fmt.Sprintf("%s; --setup-ldap will migrate it, %s, %s", head, groups, home))
 	}
 	return out
 }

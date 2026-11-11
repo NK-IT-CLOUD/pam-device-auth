@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -317,20 +319,22 @@ func TestPollToken_Timeout(t *testing.T) {
 
 func TestPollToken_ContextTimeoutDuringRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1500 * time.Millisecond)
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	// The first request goes out at once and is still in flight when the
+	// context ends.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
 	_, err := PollToken(ctx, newTestClient(srv), srv.URL, "ssh-server", "dev-code", 1)
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("PollToken() should fail when the request context times out")
+	if err == nil || !strings.Contains(err.Error(), "device authorization timed out") {
+		t.Fatalf("PollToken() error = %v, want the timeout when the context ends during a request", err)
 	}
-	if elapsed > 2*time.Second {
+	if elapsed > time.Second {
 		t.Fatalf("poll request should have been cancelled, elapsed = %v", elapsed)
 	}
 }
@@ -437,5 +441,176 @@ func TestRefreshToken_ServerDown(t *testing.T) {
 	_, err := RefreshToken(context.Background(), client, "http://127.0.0.1:1", "ssh-server", "rt")
 	if err == nil {
 		t.Error("should fail on unreachable server")
+	}
+}
+
+// tokenSuccess answers a token request with a fixed token pair.
+func tokenSuccess(t *testing.T, w http.ResponseWriter, accessToken string) {
+	t.Helper()
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
+		"access_token": accessToken, "refresh_token": "rt", "token_type": "Bearer",
+	}); err != nil {
+		t.Errorf("Encode() error: %v", err)
+	}
+}
+
+// The user presses Enter after approving in the browser: the first token
+// request must go out at once, not after a full poll interval.
+func TestPollToken_FirstRequestAtOnce(t *testing.T) {
+	old := MinPollInterval
+	MinPollInterval = 2
+	defer func() { MinPollInterval = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenSuccess(t, w, "at-once")
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	token, err := PollToken(ctx, newTestClient(srv), srv.URL, "ssh-server", "dev-code", 2)
+	if err != nil {
+		t.Fatalf("PollToken() error: %v", err)
+	}
+	if token.AccessToken != "at-once" {
+		t.Errorf("AccessToken = %q", token.AccessToken)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("the token arrived after %s; the first request must not wait for the poll interval (2 s)", d)
+	}
+}
+
+// fastRetries removes the waits between token requests for one test.
+func fastRetries(t *testing.T) {
+	t.Helper()
+	oldInterval, oldBackoff := MinPollInterval, minRetryBackoff
+	MinPollInterval, minRetryBackoff = 0, 10*time.Millisecond
+	t.Cleanup(func() { MinPollInterval, minRetryBackoff = oldInterval, oldBackoff })
+}
+
+// A proxy error page, a rate limit and a dropped connection say nothing about
+// the device code: polling goes on and the login completes.
+func TestPollToken_RetriesTransientErrors(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte("<html><body>502 Bad Gateway</body></html>"))
+		case 2:
+			w.WriteHeader(http.StatusTooManyRequests)
+		case 3:
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("Hijack() error: %v", err)
+				return
+			}
+			conn.Close()
+		default:
+			tokenSuccess(t, w, "after-retries")
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	token, err := PollToken(ctx, newTestClient(srv), srv.URL, "ssh-server", "dev-code", 0)
+	if err != nil {
+		t.Fatalf("PollToken() error: %v", err)
+	}
+	if token.AccessToken != "after-retries" {
+		t.Errorf("AccessToken = %q", token.AccessToken)
+	}
+	if n := calls.Load(); n != 4 {
+		t.Errorf("token requests = %d, want 4 (three transient failures, then the token)", n)
+	}
+}
+
+// While the provider keeps failing, polling goes on until the deadline and
+// the error names the last failure.
+func TestPollToken_TransientUntilDeadline(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	_, err := PollToken(ctx, newTestClient(srv), srv.URL, "ssh-server", "dev-code", 0)
+	if err == nil {
+		t.Fatal("PollToken() must fail at the deadline")
+	}
+	if !strings.Contains(err.Error(), "device authorization timed out") || !strings.Contains(err.Error(), "503") {
+		t.Errorf("error = %q, want the timeout and the last failure (status 503)", err)
+	}
+	if n := calls.Load(); n < 2 {
+		t.Errorf("token requests = %d, want more than one before the deadline", n)
+	}
+}
+
+// The wait after a transient failure starts at the poll interval, doubles and
+// is capped; an answer of the provider resets it.
+func TestNextBackoff(t *testing.T) {
+	const interval = 5 * time.Second
+	var got []time.Duration
+	b := time.Duration(0)
+	for i := 0; i < 5; i++ {
+		b = nextBackoff(b, interval)
+		got = append(got, b)
+	}
+	want := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff sequence = %v, want %v", got, want)
+		}
+	}
+	if b := nextBackoff(0, 0); b != minRetryBackoff {
+		t.Errorf("nextBackoff(0, 0) = %s, want the minimum %s", b, minRetryBackoff)
+	}
+}
+
+// The poll interval is the floor: RFC 8628 does not allow polling faster, so
+// the wait after repeated failures must not fall below it, also when the
+// interval (from the provider, or after slow_down answers) is above the cap.
+func TestNextBackoff_NeverBelowTheInterval(t *testing.T) {
+	const interval = 45 * time.Second
+	b := time.Duration(0)
+	for i := 1; i <= 4; i++ {
+		b = nextBackoff(b, interval)
+		if b < interval {
+			t.Fatalf("failure %d in a row: wait %s is below the poll interval %s", i, b, interval)
+		}
+	}
+}
+
+// An error page of the provider goes into the helper's log line; it must not
+// carry the whole body there.
+func TestErrorBodiesAreTruncated(t *testing.T) {
+	huge := strings.Repeat("x", 64<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(huge))
+	}))
+	defer srv.Close()
+
+	_, err := RequestCode(context.Background(), newTestClient(srv), srv.URL, "ssh-server")
+	if err == nil || len(err.Error()) > 600 {
+		t.Errorf("RequestCode() error has %d bytes, want an error of at most 600", len(fmt.Sprint(err)))
+	}
+	if err != nil && !strings.Contains(err.Error(), "status 500") {
+		t.Errorf("RequestCode() error %.80q lacks the status", err.Error())
+	}
+
+	_, err = RefreshToken(context.Background(), newTestClient(srv), srv.URL, "ssh-server", "rt")
+	if err == nil || len(err.Error()) > 600 {
+		t.Errorf("RefreshToken() error has %d bytes, want an error of at most 600", len(fmt.Sprint(err)))
 	}
 }

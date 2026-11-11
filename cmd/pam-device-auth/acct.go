@@ -88,6 +88,19 @@ func requiresIPGate(user string) bool {
 	return user != "root"
 }
 
+// busctlClientsArgs is the busctl command line that asks the SSSD InfoPipe for
+// the "clients" attribute of user. busctl parses options anywhere on its
+// command line, so "--" comes before the verb: everything after it, the user
+// name included, is data.
+func busctlClientsArgs(user string) []string {
+	return []string{"--json=short", "--", "call",
+		"org.freedesktop.sssd.infopipe",
+		"/org/freedesktop/sssd/infopipe",
+		"org.freedesktop.sssd.infopipe",
+		"GetUserAttr", "sas", user, "1", "clients",
+	}
+}
+
 // busctlClients reads the "clients" IP allowlist attribute for a directory
 // user via sssd-infopipe over D-Bus. Callers MUST only invoke this for a user
 // subject to the non-root gate. Any non-zero exit here is a read failure (ifp
@@ -100,12 +113,7 @@ func busctlClients(user string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), busctlTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "busctl", "--json=short", "call",
-		"org.freedesktop.sssd.infopipe",
-		"/org/freedesktop/sssd/infopipe",
-		"org.freedesktop.sssd.infopipe",
-		"GetUserAttr", "sas", user, "1", "clients",
-	).Output()
+	out, err := exec.CommandContext(ctx, "busctl", busctlClientsArgs(user)...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("busctl GetUserAttr clients failed for %q: %s", user, busctlFailure(ctx, err))
 	}
@@ -156,13 +164,13 @@ func runPamAcct() int {
 	log, err := newAcctLogger(logFile, debug)
 	if err != nil {
 		// NewLogger fails when the log cannot be opened (missing directory,
-		// symlink, immutable file, read-only filesystem, no space to create a
-		// missing file) or, when its mode is not 0640, set to 0640
-		// (append-only file, filesystem without chmod). An existing log on a
-		// full disk opens fine. Either way: no
-		// account decision without an audit log. The decision does not use the
-		// logger; the reason goes to stderr and syslog. root stays exempt from
-		// the account check.
+		// immutable file, read-only filesystem, no space to create a missing
+		// file), is no regular file (symlink, FIFO, directory) or has mode
+		// bits beyond 0640 that cannot be removed (append-only file,
+		// filesystem without chmod). An existing log on a full disk opens
+		// fine. Either way: no account decision without an audit log. The
+		// decision does not use the logger; the reason goes to stderr and
+		// syslog. root stays exempt from the account check.
 		if !requiresIPGate(user) {
 			reportLogFailure(logFailureMessage(err, "root is exempt, allowing"))
 			return 0
@@ -188,6 +196,13 @@ func pamAccount(log *logger.Logger, user, rhost string, read func(string) ([]str
 	if !requiresGate {
 		log.Info("pam-acct: user=root; exempt, allow (break-glass)")
 		return 0
+	}
+
+	// The name becomes an argument of busctl; one that looks like an option is
+	// no directory user.
+	if err := loginNameError(user); err != nil {
+		log.Error("pam-acct: refusing user name %q: %v; denying", user, err)
+		return 1
 	}
 
 	clients, readErr := read(user)

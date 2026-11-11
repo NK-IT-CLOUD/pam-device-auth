@@ -88,9 +88,6 @@ func charCountBits(version int) int {
 
 // --- Data encoding ---
 
-// Total data codewords (data + ECC) per version at level M
-var totalCodewords = [11]int{0, 26, 44, 70, 100, 134, 172, 196, 242, 292, 346}
-
 // ECC codewords per block for level M
 var eccPerBlock = [11]int{0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 28}
 
@@ -308,12 +305,6 @@ func newMatrix(size int) [][]bool {
 		m[i] = make([]bool, size)
 	}
 	return m
-}
-
-func setModule(matrix [][]bool, row, col int, dark bool) {
-	if row >= 0 && row < len(matrix) && col >= 0 && col < len(matrix) {
-		matrix[row][col] = dark
-	}
 }
 
 // placeFinders places the three 7x7 finder patterns.

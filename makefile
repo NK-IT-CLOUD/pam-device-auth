@@ -24,12 +24,13 @@ PAM_SO=pam_device_auth.so
 # The .so is loaded in-process by sshd and runs as root for every auth attempt,
 # so harden the only native artifact: FORTIFY (needs -O2) + stack-protector +
 # stack-clash + format-string warnings, and full RELRO/BIND_NOW + non-exec stack
-# at link. (_FORTIFY_SOURCE=2 for broad toolchain compatibility; raise to 3 if
-# the build gcc/glibc supports it.)
-PAM_CFLAGS=-O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fstack-clash-protection -fPIC -Wall -Wextra -Wformat -Wformat-security
+# at link. _FORTIFY_SOURCE=3 needs gcc 12 or later; with an older compiler the C
+# library treats it like 2 and prints a warning. That is why -Werror is set in
+# the analyze target only and not here.
+PAM_CFLAGS=-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fPIC -Wall -Wextra -Wformat -Wformat-security
 PAM_LDFLAGS=-shared -Wl,-z,relro,-z,now -Wl,-z,noexecstack -lpam
 
-.PHONY: all build pam build-all test test-unit lint format clean clean-all deb rpm package-prep release install uninstall
+.PHONY: all build pam build-all test test-unit lint analyze format clean clean-all deb rpm package-prep release install uninstall
 
 # Run the steps in sub-makes so `make -j` cannot schedule clean alongside the
 # build (as prerequisites they would run concurrently and clean could delete
@@ -72,9 +73,19 @@ test-unit:
 	@echo "Running unit tests..."
 	go test $(GO_TEST_FLAGS) ./internal/...
 
-# Lint
+# Lint: go vet and staticcheck for the Go code, shellcheck for the maintainer
+# scripts and the packaging scripts. staticcheck runs at a pinned version and is
+# no dependency of the module.
+STATICCHECK=honnef.co/go/tools/cmd/staticcheck@v0.8.2
 lint:
 	go vet ./...
+	go run $(STATICCHECK) ./...
+	shellcheck debian/preinst debian/postinst debian/prerm debian/postrm packaging/*.sh
+
+# One pass over the PAM module with gcc's static analyzer. Every warning is an
+# error here; nothing is written. Needs gcc 12 or later (see PAM_CFLAGS).
+analyze:
+	gcc $(PAM_CFLAGS) -fanalyzer -Werror -c $(PAM_SRC) -o /dev/null
 
 # Format
 format:

@@ -104,3 +104,25 @@ func TestParseClientVersion_StripsControlBytes(t *testing.T) {
 		}
 	}
 }
+
+// PIDs are reused: without a bound the journal also returns the lines of an
+// earlier process with the same PID, from another boot.
+func TestJournalArgsLimitToThisBoot(t *testing.T) {
+	got := journalArgs(4711)
+	want := []string{"-b", "_PID=4711", "-o", "cat", "--no-pager"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("journalArgs(4711) = %v, want %v", got, want)
+	}
+}
+
+// Within one boot a PID can be reused as well; the newest line is the one of
+// the connection that asks.
+func TestParseClientVersion_NewestWins(t *testing.T) {
+	out := "debug1: Remote protocol version 2.0, remote software version OpenSSH_for_Windows_9.5\n" +
+		"Connection closed\n" +
+		"debug1: Remote protocol version 2.0, remote software version OpenSSH_10.2p1 Ubuntu-2ubuntu3\n" +
+		"Postponed keyboard-interactive/pam\n"
+	if got := parseClientVersion(out); got != "OpenSSH_10.2p1 Ubuntu-2ubuntu3" {
+		t.Errorf("parseClientVersion() = %q, want the newest client version", got)
+	}
+}

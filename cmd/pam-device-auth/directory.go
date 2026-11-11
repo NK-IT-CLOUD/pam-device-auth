@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"crypto"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -23,15 +23,86 @@ import (
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/token"
 )
 
-// directoryAuthFlow is the auth path for hosts where identity comes from the
+// timed runs fn and logs at DEBUG how long step took: with --debug a slow
+// login shows which request to the identity provider was slow.
+func timed(log *logger.Logger, step string, fn func()) {
+	start := time.Now()
+	fn()
+	log.Debug("%s took %s", step, time.Since(start).Round(time.Millisecond))
+}
+
+// outcome is the result of a login attempt. The zero value denies, so a path
+// that never sets it cannot let a login through.
+type outcome int
+
+const (
+	denySoft outcome = iota // failed; sshd may let the user try again
+	denyHard                // denied (missing role, no directory identity); no retry
+	allow
+)
+
+// exitCode is the helper's exit status for an outcome, as pam_device_auth.c
+// reads it: 0 success, 2 hard deny, everything else a soft failure.
+func (o outcome) exitCode() int {
+	switch o {
+	case allow:
+		return 0
+	case denyHard:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// authIO is the helper's side of the line protocol with the PAM module: the
+// module collects info lines and shows them with the next "FLUSH:" line, which
+// is a prompt that the module answers with one line.
+type authIO struct {
+	in  *bufio.Reader
+	out io.Writer
+}
+
+// info writes one info line.
+func (a *authIO) info(format string, args ...any) {
+	fmt.Fprintf(a.out, format+"\n", args...)
+}
+
+// prompt shows text as a prompt and waits for the answer line. The error says
+// that no complete line arrived (the other side is gone).
+func (a *authIO) prompt(text string) error {
+	fmt.Fprintf(a.out, "FLUSH:%s\n", text)
+	_, err := a.in.ReadString('\n')
+	return err
+}
+
+// authFlow is one login attempt on a host where identity comes from the
 // directory (via SSSD/NSS). pam-device-auth here is ONLY the extra OIDC
 // SSH-login layer: it validates an OIDC token (signature/issuer/client/exp/iat,
-// required_role, optional required_acr, optional IP allowlist) for the SSH
-// user, then grants or denies the login. It NEVER reads /etc/shadow, never
-// prompts for a local password, and never creates users or manages groups —
-// SSSD and the directory own identity, groups, home dir, and the sudo password
-// (pam_sss).
-func directoryAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser, clientIP string) {
+// required_role, optional required_acr) for the SSH user, then grants or
+// denies the login. It NEVER reads /etc/shadow, never prompts for a local
+// password, and never creates users or manages groups — SSSD and the directory
+// own identity, groups, home dir, and the sudo password (pam_sss).
+type authFlow struct {
+	log       *logger.Logger
+	cfg       *config.Config
+	client    *http.Client
+	endpoints *discovery.Endpoints
+	io        *authIO
+	// nss reports whether a user resolves through SSSD (nssLookup).
+	nss func(user string) (found bool, err error)
+}
+
+// run decides the login of sshUser from clientIP: the directory identity gate,
+// then the cached session of a known address, then the device flow.
+func (f *authFlow) run(sshUser, clientIP string) outcome {
+	// The login name becomes an argument of getent; a name that looks like an
+	// option is no directory user and never reaches a command line.
+	if err := loginNameError(sshUser); err != nil {
+		f.log.Error("Directory: refusing login name %q: %v; denying", sshUser, err)
+		f.deny("Access denied: no directory identity for this user.")
+		return denyHard
+	}
+
 	// Defensive NSS identity gate. In directory mode the SSH user MUST resolve
 	// via NSS (SSSD/LDAP). The deployed sshd config already guarantees this —
 	// publickey is served from the directory by sss_ssh_authorizedkeys, so an
@@ -39,28 +110,27 @@ func directoryAuthFlow(log *logger.Logger, cfg *config.Config, httpClient *http.
 	// drop-in we must not grant access (or cache a refresh token) for a user
 	// who has no Unix identity. getent -s sss queries SSSD only — local
 	// /etc/passwd accounts must not pass the directory gate.
-	found, nssErr := nssLookup(sshUser)
-	if allow, logMsg, banner := identityGate(sshUser, found, nssErr); !allow {
-		log.Error("%s", logMsg)
-		denyBanner(banner)
-		os.Exit(2)
+	found, nssErr := f.nss(sshUser)
+	if ok, logMsg, banner := identityGate(sshUser, found, nssErr); !ok {
+		f.log.Error("%s", logMsg)
+		f.deny(banner)
+		return denyHard
 	}
 
-	if tryCachedDirectory(log, cfg, httpClient, endpoints, sshUser, clientIP) {
-		return
+	if o, done := f.cached(sshUser, clientIP); done {
+		return o
 	}
-	deviceDirectory(log, cfg, httpClient, endpoints, sshUser, clientIP)
-	// Success falls through; main() owns the single os.Exit(0). Hard-deny/error
-	// paths inside the two flows terminate directly via os.Exit(2)/os.Exit(1).
+	return f.device(sshUser, clientIP)
 }
 
-// tryCachedDirectory uses a cached refresh token for a known IP to re-validate
-// with the IdP without a browser round-trip. Returns true on success. A soft
-// failure (network, expired refresh) returns false: device flow required; a
-// genuine access denial on a known IP (role revoked, IP removed) is a
-// hard deny (exit 2) — no point re-prompting.
-func tryCachedDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser, clientIP string) bool {
-	success := false
+// cached uses a cached refresh token for a known IP to re-validate with the
+// IdP without a browser round-trip. done reports whether that settled the
+// login: allow, or a hard deny for a genuine access denial on a known IP (role
+// revoked) — no point re-prompting. A soft failure (network, expired refresh)
+// leaves done false: device flow required.
+func (f *authFlow) cached(sshUser, clientIP string) (o outcome, done bool) {
+	log, cfg, httpClient, endpoints := f.log, f.cfg, f.client, f.endpoints
+	denyReason := ""
 	err := cache.WithUserLock(sshUser, func() error {
 		session, err := cache.Load(sshUser)
 		if errors.Is(err, cache.ErrCorrupt) {
@@ -78,7 +148,10 @@ func tryCachedDirectory(log *logger.Logger, cfg *config.Config, httpClient *http
 		// this, two PAM processes can submit the same one-time refresh token and
 		// the loser can delete or overwrite the winner's newly rotated token.
 		ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-		tokenResp, err := device.RefreshToken(ctx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, session.RefreshToken)
+		var tokenResp *device.TokenResponse
+		timed(log, "Token refresh", func() {
+			tokenResp, err = device.RefreshToken(ctx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, session.RefreshToken)
+		})
 		cancel()
 		if err != nil {
 			if errors.Is(err, device.ErrRefreshRejected) {
@@ -97,11 +170,20 @@ func tryCachedDirectory(log *logger.Logger, cfg *config.Config, httpClient *http
 			return cache.Delete(sshUser)
 		}
 
-		if reason := checkDirectoryAccess(result, cfg); reason != "" {
+		if reason := roleDenial(result, cfg); reason != "" {
 			log.Error("Directory: access revoked for %s on known IP %s: %s", sshUser, clientIP, reason)
 			_ = cache.Delete(sshUser)
-			denyBanner(reason)
-			os.Exit(2)
+			// The banner waits for the user; it is shown after the lock is released.
+			denyReason = reason
+			o, done = denyHard, true
+			return nil
+		}
+		// The authentication level of a refreshed token is what the session
+		// had, or what the provider still vouches for; a new device login can
+		// reach the required level. So this is no revocation: device flow.
+		if reason := acrDenial(result, cfg); reason != "" {
+			log.Warn("Directory: refreshed token of %s does not meet required_acr (cache cleared, device auth): %s", sshUser, reason)
+			return cache.Delete(sshUser)
 		}
 
 		log.Info("Directory auth OK (cached): user=%s roles=%v", result.Username, result.Roles)
@@ -111,24 +193,34 @@ func tryCachedDirectory(log *logger.Logger, cfg *config.Config, httpClient *http
 				return err
 			}
 		}
-		success = true
+		o, done = allow, true
 		return nil
 	})
 	if err != nil {
 		log.Warn("Directory: session cache error: %v", err)
 	}
-	return success
+	if denyReason != "" {
+		f.deny(denyReason)
+	}
+	return o, done
 }
 
-// deviceDirectory runs the full device-grant flow and grants or denies login.
-func deviceDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Client, endpoints *discovery.Endpoints, sshUser, clientIP string) {
+// device runs the full device-grant flow and grants or denies login.
+func (f *authFlow) device(sshUser, clientIP string) outcome {
+	log, cfg, httpClient, endpoints := f.log, f.cfg, f.client, f.endpoints
 	reqCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	dc, err := device.RequestCode(reqCtx, httpClient, endpoints.DeviceAuthorizationEndpoint, cfg.ClientID)
+	var (
+		dc  *device.DeviceCode
+		err error
+	)
+	timed(log, "Device code request", func() {
+		dc, err = device.RequestCode(reqCtx, httpClient, endpoints.DeviceAuthorizationEndpoint, cfg.ClientID)
+	})
 	cancel()
 	if err != nil {
 		log.Error("Device code request failed: %v", err)
-		fmt.Println("Authentication failed.")
-		os.Exit(1)
+		f.io.info("Authentication failed.")
+		return denySoft
 	}
 
 	// These IdP-supplied values reach the SSH client's terminal via the PAM
@@ -137,27 +229,32 @@ func deviceDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Cl
 	dc.VerificationURIComplete = sanitizeDisplay(dc.VerificationURIComplete)
 	dc.UserCode = sanitizeDisplay(dc.UserCode)
 
-	fmt.Println("------------------------------------")
+	f.io.info("------------------------------------")
 	if dc.VerificationURIComplete != "" {
-		fmt.Printf("Link:  %s\n", dc.VerificationURIComplete)
-		fmt.Printf("Code:  %s\n", dc.UserCode)
+		f.io.info("Link:  %s", dc.VerificationURIComplete)
+		f.io.info("Code:  %s", dc.UserCode)
 		show, client, reason := sshclient.QRDecision(cfg.ShowQR)
 		log.Info("%s", qrDecisionMessage(show, client, reason))
 		if show && canRenderQR(dc.VerificationURIComplete) {
-			fmt.Println()
+			f.io.info("")
 			if qrStr, err := qr.Render(dc.VerificationURIComplete); err == nil {
-				fmt.Print(qrStr)
+				fmt.Fprint(f.io.out, qrStr)
 			}
 		} else if show {
 			log.Info("%s", qrNotRenderedMessage(dc.VerificationURIComplete))
 		}
 	} else {
-		fmt.Printf("Open:  %s\n", dc.VerificationURI)
-		fmt.Printf("Code:  %s\n", dc.UserCode)
+		f.io.info("Open:  %s", dc.VerificationURI)
+		f.io.info("Code:  %s", dc.UserCode)
 	}
-	fmt.Println("------------------------------------")
-	fmt.Println("FLUSH:Authorize in browser, then press Enter... ")
-	bufio.NewReaderSize(os.Stdin, 64).ReadString('\n')
+	f.io.info("------------------------------------")
+	if err := f.io.prompt("Authorize in browser, then press Enter... "); err != nil {
+		// No answer line means the PAM side is gone: the SSH client disconnected
+		// and sshd ended its PAM process. Polling on would complete a login that
+		// nobody waits for and store its session.
+		log.Warn("Device flow: the SSH client went away at the prompt (%v); aborting", err)
+		return denySoft
+	}
 
 	timeout := cfg.AuthTimeout
 	if dc.ExpiresIn > 0 && dc.ExpiresIn < timeout {
@@ -170,26 +267,27 @@ func deviceDirectory(log *logger.Logger, cfg *config.Config, httpClient *http.Cl
 	tokenResp, err := device.PollToken(ctx, httpClient, endpoints.TokenEndpoint, cfg.ClientID, dc.DeviceCode, dc.Interval)
 	if err != nil {
 		log.Error("Token polling failed: %v", err)
-		fmt.Println("Authentication failed.")
-		os.Exit(1)
+		f.io.info("Authentication failed.")
+		return denySoft
 	}
 
 	result, err := validateDirectoryToken(log, httpClient, endpoints, cfg, tokenResp.AccessToken, sshUser)
 	if err != nil {
 		log.Error("Token validation failed: %v", err)
-		fmt.Println("Authentication failed.")
-		os.Exit(1)
+		f.io.info("Authentication failed.")
+		return denySoft
 	}
 
 	if reason := checkDirectoryAccess(result, cfg); reason != "" {
 		log.Error("Directory: access denied for %s: %s", sshUser, reason)
-		denyBanner(reason)
-		os.Exit(2)
+		f.deny(reason)
+		return denyHard
 	}
 
 	log.Info("Directory auth OK: user=%s email=%s roles=%v", result.Username, result.Email, result.Roles)
 
 	rememberDeviceLogin(log, sshUser, tokenResp.RefreshToken, clientIP)
+	return allow
 }
 
 // qrDecisionMessage is the device flow's log line for the QR decision: the
@@ -237,7 +335,14 @@ func rememberDeviceLogin(log *logger.Logger, sshUser, refreshToken, clientIP str
 // can distinguish "bad token" from "denied".
 func validateDirectoryToken(log *logger.Logger, httpClient *http.Client, endpoints *discovery.Endpoints, cfg *config.Config, accessToken, sshUser string) (*token.TokenResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	keys, cached, err := token.FetchJWKSCached(ctx, httpClient, endpoints.JwksURI, cfg.IssuerURL, log.Debug, log.Warn)
+	var (
+		keys   map[string]crypto.PublicKey
+		cached bool
+		err    error
+	)
+	timed(log, "JWKS fetch", func() {
+		keys, cached, err = token.FetchJWKSCached(ctx, httpClient, endpoints.JwksURI, cfg.IssuerURL, log.Debug, log.Warn)
+	})
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("JWKS fetch: %w", err)
@@ -272,9 +377,24 @@ func validateDirectoryToken(log *logger.Logger, httpClient *http.Client, endpoin
 // deny reason or "". The `clients` IP allowlist is enforced separately in the
 // PAM account phase (acct.go) for every login, so it is not re-checked here.
 func checkDirectoryAccess(result *token.TokenResult, cfg *config.Config) string {
+	if reason := roleDenial(result, cfg); reason != "" {
+		return reason
+	}
+	return acrDenial(result, cfg)
+}
+
+// roleDenial is the deny reason for a token without the required role, or "".
+func roleDenial(result *token.TokenResult, cfg *config.Config) string {
 	if !token.HasRole(result.Roles, cfg.RequiredRole) {
 		return fmt.Sprintf("Access denied: '%s' lacks required role '%s'.", result.Username, cfg.RequiredRole)
 	}
+	return ""
+}
+
+// acrDenial is the deny reason for a token whose authentication level (acr)
+// is missing or not in required_acr, or "". Without required_acr every token
+// passes.
+func acrDenial(result *token.TokenResult, cfg *config.Config) string {
 	if len(cfg.RequiredACR) > 0 && !slices.Contains(cfg.RequiredACR, result.ACR) {
 		if result.ACR == "" {
 			return "Access denied: the token carries no authentication level (acr); the identity provider must add the acr claim (Keycloak: client scope acr)."
@@ -301,22 +421,17 @@ func identityGate(user string, found bool, lookupErr error) (allow bool, logMsg,
 	return true, "", ""
 }
 
-// nssUserExists reports whether the user resolves through SSSD. It queries the
+// nssLookup reports whether the user resolves through SSSD. It queries the
 // sss NSS service explicitly (getent -s sss) so that local-only /etc/passwd
 // accounts do NOT satisfy the directory identity gate: the documented boundary
 // is "SSSD and the directory own identity", and a plain `getent passwd` would
 // also accept `files` entries, letting a same-named local account bypass
 // directory revocation (PDA-SEC-001). A short timeout guards against a hung
 // SSSD.
-func nssUserExists(username string) bool {
-	found, err := nssLookup(username)
-	return err == nil && found
-}
-
-// nssLookup is nssUserExists with the failure cause kept apart: getent exits 2
-// for "key not found" (found=false, err=nil); any other failure (timeout,
-// SSSD down, exec error) is returned as err so callers can log an outage
-// instead of claiming the account does not exist.
+//
+// getent exits 2 for "key not found" (found=false, err=nil); any other failure
+// (timeout, SSSD down, exec error) is returned as err so callers can log an
+// outage instead of claiming the account does not exist.
 func nssLookup(username string) (found bool, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -328,16 +443,18 @@ func nssLookup(username string) (found bool, err error) {
 		}
 		return false, err
 	}
-	return len(bytes.TrimSpace(out)) > 0, nil
+	// Only the entry of exactly this name counts: getent answers an all-digit
+	// key with the entry of that UID.
+	return nssAnswerMatches(out, username), nil
 }
 
-// denyBanner prints a standard hard-deny message to the SSH client and waits
-// for Enter (the FLUSH triggers OpenSSH to display batched info lines).
-func denyBanner(reason string) {
-	fmt.Println("------------------------------------")
-	fmt.Println(reason)
-	fmt.Println("Contact your administrator.")
-	fmt.Println("------------------------------------")
-	fmt.Println("FLUSH:Press Enter to disconnect... ")
-	bufio.NewReaderSize(os.Stdin, 64).ReadString('\n')
+// deny prints a standard hard-deny message to the SSH client and waits for
+// Enter (the prompt makes OpenSSH display the batched info lines). Whether the
+// answer arrives changes nothing: the login is denied either way.
+func (f *authFlow) deny(reason string) {
+	f.io.info("------------------------------------")
+	f.io.info("%s", reason)
+	f.io.info("Contact your administrator.")
+	f.io.info("------------------------------------")
+	_ = f.io.prompt("Press Enter to disconnect... ")
 }

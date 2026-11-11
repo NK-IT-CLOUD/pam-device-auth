@@ -18,6 +18,8 @@
 #include <signal.h>
 #include <poll.h>
 #include <limits.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
 
 #define AUTH_BIN "/usr/local/bin/pam-device-auth"
 #define BUFFER_SIZE 4096
@@ -81,7 +83,18 @@ static void log_message(int priority, const char *format, ...) {
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), "%Y/%m/%d %H:%M:%S", &tm_buf);
 
-    int log_fd = open(LOG_FILE, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0640);
+    // O_NOFOLLOW refuses a symlink at the path; O_NONBLOCK makes opening a
+    // FIFO fail at once instead of blocking this sshd process until someone
+    // reads it. Whatever opens nevertheless and is no regular file (a FIFO
+    // that has a reader, a device) is not written to. The helper applies the
+    // same rule and denies the login without its log; here syslog still gets
+    // the line.
+    int log_fd = open(LOG_FILE, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0640);
+    struct stat log_st;
+    if (log_fd >= 0 && (fstat(log_fd, &log_st) != 0 || !S_ISREG(log_st.st_mode))) {
+        close(log_fd);
+        log_fd = -1;
+    }
     FILE *f = (log_fd >= 0) ? fdopen(log_fd, "a") : NULL;
     if (f != NULL) {
         fprintf(f, "%s " PAM_LOG_PREFIX "   %s %s\n", timestamp, priority_to_level(priority), full_message);
@@ -130,12 +143,12 @@ static void get_client_ip(pam_handle_t *pamh, char *ip_buf, size_t ip_buf_size) 
     }
 }
 
-// Monotonic deadline helpers. PAM modules may be invoked concurrently in the
-// same sshd process; all timeout state must be per-call (stack-local), never
-// process-global. SIGALRM + a global alarm handler is unsafe here because
-// (a) there is only one alarm per process, so concurrent logins clobber each
-// other, and (b) the signal handler ran outside the authenticate frame and
-// relied on globals that two sessions would race on.
+// Monotonic deadline helpers. All timeout state is per call (stack-local),
+// never process-global, and the module does not use SIGALRM: the alarm timer
+// and its handler are state of the whole process and belong to the application
+// that loaded the module. sshd runs the PAM conversation of each connection in
+// a process of its own, so two logins never share one; the note at
+// setenv("PAM_USER") below is the one place that relies on it.
 static void deadline_from_now(struct timespec *deadline, int seconds) {
     clock_gettime(CLOCK_MONOTONIC, deadline);
     deadline->tv_sec += seconds;
@@ -216,7 +229,11 @@ static int line_reader_next(line_reader_t *lr, char *line, size_t line_size) {
         if (pret == 0) return -1; // deadline hit
 
         if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = read(lr->fd, lr->buf + lr->buf_len, BUFFER_SIZE - lr->buf_len);
+            // The buffer has room here, a full one was flushed above. The check
+            // states that bound next to the read, where the compiler sees it
+            // (_FORTIFY_SOURCE=3 otherwise warns about the length).
+            if (lr->buf_len >= sizeof(lr->buf)) return -1;
+            ssize_t n = read(lr->fd, lr->buf + lr->buf_len, sizeof(lr->buf) - lr->buf_len);
             if (n < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -273,10 +290,24 @@ static int waitpid_until_deadline(pid_t pid, const struct timespec *deadline, in
     }
 }
 
+// Called first in a forked child: the kernel sends this process SIGTERM when
+// the process that forked it ends, and the setting survives the exec of the
+// helper. sshd ends its PAM process with SIGTERM when the SSH client
+// disconnects; without this the helper would run on as an orphan. `parent` is
+// getpid() taken before fork(): if the parent is already gone by now, or the
+// setting cannot be made, the child ends at once.
+static void die_with_parent(pid_t parent) {
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent) {
+        _exit(1);
+    }
+}
+
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     const char *username;
     char client_ip[INET6_ADDRSTRLEN];
-    char buffer[BUFFER_SIZE];
+    // One byte more than the reader's buffer, so a line that fills it without
+    // a newline (BUFFER_SIZE bytes) is passed on whole.
+    char buffer[BUFFER_SIZE + 1];
     int result = PAM_AUTH_ERR;
 
     (void)flags;
@@ -304,10 +335,11 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     log_message(LOG_INFO, "Authentication attempt for user %s from IP %s", safe_user, safe_ip);
 
     // NOTE (concurrency): PAM_USER/PAM_RHOST are passed to the child via the
-    // process environment. OpenSSH forks a dedicated process per connection for
-    // auth, so this is safe in practice. Were PAM ever driven from multiple
-    // threads in one process, this global env would race across logins; the
-    // correct fix then is to pass identity over the to_child pipe instead of env.
+    // process environment. sshd runs the PAM conversation of each connection in
+    // a process of its own, so no other login can change them in between. Were
+    // PAM ever driven from multiple threads in one process, this global env
+    // would race across logins; the correct fix then is to pass identity over
+    // the to_child pipe instead of env.
     setenv("PAM_USER", username, 1);
     setenv("PAM_RHOST", client_ip, 1);
 
@@ -333,6 +365,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         return PAM_SYSTEM_ERR;
     }
 
+    pid_t parent_pid = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         log_message(LOG_ERR, "Fork failed");
@@ -344,6 +377,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     }
 
     if (pid == 0) {
+        die_with_parent(parent_pid);
+
         // Child: wire up stdin/stdout, close everything else
         close(to_child[1]);
         close(from_child[0]);
@@ -401,7 +436,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             }
         }
 
-        execl(AUTH_BIN, AUTH_BIN, NULL);
+        execl(AUTH_BIN, AUTH_BIN, (char *)NULL);
         _exit(127);
     }
 
@@ -410,8 +445,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     // password in directory mode, so there is no PROMPT:/secret-relay path.)
     // Single per-call deadline covers ALL parent-side waiting (pipe reads +
     // final child reap). Replaces the earlier SIGALRM scheme which only
-    // covered waitpid and used process-global state (unsafe under concurrent
-    // PAM calls in the same sshd process).
+    // covered waitpid and used process-global state.
     close(to_child[0]);
     close(from_child[1]);
 
@@ -619,6 +653,7 @@ PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const c
 
     int result;
 
+    pid_t parent_pid = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         // Fork failure means we cannot even ask the helper. root is already
@@ -631,6 +666,8 @@ PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const c
     }
 
     if (pid == 0) {
+        die_with_parent(parent_pid);
+
         // Child. This mode is non-interactive: the helper only returns an
         // exit code, there is no PAM conversation, so no pipes are wired up
         // — just close every fd beyond stdin/stdout/stderr.

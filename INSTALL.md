@@ -201,7 +201,9 @@ Important: if a local account has the same name but a different UID from a
 directory user, `--setup-ldap` lists and migrates it. The local passwd/shadow
 entry is removed; the home, the mail spool and the crontab are kept, and only
 the files that belonged to the old IDs are re-owned. The user goes back into
-its local groups except `sudo`, `admin` and `wheel`. No process is killed: an
+its local groups except the privileged ones (`sudo`, `admin`, `wheel`, `root`,
+`adm`, `shadow`, `disk`, `staff`, `docker`, `lxd`, `incus`, `libvirt`), which
+the list of accounts names as `not carried over (privileged): …`. No process is killed: an
 account with running processes is skipped with a warning; stop them and run
 `--setup-ldap` again. Genuine local-only accounts and same-UID entries are not
 changed.
@@ -220,6 +222,7 @@ Representative output with example names and counts:
 Config OK: issuer=https://sso.example.com/realms/myrealm client=ssh-server role=ssh-access sudo_role=ssh-admin
 OIDC:
   [OK]   discovery reachable (device=https://sso.example.com/realms/myrealm/protocol/openid-connect/auth/device)
+  [OK]   discovery answered in 80ms
   [OK]   issuer matches config
 Directory (SSSD/NSS):
   [OK]   sss_ssh_authorizedkeys present (publickey factor source)
@@ -236,6 +239,9 @@ SSH daemon:
   [OK]   AuthorizedKeysCommand → sss_ssh_authorizedkeys (directory key = factor 1)
   [OK]   AuthorizedKeysCommand binary exists: /usr/bin/sss_ssh_authorizedkeys
   [OK]   non-root: publickey,keyboard-interactive:pam (2FA)
+  [OK]   SSH factors per member: 2 with key and OIDC, 0 key-only (service groups)
+  [OK]   UsePAM yes
+  [OK]   KbdInteractiveAuthentication yes
   [OK]   root: publickey only (break-glass)
   [OK]   non-root: AuthorizedKeysFile none (directory key is the only publickey source)
 
@@ -404,8 +410,9 @@ depends on SSSD/InfoPipe, so an SSSD outage cannot lock out the local
 break-glass key.
 
 **Fail-closed:** the gate is enforced through the SSSD InfoPipe (`ifp`
-responder), which `--setup-ldap` configures automatically (no extra package is
-required, only `busctl` from systemd). The account phase reads `clients` for
+responder), which `--setup-ldap` configures automatically; it installs the
+`sssd-dbus` package that provides the responder, and the helper reads it with
+`busctl` from systemd. The account phase reads `clients` for
 every directory user, so if InfoPipe is unavailable the lookup fails and the
 login is denied. This denies **every directory user** at the account phase,
 whether or not `clients` is set, until InfoPipe is restored. Only root is
@@ -445,6 +452,14 @@ It deliberately does not undo directory-mode host configuration:
 and home directories remain. Review and remove those separately only when
 decommissioning the host.
 
+With the drop-in gone, sshd is back on the distribution's settings while
+directory users still resolve. If those settings allow password
+authentication, a directory user can log in with the directory password
+alone. The removal says so
+(`sssd stays configured: directory users can log in over SSH with their directory password if sshd allows password authentication; …`);
+check `PasswordAuthentication` in the sshd config, or remove
+`/etc/sssd/sssd.conf` when the host should no longer know the directory.
+
 The removal is refused while `/etc/pam.d/sshd` uses `pam_device_auth.so` and no
 valid `/etc/pam.d/sshd.original` exists (missing, empty, without an `auth` or
 `@include` line, or itself containing `pam_device_auth.so`):
@@ -477,6 +492,9 @@ sudo apt install ./build/packages/pam-device-auth_<version>_amd64.deb
 
 On Rocky Linux or Fedora, install the equivalent build dependencies with
 `sudo dnf install pam-devel gcc golang` and run `make rpm` instead of `make deb`.
+With a compiler before gcc 12 (Rocky Linux 9) the build prints one warning,
+`_FORTIFY_SOURCE > 2 is treated like 2 on this platform`, and builds the PAM
+module with level 2.
 
 Using the package is safer than copying the binary and PAM module by hand because
 it also installs tmpfiles, log rotation, configuration templates and removal
@@ -532,7 +550,7 @@ user's `clients` attribute, if one is set.
 | Component | Path |
 |---|---|
 | Helper | `/usr/local/bin/pam-device-auth` |
-| PAM module | `/usr/lib/security/pam_device_auth.so` |
+| PAM module | `/usr/lib/security/pam_device_auth.so` (deb), `/usr/lib64/security/pam_device_auth.so` (rpm) |
 | Main configuration | `/etc/pam-device-auth/config.json` |
 | sshd drop-in | `/etc/ssh/sshd_config.d/10-pam-device-auth.conf` |
 | Sudoers drop-in | `/etc/sudoers.d/pam-device-auth` |

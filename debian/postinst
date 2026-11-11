@@ -80,7 +80,7 @@ restart_ssh() {
 pam_active() {
     [ -e /etc/pam.d/sshd ] || return 1
     _rc=0
-    grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?
+    grep -q '^[^#]*pam_device_auth\.so' /etc/pam.d/sshd || _rc=$?
     case "$_rc" in
         0) return 0 ;;
         1) return 1 ;;
@@ -253,11 +253,13 @@ for _so in /usr/lib/security/pam_device_auth.so /usr/lib64/security/pam_device_a
 done
 chown root:root "${CONFIG_FILE}"
 chmod 600 "${CONFIG_FILE}"
-touch "${LOG_FILE}"
-# Log contains PII (usernames, emails, IPs, roles) — restrict to root+adm
-chmod 640 "${LOG_FILE}"
-if getent group adm >/dev/null 2>&1; then
-    chown root:adm "${LOG_FILE}"
+# The log holds PII (usernames, emails, IPs, roles): a regular file, mode at
+# most 0640, root:adm. The helper does this on the open file and refuses a
+# symlink, a FIFO or a directory at the path; touch, chmod and chown would
+# follow a symlink planted there.
+if ! "$BIN" --prepare-log; then
+    err "${BIN} --prepare-log failed for ${LOG_FILE} (reason above); fix the log path, then run: ${FINISH}"
+    exit 1
 fi
 
 if pam_active; then

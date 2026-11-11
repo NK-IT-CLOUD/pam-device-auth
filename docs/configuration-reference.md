@@ -1,8 +1,9 @@
 # Configuration Reference
 
 All settings live in `/etc/pam-device-auth/config.json` (permissions
-`0600 root:root`). Six fields can be overridden at runtime via
-`PAM_DEVICE_AUTH_*` environment variables; see [Environment overrides](#environment-overrides).
+`0600 root:root`). For a command run by hand, six fields can be overridden via
+`PAM_DEVICE_AUTH_*` environment variables; they do not reach a login. See
+[Environment overrides](#environment-overrides).
 
 Identity (users, groups, home directory, SSH keys, sudo password) comes from an
 LDAP directory via SSSD/NSS. pam-device-auth is the OIDC layer: it validates an
@@ -10,6 +11,23 @@ access token for the SSH user and grants or denies the login. The authentication
 path never reads `/etc/shadow`, prompts for a local password, or modifies local
 accounts. The separate `--setup-ldap` operation can migrate a local account that
 shadows a directory identity; see [Directory Mode Setup](ldap-directory-setup.md#migration-on-existing-hosts-important).
+
+## Unknown keys
+
+A key the loader does not know is ignored, at every level of the file. A
+misspelled key such as `requried_acr` would therefore switch its setting off,
+so it is reported:
+
+- A login writes one WARN line per finding to `/var/log/pam-device-auth.log`
+  (`config: unknown key "requried_acr" is ignored`) and goes on. An upgrade
+  never locks a host out over a stray key.
+- `--check`, `--enable` and `--setup-ldap` treat each finding as a blocker
+  (`[FAIL] config: unknown key …`).
+
+Keys are matched without regard to case. Keys that earlier versions used and
+that were removed since (`create_user`, `user_groups`, `admin_groups`,
+`force_password_change`, `directory_mode`, `ip_claim` and older ones) are not
+reported; a config that still carries them stays valid.
 
 Config is validated on every helper invocation (`pam-device-auth --check` runs
 the same validation). Invalid config aborts the call with a logged error; PAM
@@ -24,7 +42,7 @@ returns `PAM_AUTH_ERR`.
 | [`required_role`](#required_role) | string | yes | (none) | Role that must appear in the user's token. Users without it are denied. |
 | [`sudo_role`](#sudo_role) | string | no | (none) | OIDC role / directory group that grants sudo (via `pam_sss`). Informational here; enforcement is the directory group. |
 | [`role_claim`](#role_claim) | string | no | (none) | Extra dotted JWT claim path for roles, e.g. `groups`. Supplements Keycloak's `realm_access.roles` and `resource_access.<client>.roles`. |
-| [`auth_timeout`](#auth_timeout) | int (seconds) | no | `180` | Device-flow polling timeout. Range: 30-240. Capped further by the provider's `expires_in`. |
+| [`auth_timeout`](#auth_timeout) | int (seconds) | no | `180` | How long the helper waits for the approval. Range: 30-240. Capped further by the provider's `expires_in`; sshd's `LoginGraceTime` (default 120 s) bounds the login as a whole. |
 | [`allowed_algorithms`](#allowed_algorithms) | string[] | no | `[]` (accept all supported) | Pin accepted JWT `alg` header values (e.g. `["RS256"]`). Empty/unset accepts any of RS256/384/512, ES256/384/512. |
 | [`show_qr`](#show_qr) | bool (nullable) | no | `null` (auto-detect) | `true` = always render QR, `false` = never, `null` = auto-detect client capability. |
 | [`root_login`](#root_login) | string | no | `"key"` | `"key"` keeps root's own SSH key as the emergency path. `"disabled"` refuses every SSH login of root. Applied by `--setup-ldap` and `--enable`. |
@@ -32,10 +50,10 @@ returns `PAM_AUTH_ERR`.
 | [`root_login_sources`](#root_login_sources) | string[] | no | `[]` | Client IP addresses for which `--check` evaluates root's sshd policy (`Match Address` blocks). Used by `--check` only. |
 | [`ldap`](#ldap) | object | setup only | (none) | Directory wiring consumed by `--setup-ldap` to write `/etc/sssd/sssd.conf`, and checked by `--check`. `ldap.profile` is required in it. Not used by the auth runtime. |
 
-Unknown fields are ignored; extra fields do not fail validation. (Configs from
-older releases that still carry `create_user`, `user_groups`, `admin_groups`,
-`force_password_change` or `directory_mode` remain valid; those fields are
-ignored.)
+A field that is not in this table is reported; see
+[Unknown keys](#unknown-keys). Configs from older releases that still carry
+`create_user`, `user_groups`, `admin_groups`, `force_password_change` or
+`directory_mode` remain valid; those fields are ignored without a report.
 
 ## Field details
 
@@ -104,14 +122,23 @@ InfoPipe lookup. A config that still carries
 
 ### `auth_timeout`
 
-- Upper bound for the device-flow polling loop
-- Effective timeout is `min(auth_timeout, dc.ExpiresIn)`, whichever is
-  smaller. Keycloak defaults to `oauth2DeviceCodeLifespan = 600 s`, so
-  `auth_timeout = 180` is always the binding constraint in practice.
+- How long the helper waits for the approval, counted from the moment the user
+  presses Enter at the prompt
+- Effective timeout is `min(auth_timeout, expires_in)`, where `expires_in` is
+  the lifetime of the device code the provider reports. Keycloak defaults to
+  `oauth2DeviceCodeLifespan = 600 s`, so there `auth_timeout` is the smaller
+  one.
 - Range 30-240. Values outside this are rejected at config load.
-- The upper bound 240 leaves 60 s of headroom below the C wrapper's hard
-  `AUTH_TOTAL_TIMEOUT_S=300` SIGKILL; raising it above 240 would let PAM
-  kill the helper mid-flow.
+- sshd's `LoginGraceTime` bounds the login as a whole, from the moment the
+  connection is opened to the end of the OIDC step, and its default of 120 s
+  is shorter than the default `auth_timeout`. With the defaults sshd therefore
+  ends the login two minutes after the connection was opened, whatever
+  `auth_timeout` says. To use a longer wait, set `LoginGraceTime` in a file in
+  `/etc/ssh/sshd_config.d/` that sorts before `10-pam-device-auth.conf`; see
+  [troubleshooting](troubleshooting.md#the-login-ends-after-two-minutes-timeout-before-authentication).
+- The upper bound 240 leaves 60 s of headroom below the PAM module's own limit
+  for the OIDC step (`AUTH_TOTAL_TIMEOUT_S`, 300 s), after which it stops the
+  helper.
 
 ### `allowed_algorithms`
 
@@ -127,6 +154,13 @@ InfoPipe lookup. A config that still carries
   ```
   Realms that sign with ECDSA (e.g. an `ES256`-default realm) should pin
   `["ES256"]` instead: match whatever your IdP's JWKS actually advertises.
+- An entry the verifier does not support (`rs256`, `PS256`, `none`) never
+  matches a token. It is reported like an unknown key (see
+  [Unknown keys](#unknown-keys)):
+  `config: allowed_algorithms: "rs256" is not supported (supported: RS256, RS384, RS512, ES256, ES384, ES512)`.
+  A list without any supported entry is a config error
+  (`allowed_algorithms has no supported entry (…)`), because no token could
+  ever pass.
 - Purpose: closes the algorithm-confusion window if a hostile actor
   influences the JWKS response.
 
@@ -207,12 +241,15 @@ token. Empty or absent: no check.
 - Values are compared as exact strings. There is no ordering of levels, so list
   every value you accept.
 - The helper checks the claim after the device flow and after every refresh of
-  the cached login, next to `required_role`. A token whose `acr` is missing is
-  denied with `Access denied: the token carries no authentication level (acr);
-  the identity provider must add the acr claim (Keycloak: client scope acr).`;
-  a token with another value with `Access denied: authentication level "<acr>"
-  is not accepted (required: <list>).` Both are hard denies (exit 2), and a
-  denied refresh also removes the cached session.
+  the cached login, next to `required_role`. After the device flow a token
+  whose `acr` is missing is denied with `Access denied: the token carries no
+  authentication level (acr); the identity provider must add the acr claim
+  (Keycloak: client scope acr).`; a token with another value with `Access
+  denied: authentication level "<acr>" is not accepted (required: <list>).`
+  Both are hard denies (exit 2).
+- After a refresh the same finding is no denial: the helper logs it, removes
+  the cached session and starts the device flow, because a new sign-in can
+  reach the required level.
 - Each entry must be non-empty and contain no whitespace or control
   characters; otherwise the config does not load.
 - `--check` prints the policy (`Token policy: acr must be one of …`) but
@@ -358,8 +395,10 @@ posture and InfoPipe health.
 
 ## Environment overrides
 
-Every override is a string; numeric fields are parsed with `strconv.Atoi`.
-Unset variables leave the file value in place.
+Six fields can be set through the environment of a command run by hand:
+`--check`, `--enable`, `--setup-ldap`, or a login run for a test with
+`PAM_USER` and `PAM_RHOST` set. Every override is a string; numeric fields are
+parsed with `strconv.Atoi`. Unset variables leave the file value in place.
 
 | Variable | Overrides |
 |---|---|
@@ -370,8 +409,11 @@ Unset variables leave the file value in place.
 | `PAM_DEVICE_AUTH_ROLE_CLAIM` | `role_claim` |
 | `PAM_DEVICE_AUTH_TIMEOUT` | `auth_timeout` (integer) |
 
-Use cases: CI smoke tests, per-host variation without per-host config
-templating, emergency overrides via `/etc/default/<service>`.
+The variables do not reach a login that sshd starts: sshd runs the PAM
+conversation with an empty environment, so a value in the sshd unit or in
+`/etc/default/ssh` changes nothing there. Settings that logins should use
+belong in `config.json`. A `--check` run with one of the variables set checks
+other values than the logins use.
 
 ## Example configs
 

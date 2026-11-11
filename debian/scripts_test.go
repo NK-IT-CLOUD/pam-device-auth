@@ -23,6 +23,8 @@ var (
 	postinst string
 	//go:embed postrm
 	postrm string
+	//go:embed prerm
+	prerm string
 )
 
 // shellFunc returns the body of the POSIX shell function name in script.
@@ -154,7 +156,7 @@ func TestPostinstPamActiveReadsTheStack(t *testing.T) {
 		t.Errorf("pam_active looks at sshd.original:\n%s", body)
 	}
 	for _, want := range []string{
-		"grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?",
+		`grep -q '^[^#]*pam_device_auth\.so' /etc/pam.d/sshd || _rc=$?`,
 		"0) return 0 ;;",
 		"1) return 1 ;;",
 		`err "cannot read /etc/pam.d/sshd (grep exit $_rc)"`,
@@ -183,6 +185,71 @@ func TestSSHServiceMapping(t *testing.T) {
 		}
 		if want := "(supported: " + strings.Join(ids(), ", ") + ")"; !strings.Contains(body, want) {
 			t.Errorf("%s ssh_service error does not list %s", name, want)
+		}
+	}
+}
+
+// postinst prepares the log through the helper, which works on the open file
+// and refuses everything but a regular file. touch, chmod and chown on the
+// path would follow a symlink planted there (on Ubuntu the syslog user can
+// write to /var/log) and hand the link target to root:adm with mode 0640.
+func TestPostinstPreparesTheLogThroughTheHelper(t *testing.T) {
+	if !strings.Contains(postinst, "if ! \"$BIN\" --prepare-log; then\n") {
+		t.Error("postinst does not run \"$BIN\" --prepare-log")
+	}
+	for _, banned := range []string{`touch "${LOG_FILE}"`, `chmod 640 "${LOG_FILE}"`, `chown root:adm "${LOG_FILE}"`} {
+		if strings.Contains(postinst, banned) {
+			t.Errorf("postinst still runs %q on the log path", banned)
+		}
+	}
+}
+
+// After a removal sssd stays configured (by design), but the sshd drop-in
+// that required the key and the OIDC step is gone. postrm says what that
+// means, in both arms, when sssd.conf exists.
+func TestPostrmWarnsAboutPasswordLogins(t *testing.T) {
+	body := shellFunc(t, postrm, "warn_password_logins")
+	for _, want := range []string{
+		"[ -f /etc/sssd/sssd.conf ] || return 0",
+		"sssd stays configured: directory users can log in over SSH with their directory password if sshd allows password authentication; review PasswordAuthentication and /etc/sssd/sssd.conf",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("warn_password_logins lacks %q:\n%s", want, body)
+		}
+	}
+	for _, arm := range []string{"    remove | 0)\n", "    purge)\n"} {
+		_, armBody, ok := strings.Cut(postrm, "\n"+arm)
+		if !ok {
+			t.Fatalf("postrm has no arm %q", arm)
+		}
+		armBody, _, _ = strings.Cut(armBody, "\n        ;;\n")
+		undo := strings.Index(armBody, "\n        undo_sshd_config\n")
+		warn := strings.Index(armBody, "\n        warn_password_logins\n")
+		if undo < 0 || warn < undo {
+			t.Errorf("postrm arm %q: want warn_password_logins after undo_sshd_config:\n%s", strings.TrimSpace(arm), armBody)
+		}
+	}
+}
+
+// "The sshd PAM stack uses the module" means a line that is no comment names
+// it. A commented-out line (an admin's note, a disabled stack) must not make
+// postinst restart sshd, prerm refuse a removal or postrm report a broken
+// stack. The backup check stays strict: a rollback copy must not mention the
+// module at all.
+func TestScriptsIgnoreCommentedModuleLine(t *testing.T) {
+	const active = `grep -q '^[^#]*pam_device_auth\.so' /etc/pam.d/sshd`
+	const loose = `grep -q 'pam_device_auth.so' /etc/pam.d/sshd`
+	for name, script := range map[string]string{"postinst": postinst, "prerm": prerm, "postrm": postrm} {
+		if !strings.Contains(script, active) {
+			t.Errorf("%s does not test the stack with %s", name, active)
+		}
+		if strings.Contains(script, loose) {
+			t.Errorf("%s still counts a commented-out line: %s", name, loose)
+		}
+	}
+	for name, script := range map[string]string{"prerm": prerm, "postrm": postrm} {
+		if !strings.Contains(shellFunc(t, script, "valid_backup"), `! grep -q 'pam_device_auth.so' "$ORIG"`) {
+			t.Errorf("%s: valid_backup must refuse every mention of the module in the backup", name)
 		}
 	}
 }

@@ -75,6 +75,9 @@ func directoryUserIDs(user string) (uid, gid int64, err error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	if !nssAnswerMatches(out, user) {
+		return 0, 0, fmt.Errorf("the directory has no passwd entry named %s", user)
+	}
 	f := strings.Split(strings.TrimSpace(string(out)), ":")
 	if len(f) < 4 {
 		return 0, 0, fmt.Errorf("unexpected passwd entry for %s", user)

@@ -13,7 +13,7 @@ upgrades, failure modes.
 | `/usr/lib/security/pam_device_auth.so` (deb) or `/usr/lib64/security/pam_device_auth.so` (rpm) | `0755` | `root:root` | PAM module |
 | `/var/log/pam-device-auth.log` | `0640` | `root:adm` | Auth log (PAM + Go) |
 | `/run/pam-device-auth/` | `0700` | `root:root` | tmpfs session cache dir |
-| `/run/pam-device-auth/<user>.json` | `0600` | `root:root` | Per-user cached session |
+| `/run/pam-device-auth/<user>.json` | `0600` | `root:root` | Per-user cached session; bytes of the name outside `[A-Za-z0-9_-]` are written as `%XX` (`john%2Edoe.json`) |
 | `/etc/logrotate.d/pam-device-auth` | `0644` | `root:root` | Log rotation policy |
 | `/etc/tmpfiles.d/pam-device-auth.conf` | `0644` | `root:root` | Recreates cache dir at boot |
 | `/etc/ssh/sshd_config.d/10-pam-device-auth.conf` | `0644` | `root:root` | sshd overrides; written by `--setup-ldap` / `--enable`, not by the package |
@@ -91,7 +91,8 @@ Go helper `DEBUG` is suppressed unless the binary runs with `--debug`
 The PAM module additionally writes every line to syslog at the same
 priority, so `/var/log/auth.log` / `journalctl` carries a copy. The Go
 helper does **not** write to syslog, with one exception: if it cannot open
-`/var/log/pam-device-auth.log` or cannot set it to `0640`, it denies the login
+`/var/log/pam-device-auth.log`, finds no regular file there or cannot remove
+mode bits beyond `0640`, it denies the login
 (fail closed) and sends the reason to syslog (`authpriv`, tag
 `pam-device-auth`), because sshd discards its stderr. This applies to the
 authentication phase (`...; denying login (fail closed)`) and to the account
@@ -104,10 +105,10 @@ one stream, point Journal's `ImportantLog` or a Fluentd tail at the file.
 
 Included: usernames, email addresses, IPs, roles, PAM events, verdict.
 
-Not included: passwords, temporary passwords, access tokens, refresh
-tokens, device codes, JWT payloads. Tokens never traverse the log path;
-passwords are zeroed (`memset`/`defer` zero) before any string would
-escape.
+Not included: access tokens, refresh tokens, device codes, JWT payloads;
+tokens never traverse the log path. The helper reads no password. When a
+request to the identity provider fails, its answer goes into the log line with
+at most 512 bytes.
 
 ### File perms rationale
 
@@ -116,14 +117,15 @@ Linux channel for log readers (syslog daemon, logwatch, journald
 forwarders, etc.) without granting other services rights to read. This
 matches `/var/log/auth.log` semantics on Debian/Ubuntu.
 
-On a host without an `adm` group, postinst does not change the owner of the
-log (`root:root` when the package created it) and sets the permissions to
-`0640`; the log is then readable only by root.
+On a host without an `adm` group, the package (`pam-device-auth
+--prepare-log` in postinst) does not change the owner of the log (`root:root`
+when the package created it); the log is then readable only by root.
 
-The helper checks the log's mode every time it opens it and sets `0640` when
-the mode differs; a log that already is `0640` is not changed. A log it cannot
-open (for example immutable with `chattr +i`), or whose wrong mode it cannot
-correct (for example a `0644` log made append-only with `chattr +a`), denies
+The helper checks the log every time it opens it: it must be a regular file,
+and mode bits beyond `0640` are removed. A log with `0640` or a stricter mode
+is not changed. A log it cannot open (for example immutable with
+`chattr +i`), a path that is no regular file, or excess mode bits it cannot
+remove (for example a `0644` log made append-only with `chattr +a`) deny
 every non-root login; see [syslog](#syslog).
 
 ## Rotation
@@ -160,15 +162,18 @@ No Prometheus endpoint: the helper is not a daemon. Monitor via logs.
 
 | Signal | Regex | Meaning |
 |---|---|---|
-| Hard deny (sshd stops retrying) | `\[AUTH\].*Access denied:` | Missing directory identity or role revocation |
-| Soft auth failure | `\[AUTH\].*Authentication failed` or `\[PAM\].*exit code: (1\|3-9)` | Bad password, cancelled device flow, network blip |
-| Helper timed out | `\[PAM\].*timed out after [0-9]+s` | Helper stuck; infrastructure issue |
-| IdP reachable but token invalid | `\[AUTH\].*Token validation failed` | Key rotation mid-session, clock skew, MITM |
-| IdP unreachable | `\[AUTH\].*token refresh failed` or `JWKS fetch` | Network between PAM host and Keycloak broken |
+| Hard deny (sshd stops retrying) | `\[PAM\].*\(hard deny\)`; reason in `\[AUTH\].*(Access denied:\|does not resolve via NSS\|NSS lookup for)` | Role missing or revoked, `acr` not accepted after the device flow, no directory identity for the login name, or the SSSD lookup failed |
+| Soft auth failure | `\[PAM\].*Authentication failed for user .* \(exit code: [0-9]+\)`; reason in the `[AUTH]` line before it | Device flow failed or timed out, token did not validate, config error |
+| Client gone at the prompt | `\[AUTH\].*the SSH client went away at the prompt` | The SSH client closed the connection without answering the prompt; no login, no cached session |
+| Helper timed out | `\[PAM\].*timed out after [0-9]+s` | Helper still ran 300 s after the OIDC step began; needs a `LoginGraceTime` of 300 s or more to occur |
+| Login ended by sshd | sshd journal: `Timeout before authentication` | `LoginGraceTime` (default 120 s) passed before the approval; the helper log ends at `waiting for authorization` ([troubleshooting](troubleshooting.md#the-login-ends-after-two-minutes-timeout-before-authentication)) |
+| IdP reachable but token invalid | `\[AUTH\].*(Token validation failed\|validation failed after refresh)` | Key rotation mid-session, clock skew, user name mismatch, MITM |
+| IdP unreachable | `\[AUTH\].*(token refresh failed\|JWKS fetch\|Device code request failed\|OIDC Discovery failed\|timed out \(last failure)` | Network between PAM host and the identity provider broken, or the provider answers with errors |
+| Config finding at login | `\[AUTH\].*config: (unknown key\|allowed_algorithms)` | A key the loader does not know or an unsupported algorithm entry; the login goes on, `--check` fails |
 | Backup failed on enable | `FAIL: cannot back up /etc/pam.d/sshd to /etc/pam.d/sshd.original` on the stderr of `--enable` (not in the log) | `--enable` stopped before any write; the message names the cause and, without a pristine PAM config, the restore from the `openssh-server` package |
-| Log unusable (fail-closed deny) | syslog `pam-device-auth: .*denying` or `\[PAM\].*helper exited 3 \(infra failure\)` | The helper cannot open the log or set it to `0640`; every non-root login is denied |
+| Log unusable (fail-closed deny) | syslog `pam-device-auth: .*denying` or `\[PAM\].*helper exited 3 \(infra failure\)` | The helper cannot open the log, finds no regular file there or cannot remove mode bits beyond `0640`; every non-root login is denied |
 | Metadata cache not writable | `\[AUTH\].*cache write to .* failed` | Discovery or JWKS cache under `/run/pam-device-auth/oidc/` could not be written; the live documents are used, each login fetches them again |
-| Access revoked mid-session | `\[AUTH\].*access revoked for` | Cached session rejected; user lost the required role or IP authorization |
+| Access revoked | `\[AUTH\].*access revoked for` | Cached login refused and its session removed: the refreshed token no longer carries the required role |
 | Account-phase IP gate deny | `\[AUTH\].*not in clients allowlist` | Source IP not in the user's `clients` attribute; expected for a locked-down account logging in from a new location |
 | InfoPipe read failure (fail-closed deny) | `\[AUTH\].*clients read failed, fail-closed deny` | SSSD InfoPipe/D-Bus unreachable or timed out; denies this login and, if it persists, every directory user |
 
@@ -237,9 +242,10 @@ scripts, so upgrade behavior is identical.
 
 Before any upgrade on a host reachable only via SSH:
 
-1. Keep a root SSH key session open in a second terminal. `Match User
-   root` is configured to bypass PAM, so this session survives a broken
-   PAM module
+1. Keep a root SSH key session open in a second terminal. An open session
+   survives a broken PAM module; a new root login does not need the OIDC step
+   (`Match User root`), but it still runs the account and session stacks of
+   `/etc/pam.d/sshd`
 2. `pam-device-auth --check` after upgrade, before disconnecting. There must be
    no `[FAIL]`; review every `[WARN]` against the intended directory state (for
    example, a deliberately keyless access-group member is expected but cannot SSH).
@@ -264,11 +270,12 @@ sudo systemctl restart ssh.service   # sshd.service on Rocky Linux and Fedora
 |---|---|---|
 | Helper binary missing or corrupted | Every SSH login denied (`PAM_AUTH_ERR`) | `dpkg -i` / `dnf reinstall` redeploy |
 | Config file syntactically broken | Every login denied, error logged each attempt | Fix JSON, no restart needed |
-| Keycloak realm down | Fast path denies (refresh fails), new device flows fail | No action needed; self-heals when Keycloak returns |
+| Keycloak realm down | The cached login cannot refresh (the cached session is kept) and falls back to the device flow, which fails too | No action needed; self-heals when Keycloak returns |
 | JWKS endpoint returns 500 | New tokens cannot be validated, existing cached sessions fail on refresh | No action needed |
-| Host clock drift > 60 s ahead of IdP | `iat` check rejects tokens | NTP; or temporarily widen the skew window (source change) |
+| Host clock more than 60 s behind the IdP | The `iat` check rejects every token (`token iat in future`) | NTP |
+| Host clock ahead of the IdP by more than the token lifetime plus 60 s | Every token counts as expired (`token expired`) | NTP |
 | Log file disk full | The existing log still opens: the helper still authenticates; new log writes fail silently | logrotate should run; check free space on `/var` |
-| Log cannot be opened, or is not `0640` and cannot be set to it (missing `/var/log`, symlink, `chattr +i`, `chattr +a` on a log with another mode, read-only filesystem, no space to create a missing log) | Every non-root login denied, in the auth phase and by `--pam-acct` (exit 3); the reason goes to syslog `authpriv`. root is unaffected | Fix the log file (`lsattr`, `chattr -a -i`, `ls -l`); the next login works |
+| Log cannot be opened, is no regular file, or has mode bits beyond `0640` that cannot be removed (missing `/var/log`, symlink, FIFO, `chattr +i`, `chattr +a` on a `0644` log, read-only filesystem, no space to create a missing log) | Every non-root login denied, in the auth phase and by `--pam-acct` (exit 3); the reason goes to syslog `authpriv`. root is unaffected | Fix the log file (`lsattr`, `chattr -a -i`, `ls -l`); the next login works |
 | `/run/pam-device-auth` removed at runtime | Every user pushed back to device flow once (cache rebuilt on success) | `systemd-tmpfiles --create` to recreate |
 | PAM module segfault | sshd refuses auth, logs SEGV in dmesg | `cp /etc/pam.d/sshd.original /etc/pam.d/sshd` via the root-key session, report bug |
 | SSSD InfoPipe (ifp) down or `busctl` unreachable | Account-phase IP gate fails closed: every directory user denied at login, including key-only service accounts. root is unaffected (exempt from the gate) | Restore SSSD (`systemctl status sssd`, check `ifp` responder in sssd.conf); root-key session stays usable throughout |
@@ -283,10 +290,15 @@ Match User root
     AuthorizedKeysFile .ssh/authorized_keys
 ```
 
-Root SSH-key logins bypass PAM entirely. This is **by design**: an
-operator locked out by a PAM misconfiguration must have a way back in.
-Keep the root SSH key safe, and do not change this block without a
-documented alternative rescue path.
+Root logs in with its key alone, without the OIDC step, and the account phase
+of the module returns success for root before it starts the helper or asks
+SSSD. This is **by design**: an operator locked out by a directory or identity
+provider outage must have a way back in. sshd still runs the account and
+session stacks of `/etc/pam.d/sshd` for root, so a stack that names a module
+which cannot be loaded stops new root logins too; that is why the package
+refuses to be removed while the stack uses `pam_device_auth.so` without a
+backup to restore. Keep the root SSH key safe, and do not change this block
+without a documented alternative rescue path.
 
 ## Removing pam-device-auth
 
@@ -325,6 +337,11 @@ error; fix the config and run `systemctl restart <unit>` (with dpkg, then run
 the removal again). This runs the same way for `.deb` (dpkg) and `.rpm`
 (dnf/rpm) removals. Directory users and groups live in LLDAP, not on the host;
 uninstalling pam-device-auth does not touch them or SSSD's identity cache.
+
+Because sssd stays configured, directory users still resolve after the
+removal, while sshd is back on the distribution's settings. `postrm` prints
+`sssd stays configured: directory users can log in over SSH with their directory password if sshd allows password authentication; review PasswordAuthentication and /etc/sssd/sssd.conf`
+when `/etc/sssd/sssd.conf` exists.
 
 ## Package source of truth
 

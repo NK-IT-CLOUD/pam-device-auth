@@ -22,7 +22,7 @@ valid_backup() {
 check_removal() {
     [ -e /etc/pam.d/sshd ] || return 0
     _rc=0
-    grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?
+    grep -q '^[^#]*pam_device_auth\.so' /etc/pam.d/sshd || _rc=$?
     case "$_rc" in
         0) ;;
         1) return 0 ;;

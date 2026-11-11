@@ -27,7 +27,7 @@ unset -f grep sed awk cut head git 2> /dev/null || true
 
 usage() { echo "usage: leak-gate.sh REF [RANGE]" >&2; exit 2; }
 conf() { echo "leak-gate: $*" >&2; exit 2; }
-[ $# -ge 1 ] && [ $# -le 2 ] || usage
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then usage; fi
 ref=$1
 range=
 if [ $# -eq 2 ]; then
@@ -138,12 +138,12 @@ scan_blob() { # $1 = sha, $2 = label
 # Every entry of a tree, NUL-separated so no path can hide. Paths are checked in one
 # pass; the loop itself forks only for blobs not seen before.
 scan_tree() { # $1 = commit, $2 = label prefix
-    local entry mode type sha path
+    local entry type sha path
     git ls-tree -r -z --full-tree "$1" > "$tmp/tree"
     tr '\0' '\n' < "$tmp/tree" | cut -d "$(printf '\t')" -f 2- \
         | { grep -a -i -E -f "$tmp/patterns" || true; } | not_allowed | label "$2" >> "$tmp/h.paths"
     while IFS= read -r -d '' entry; do
-        read -r mode type sha <<< "${entry%%$'\t'*}"
+        read -r _ type sha <<< "${entry%%$'\t'*}"
         path=${entry#*$'\t'}
         # A line break or other control character in a path can split a pattern.
         case "$path" in *[[:cntrl:]]*) echo "$2$(printf '%q' "$path") (control character in the path)" >> "$tmp/h.binary" ;; esac

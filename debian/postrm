@@ -76,7 +76,7 @@ restore_pam() {
     fi
     if [ -e /etc/pam.d/sshd ]; then
         _rc=0
-        grep -q 'pam_device_auth.so' /etc/pam.d/sshd || _rc=$?
+        grep -q '^[^#]*pam_device_auth\.so' /etc/pam.d/sshd || _rc=$?
         case "$_rc" in
             0)
                 err "/etc/pam.d/sshd uses pam_device_auth.so and no valid ${ORIG} exists; restore /etc/pam.d/sshd from your distribution's openssh-server package"
@@ -111,6 +111,15 @@ undo_sshd_config() {
     fi
 }
 
+# warn_password_logins: the removal leaves the directory identity (sssd, NSS,
+# pam_sss) in place by design, but the sshd drop-in that required the key and
+# the OIDC step is gone. With the distribution's sshd defaults a directory user
+# may then log in with the directory password alone.
+warn_password_logins() {
+    [ -f /etc/sssd/sssd.conf ] || return 0
+    log "sssd stays configured: directory users can log in over SSH with their directory password if sshd allows password authentication; review PasswordAuthentication and /etc/sssd/sssd.conf"
+}
+
 # deb: remove | purge | upgrade <new-version> | failed-upgrade <old> <new> |
 #      abort-install [<old> <new>] | abort-upgrade <old> <new> | disappear ...
 # rpm %postun: 0 = erase, 1 = upgrade (this old version was replaced)
@@ -126,6 +135,7 @@ case "$1" in
         # where --setup-ldap and --enable never ran has neither, and sshd is
         # left alone.
         undo_sshd_config
+        warn_password_logins
 
         # Remove logrotate + tmpfiles
         rm -f /etc/logrotate.d/${PKG}
@@ -151,6 +161,7 @@ case "$1" in
         # A purge from the config-files state usually finds nothing sshd reads
         # (remove already did that), and openssh-server may be gone by then.
         undo_sshd_config
+        warn_password_logins
 
         # Remove all config, cache, logs
         rm -rf "/etc/${PKG:?}"

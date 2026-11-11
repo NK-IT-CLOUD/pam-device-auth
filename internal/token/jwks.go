@@ -243,30 +243,41 @@ func parseECKey(k jwk) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("decode EC Y: %w", err)
 	}
 
-	var curve elliptic.Curve
+	var (
+		curve elliptic.Curve
+		size  int // bytes of one coordinate
+	)
 	switch k.Crv {
 	case "P-256":
-		curve = elliptic.P256()
+		curve, size = elliptic.P256(), 32
 	case "P-384":
-		curve = elliptic.P384()
+		curve, size = elliptic.P384(), 48
 	case "P-521":
-		curve = elliptic.P521()
+		curve, size = elliptic.P521(), 66
 	default:
 		return nil, fmt.Errorf("unsupported curve: %s", k.Crv)
 	}
 
-	x := new(big.Int).SetBytes(xBytes)
-	y := new(big.Int).SetBytes(yBytes)
-	// Reject points that do not satisfy the curve equation. An off-curve point
-	// supplied via a poisoned JWKS can enable invalid-curve attacks; verifying
-	// membership before the key is used is the standard mitigation.
-	if !curve.IsOnCurve(x, y) {
-		return nil, fmt.Errorf("EC point is not on curve %s", k.Crv)
+	// A JWK coordinate is the unsigned big-endian value, as long as the field
+	// (RFC 7518, 6.2.1.2). Some senders leave leading zero bytes out, others
+	// add one; neither changes the value, so both are brought to the field
+	// length. A value that does not fit is malformed.
+	xBytes = bytes.TrimLeft(xBytes, "\x00")
+	yBytes = bytes.TrimLeft(yBytes, "\x00")
+	if len(xBytes) > size || len(yBytes) > size {
+		return nil, fmt.Errorf("EC coordinate longer than %d bytes for curve %s", size, k.Crv)
 	}
+	point := make([]byte, 1+2*size)
+	point[0] = 4 // uncompressed point: 0x04 || X || Y
+	copy(point[1+size-len(xBytes):1+size], xBytes)
+	copy(point[1+2*size-len(yBytes):], yBytes)
 
-	return &ecdsa.PublicKey{
-		Curve: curve,
-		X:     x,
-		Y:     y,
-	}, nil
+	// ParseUncompressedPublicKey refuses a point that does not satisfy the
+	// curve equation and the point at infinity. An off-curve point supplied
+	// via a poisoned JWKS can enable invalid-curve attacks.
+	pub, err := ecdsa.ParseUncompressedPublicKey(curve, point)
+	if err != nil {
+		return nil, fmt.Errorf("EC point is not on curve %s: %w", k.Crv, err)
+	}
+	return pub, nil
 }

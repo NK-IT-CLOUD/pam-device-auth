@@ -3,6 +3,177 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.1] - unreleased
+
+Fixes from a review of 0.7.0. The sshd drop-in and `sssd.conf` stay as they
+are; an upgrade needs no manual step.
+
+### Security
+- **Toolchain bumped to Go 1.27.4.** govulncheck flagged one standard library
+  advisory in 1.27.3 (GO-2026-6859, net/http: an HTTP/1 server crash through a
+  header race in `MaxBytesReader`), fixed in 1.27.4. The helper runs no HTTP
+  server; the bump keeps the scan of the release clean.
+
+### Fixed
+- The helper stops when the SSH client disconnects at the "press Enter"
+  prompt. Before, it lost its parent, took the end of its input for the
+  answer and polled the identity provider for up to `auth_timeout`; a code
+  approved in that time was logged as `Directory auth OK` and stored a cached
+  session although no SSH session existed. Now the helper logs
+  `Device flow: the SSH client went away at the prompt (<reason>); aborting`
+  and exits 1, and the PAM module has the kernel end the helper together with
+  the sshd process that started it.
+- After Enter the first token request goes out at once. Before, every
+  interactive login waited one poll interval (5 s) before it asked the
+  identity provider for the token.
+- Token polling survives transient failures: a network error, an HTTP 5xx,
+  408 or 429 and an error page that is no OAuth error document (a reverse
+  proxy's 502, for example) are retried with a growing wait (the poll
+  interval, doubling up to 30 s, never shorter than the poll interval) until
+  `auth_timeout`. Before, the first such
+  failure ended the login with `poll token: …` or `parse error response`. At
+  the timeout the log names the last failure:
+  `device authorization timed out (last failure: token endpoint answered status 503)`.
+- With `required_acr`, a refreshed token without an accepted `acr` no longer
+  ends in a hard deny on a known address. The helper removes the cached
+  session and starts the device flow, where a new sign-in can reach the
+  level. A missing role stays a hard deny, and so does an `acr` finding after
+  the device flow.
+- A login name or group member name that starts with `-` never reaches a
+  command line: the login and the account phase deny it, `--check` reports
+  it and leaves it out, and `getent`, `busctl` and `sss_ssh_authorizedkeys`
+  get every name after `--` (busctl reads options anywhere on its command
+  line, so such a name in the directory changed what busctl did as root).
+- The directory identity check accepts an answer of `getent` only when it
+  carries the requested name. `getent` answers an all-digit name with the
+  entry of that UID, so the check passed for a name that is no directory
+  user. The same rule now applies to the ID-map check of `--check` and to
+  the search for local accounts that shadow a directory user. A login name
+  in another case than the directory entry (`Alice` for `alice`, which a
+  case-insensitive SSSD domain such as the `ad` profile resolves) is refused
+  at this check too; before, it failed later, at the comparison with the
+  user name in the token.
+- `--check` reads `AuthenticationMethods` the way sshd does: every
+  alternative (alternatives are separated by whitespace) must contain
+  `publickey` and `keyboard-interactive:pam`. Before,
+  `publickey keyboard-interactive:pam`, where a space took the place of the
+  comma and either factor is enough, was reported as `(2FA)`.
+- `--check` asks sshd for the methods of every access-group and
+  service-group member (`sshd -T -C user=<member>`) and warns about a member
+  whose methods do not fit the tier, for example through a `Match` block in
+  another sshd drop-in:
+  `member(s) whose SSH factors do not fit their tier (…): alice (publickey)`.
+  It fails when `UsePAM` or `KbdInteractiveAuthentication` is not `yes`:
+  without PAM sshd runs neither the OIDC step nor the account phase.
+- Keys in `config.json` that the loader does not know are reported instead of
+  ignored without a word; a misspelled `required_acr` or `allowed_algorithms`
+  switched that setting off unnoticed. A login logs
+  `config: unknown key "<path>" is ignored` at WARN and goes on, so an
+  upgrade never locks a host out over a stray key; `--check`, `--enable` and
+  `--setup-ldap` fail on it. Keys of earlier versions (`directory_mode`,
+  `ip_claim`, `create_user` and the like) stay silent.
+- `allowed_algorithms` entries the verifier does not support (`rs256`,
+  `PS256`, `none`) are reported the same way:
+  `config: allowed_algorithms: "rs256" is not supported (supported: …)`.
+  A list with no supported entry is a config error; before, such a config
+  loaded and every login failed at the token check.
+- The log path must be a regular file. The helper and the PAM module open
+  `/var/log/pam-device-auth.log` without blocking and refuse a FIFO or a
+  directory there as they refused a symlink before; a FIFO at the path
+  blocked every login in `open(2)`. The reason in syslog reads
+  `log path is not a regular file: … is a FIFO or a device`.
+- The package's post-install script no longer runs `touch`, `chmod` and
+  `chown` on the log path, which followed a symlink: where another user can
+  write to `/var/log` (the syslog user on Ubuntu), a planted symlink made the
+  next install or upgrade set mode `0640` and `root:adm` on the link target.
+  The script now runs `pam-device-auth --prepare-log`, which works on the
+  open file and neither chmods nor chowns a log whose mode and owner already
+  fit; an append-only log refuses both.
+- The helper removes only the mode bits of the log beyond `0640`. Before, it
+  set every other mode to exactly `0640`, also a stricter `0600`.
+- `--setup-ldap`, `--enable` and `--check` run with a fixed `PATH`
+  (`/usr/sbin:/usr/bin:/sbin:/bin`). In a root shell without the sbin
+  directories (`su` on Debian) `sshd -t` could not be started, which the
+  setup reported as a rejected sshd drop-in and rolled back.
+- The QR decision reads the client version from the journal of the current
+  boot only and takes the newest line. Before, a reused PID could make the
+  version line of an earlier connection decide.
+- User names with a dot, an `@` or any other character outside
+  `[A-Za-z0-9_-]`, and names of 33 to 64 bytes, get the cached login. Before,
+  such a user (`john.doe`) went through the device flow at every login and
+  the log showed `session cache error: invalid username for cache` twice.
+  The cache file name is the user name with those bytes written as `%XX`
+  (`john%2Edoe.json`); names that had a cache before keep their file, so no
+  cached session is lost by the upgrade.
+- The migration of a local account that shadows a directory user no longer
+  carries over `root`, `adm`, `shadow`, `disk`, `staff`, `docker`, `lxd`,
+  `incus` and `libvirt` (so far only `sudo`, `admin` and `wheel` were left
+  out). These groups give root or near-root rights, which come from the
+  directory in this setup. `--setup-ldap` and the preview of `--check` name
+  the groups that are not carried over.
+- On Rocky Linux and Fedora `--setup-ldap` keeps the authselect features of
+  a host that already uses the `sssd` profile (`with-faillock`, `with-sudo`)
+  and adds `with-mkhomedir` to them. Before, it always ran
+  `authselect select sssd with-mkhomedir --force`, which dropped every other
+  feature without a word. Another profile is still replaced, and the setup
+  prints which one: `authselect: replacing profile "winbind"`.
+- An `ES256`, `ES384` or `ES512` token passes only with a key on the curve of
+  that algorithm (P-256, P-384, P-521; RFC 7518). Before, the verifier tied
+  only the signature length to the algorithm. The log names the mismatch:
+  `algorithm ES256 requires curve P-256, the key is on P-384`.
+- A failed request to the identity provider puts at most 512 bytes of the
+  answer into the log line. Before, an error page of up to 1 MiB went into
+  one line.
+- A commented-out `pam_device_auth.so` line in `/etc/pam.d/sshd` no longer
+  counts as an active module. Before, `--check` reported
+  `pam-device-auth is already active` and took the account phase for live on
+  such a host, and the package scripts treated the stack as using the module.
+- The rpm lists `sssd-dbus` as a weak dependency, as the deb does. The
+  account phase reads a user's allowed addresses through it.
+
+### Added
+- `--check` reports a slow identity provider: `discovery answered in 80ms`,
+  or a warning above 2 s that names the usual cause, a name server in
+  `/etc/resolv.conf` that does not answer properly. The helper resolves names
+  with Go's resolver and waits 5 s for such a server, where `curl` and
+  `getent` move on at once.
+- A run by hand with `--debug` logs how long each request to the identity
+  provider took (`Discovery took …`, `Device code request took …`,
+  `Token refresh took …`, `JWKS fetch took …`).
+
+### Changed
+- Removing the package prints what stays behind when sssd is configured:
+  `sssd stays configured: directory users can log in over SSH with their directory password if sshd allows password authentication; review PasswordAuthentication and /etc/sssd/sssd.conf`.
+  The removal deletes the sshd drop-in that required the key and the OIDC
+  step and keeps the directory identity, as before.
+- The PAM module is built with `_FORTIFY_SOURCE=3` (before: 2); the C library
+  now also checks the length of the read into the module's line buffer at run
+  time. The module needs the same glibc version as before. A source build
+  with a compiler before gcc 12 prints one warning and gets level 2.
+- `make lint` runs staticcheck and shellcheck besides `go vet`, and the new
+  `make analyze` compiles the PAM module once with gcc's static analyzer; CI
+  runs both.
+- Documentation corrected against the code:
+  - sshd's `LoginGraceTime` (default 120 s) bounds the whole login and is
+    shorter than the default `auth_timeout`; the configuration reference and
+    the troubleshooting guide say how to raise it.
+  - The `PAM_DEVICE_AUTH_*` environment variables only apply to a command run
+    by hand. They never reached a login, because sshd runs the PAM
+    conversation with an empty environment.
+  - The user name the identity provider puts into `preferred_username` must
+    not be changeable by users (SECURITY.md, Keycloak guide).
+  - `iat` is a required claim; the helper reads no password; the PAM module
+    has no `strtok_r`; sshd runs the PAM conversation of each connection in
+    its own process.
+  - Log lines and error texts in the troubleshooting and operations guides
+    are the ones the code writes; the monitoring patterns match them.
+  - Local non-root users cannot log in (man page); root's key login still
+    runs the account and session stacks of `/etc/pam.d/sshd` (operations).
+
+### Deprecated
+- The `PAM_DEVICE_AUTH_*` environment variables. Set the values in
+  `config.json`; 0.8.0 removes the variables.
+
 ## [0.7.0] - 2026-11-09
 
 No fallbacks: an unsupported platform, a missing file or a failed step is an

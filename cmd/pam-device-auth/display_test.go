@@ -13,7 +13,7 @@ func TestSanitizeDisplay_StripsControlBytes(t *testing.T) {
 		{"plain URL untouched", "https://sso.example.com/device?user_code=ABCD-EFGH", "https://sso.example.com/device?user_code=ABCD-EFGH"},
 		{"ESC stripped", "https://x\x1b]52;c;evil\x07.com", "https://x?]52;c;evil?.com"},
 		{"CSI C1 raw byte stripped", "AB\x9b31mCD", "AB?31mCD"},
-		{"CSI C1 UTF-8 rune stripped", "AB31mCD", "AB?31mCD"},
+		{"CSI C1 UTF-8 rune stripped", "AB\u009b31mCD", "AB?31mCD"},
 		{"newline stripped", "code\nFLUSH:fake prompt", "code?FLUSH:fake prompt"},
 		{"carriage return stripped", "real\rfake", "real?fake"},
 		{"DEL stripped", "ab\x7fcd", "ab?cd"},

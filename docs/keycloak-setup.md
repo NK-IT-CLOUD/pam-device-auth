@@ -91,6 +91,21 @@ Bind it as the client's browser flow override.
   refuses tokens from any other flow, also after a refresh. See the
   [configuration reference](configuration-reference.md#required_acr).
 
+### User names
+
+The helper links the Keycloak account to the account on the host through one
+claim: `preferred_username` must be equal to the SSH login name. Two things
+follow for the realm:
+
+- The Keycloak user name is the login name in the directory. With the LDAP
+  federation of section 6 that is the case when *Username LDAP attribute* is
+  the attribute SSSD uses as the login name (`uid` for LLDAP,
+  `sAMAccountName` for an Active Directory).
+- Users must not be able to change it. Leave **Realm settings → Login → Edit
+  username** off. With it on, a user who has the SSH role can take another
+  user's login name and then passes the OIDC step for that login; only the
+  SSH key of the other account still stands in the way.
+
 ## 2 · Create the SSH roles
 
 Two **realm-level** roles (recommended over client roles: simpler to
@@ -150,12 +165,19 @@ Sensible defaults in **Realm settings → Sessions / Tokens**:
 |---|---|---|
 | `oauth2DeviceCodeLifespan` | 600 s (10 min) | Enough time to scan QR / read code, not so long that stale codes accumulate |
 | `oauth2DevicePollingInterval` | 5 s | RFC 8628 default; Keycloak respects `interval` in the device-auth response |
-| Access Token Lifespan | 900 s (15 min) | Must exceed the helper's `auth_timeout` + JWKS fetch overhead |
+| Access Token Lifespan | the realm default | The helper validates the access token right after Keycloak issues it, at the device login and at every cached login, so the lifespan does not have to cover `auth_timeout` |
 | SSO Session Idle | 30 min | Refresh-token validity for the cached fast path |
 | SSO Session Max | 8 h | Hard upper bound for the cached fast path |
 
 The helper does **not** use the ID token, only the access token, so ID
 token lifetimes are irrelevant.
+
+The two session settings decide how long a known address logs in without the
+browser: every cached login refreshes the token, which needs the session at
+Keycloak. With the values above the link is needed again after 30 minutes
+without a login of the user on that host, and at the latest 8 hours after the
+device login. It is also needed after a reboot of the host (the cache is in
+tmpfs), from a new address, and when the session was ended in Keycloak.
 
 ## 6 · (Recommended) LDAP federation
 
@@ -225,11 +247,17 @@ See the [complete preflight example and interpretation](../INSTALL.md#5-prefligh
 
 ### Inspect a real access token
 
-For a user who has just completed the device flow, grab the access token
-from the helper log (debug level) or use `curl` against the device endpoint
-from a workstation:
+The helper never logs a token, also not with `--debug`. Run the device flow
+by hand from a workstation, with the same scope the helper asks for:
 
 ```bash
+ISSUER=https://sso.example.com/realms/myrealm
+curl -s -d client_id=ssh-server -d 'scope=openid profile email' \
+  "$ISSUER/protocol/openid-connect/auth/device" | jq .
+# open verification_uri_complete in a browser and approve, then:
+curl -s -d grant_type=urn:ietf:params:oauth:grant-type:device_code \
+  -d client_id=ssh-server -d device_code=<device_code> \
+  "$ISSUER/protocol/openid-connect/token" | jq -r .access_token
 # Decode JWT payload
 echo "<access_token>" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
 ```
@@ -241,6 +269,7 @@ Required fields present:
   "iss": "https://sso.example.com/realms/myrealm",
   "azp": "ssh-server",
   "preferred_username": "alice",
+  "iat": 1712345378,
   "exp": 1712345678,
   "realm_access": { "roles": ["ssh-access", "ssh-admin", "..."] }
 }
@@ -253,7 +282,7 @@ directory-side in the PAM account phase (see section 4).
 
 | Symptom | Cause |
 |---|---|
-| `FAIL: OIDC discovery failed` | Wrong `issuer_url`: missing `/realms/<name>` suffix, or the realm is disabled. |
+| `[FAIL] discovery failed` in `--check` | Wrong `issuer_url`: missing `/realms/<name>` suffix, or the realm is disabled. |
 | `token audience does not include "ssh-server"` | Client authentication flipped to confidential, or audience mapper removed. Public clients normally emit `azp`; confirm `azp == client_id`. |
 | `unknown key ID` errors after realm key rotation | JWKS cache inside Keycloak is stale, or the host's DNS is caching an old IdP endpoint. The helper caches the OIDC discovery document and the JWKS for 10 minutes in `/run/pam-device-auth/oidc/` (`discovery.json`, `jwks.json`). When a token's `kid` is not in the cached key set, it refetches the JWKS once live. A key removed at the IdP (revoked or rotated out) stays trusted from the cache for up to 10 minutes; clear the cache right after such a change with `rm -rf /run/pam-device-auth/oidc`. |
 | Device flow URL opens Keycloak but the `Authorize` button does nothing | Device Authorization Grant is globally disabled at the realm level. Enable it under **Realm settings → Advanced**. |

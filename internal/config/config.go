@@ -3,9 +3,12 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -44,7 +47,68 @@ type Config struct {
 	// /etc/sssd/sssd.conf. It is not used by the auth runtime (SSSD owns the
 	// bind), so it may be absent in the deployed runtime config.
 	LDAP *LDAPConfig `json:"ldap,omitempty"`
+
+	// warnings are the findings of Load that do not stop a login (Warnings).
+	warnings []string
 }
+
+// SupportedAlgorithms are the JWT signature algorithms the token verifier
+// accepts (internal/token; a test there keeps the two in step).
+var SupportedAlgorithms = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+
+// retiredKeys are top-level keys of earlier versions. A config that still
+// carries one stays valid, as their removal promised, and the key is not
+// reported as unknown.
+var retiredKeys = map[string]bool{
+	"create_user": true, "create_users": true, "user_groups": true, "admin_groups": true,
+	"add_to_sudo": true, "force_password_change": true, "directory_mode": true,
+	"ip_claim": true, "client_secret": true, "realm": true, "keycloak_url": true,
+	"callback_ip": true, "callback_port": true, "debug_mode": true,
+}
+
+// Warnings returns what Load found in the config file that a login must
+// survive but an admin must see: keys the loader does not know (a misspelled
+// key would otherwise switch its setting off without a word) and
+// allowed_algorithms entries the verifier does not support. A login logs them;
+// --check, --enable and --setup-ldap fail on them.
+func (c *Config) Warnings() []string { return c.warnings }
+
+// unknownKeys returns the keys of the JSON object raw that match no json tag
+// of the struct type t, with prefix as their path. Keys are compared without
+// regard to case, as encoding/json does, and nested objects are followed.
+func unknownKeys(raw json.RawMessage, t reflect.Type, prefix string) []string {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil // not an object: the typed decode reports that
+	}
+	known := map[string]reflect.Type{}
+	for i := 0; i < t.NumField(); i++ {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			known[strings.ToLower(name)] = t.Field(i).Type
+		}
+	}
+	var out []string
+	for _, key := range slices.Sorted(maps.Keys(obj)) {
+		ft, ok := known[strings.ToLower(key)]
+		if !ok {
+			if prefix != "" || !retiredKeys[strings.ToLower(key)] {
+				out = append(out, prefix+key)
+			}
+			continue
+		}
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Struct {
+			out = append(out, unknownKeys(obj[key], ft, prefix+key+".")...)
+		}
+	}
+	return out
+}
+
+// isSupportedAlgorithm reports whether the verifier accepts alg.
+func isSupportedAlgorithm(alg string) bool { return slices.Contains(SupportedAlgorithms, alg) }
 
 // LDAPConfig is the directory wiring for the SSSD setup wizard. The bind
 // password is needed only at setup time; it ends up in /etc/sssd/sssd.conf
@@ -156,6 +220,16 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 
+	for _, key := range unknownKeys(data, reflect.TypeFor[Config](), "") {
+		cfg.warnings = append(cfg.warnings, fmt.Sprintf("unknown key %q is ignored", key))
+	}
+	for _, alg := range cfg.AllowedAlgorithms {
+		if !isSupportedAlgorithm(alg) {
+			cfg.warnings = append(cfg.warnings, fmt.Sprintf("allowed_algorithms: %q is not supported (supported: %s)",
+				alg, strings.Join(SupportedAlgorithms, ", ")))
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -214,6 +288,11 @@ func (c *Config) Validate() error {
 	// child startup, PAM conversation round-trips, and process reap.
 	if c.AuthTimeout < 30 || c.AuthTimeout > 240 {
 		return fmt.Errorf("auth_timeout must be between 30 and 240 seconds, got %d", c.AuthTimeout)
+	}
+	// One supported entry is enough: the others never match a token and are
+	// reported as warnings by Load. With none, no token can ever validate.
+	if len(c.AllowedAlgorithms) > 0 && !slices.ContainsFunc(c.AllowedAlgorithms, isSupportedAlgorithm) {
+		return fmt.Errorf("allowed_algorithms has no supported entry (supported: %s)", strings.Join(SupportedAlgorithms, ", "))
 	}
 	switch c.RootLogin {
 	case "", RootLoginKey, RootLoginDisabled:

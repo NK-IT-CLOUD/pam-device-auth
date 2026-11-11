@@ -3,6 +3,7 @@ package token
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
@@ -242,6 +243,11 @@ func verifyECDSAJWSSignature(alg string, key *ecdsa.PublicKey, hashed, signature
 	if err != nil {
 		return err
 	}
+	// RFC 7518 ties each ES algorithm to one curve; the signature length alone
+	// does not say which curve the key is on.
+	if want := curveForAlgorithm(alg); key.Curve != want {
+		return fmt.Errorf("algorithm %s requires curve %s, the key is on %s", alg, curveName(want), curveName(key.Curve))
+	}
 	if len(signature) != partSize*2 {
 		return fmt.Errorf("invalid ECDSA signature length: got %d, want %d", len(signature), partSize*2)
 	}
@@ -256,6 +262,33 @@ func verifyECDSAJWSSignature(alg string, key *ecdsa.PublicKey, hashed, signature
 	}
 
 	return nil
+}
+
+// curveForAlgorithm returns the curve of an ES algorithm (RFC 7518, 3.4), nil
+// for any other algorithm.
+func curveForAlgorithm(alg string) elliptic.Curve {
+	switch alg {
+	case "ES256":
+		return elliptic.P256()
+	case "ES384":
+		return elliptic.P384()
+	case "ES512":
+		return elliptic.P521()
+	}
+	return nil
+}
+
+// curveName names a curve the way a JWK does.
+func curveName(c elliptic.Curve) string {
+	switch c {
+	case elliptic.P256():
+		return "P-256"
+	case elliptic.P384():
+		return "P-384"
+	case elliptic.P521():
+		return "P-521"
+	}
+	return "an unsupported curve"
 }
 
 func ecdsaCoordinateSize(alg string) (int, error) {

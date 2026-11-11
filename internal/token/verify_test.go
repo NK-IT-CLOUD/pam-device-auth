@@ -8,9 +8,12 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
 )
 
 func createRSATestJWT(t *testing.T, signingKey *rsa.PrivateKey, kid string, claims map[string]interface{}) string {
@@ -592,5 +595,26 @@ func TestValidate_ExtractsACR(t *testing.T) {
 		if res.ACR != want {
 			t.Fatalf("ACR = %q, want %q", res.ACR, want)
 		}
+	}
+}
+
+// The config loader names the algorithms the verifier accepts; the two lists
+// must be the same.
+func TestSupportedAlgorithmsMatchVerifier(t *testing.T) {
+	for _, alg := range config.SupportedAlgorithms {
+		if _, err := hashForAlgorithm(alg); err != nil {
+			t.Errorf("config.SupportedAlgorithms lists %q, which the verifier rejects: %v", alg, err)
+		}
+	}
+	for _, alg := range []string{"PS256", "EdDSA", "HS256", "none", "rs256", ""} {
+		if _, err := hashForAlgorithm(alg); err == nil {
+			t.Errorf("the verifier accepts %q, which config.SupportedAlgorithms must then list", alg)
+		}
+		if slices.Contains(config.SupportedAlgorithms, alg) {
+			t.Errorf("config.SupportedAlgorithms lists %q", alg)
+		}
+	}
+	if len(config.SupportedAlgorithms) != 6 {
+		t.Errorf("config.SupportedAlgorithms has %d entries, want the 6 of hashForAlgorithm", len(config.SupportedAlgorithms))
 	}
 }

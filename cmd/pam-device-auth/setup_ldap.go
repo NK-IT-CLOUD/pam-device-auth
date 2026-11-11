@@ -766,6 +766,11 @@ func runSetupLDAP() {
 	if err != nil {
 		fail("config error: %v", err)
 	}
+	// A misspelled key or an unsupported algorithm is settled before the setup
+	// looks at the ldap block or changes the host.
+	if lines := configWarningLines(cfg); len(lines) > 0 {
+		fail("%s", strings.Join(lines, "; "))
+	}
 	l := cfg.LDAP
 	// Single security choke point: validates every directory value before any
 	// of them is written into sssd.conf / sudoers (see validateLDAPConfig).
@@ -904,25 +909,57 @@ func wireMkhomedir(prof distro.Profile, run commandRunner) error {
 		}
 		fmt.Println("pam_mkhomedir enabled")
 	case "authselect":
-		// `select sssd` (not just enable-feature) is required: on a minimal RHEL
-		// host no authselect profile is active, and it is what actually wires
-		// pam_sss into system-auth/password-auth (which our sshd PAM template
-		// includes) plus nsswitch. `with-mkhomedir` adds pam_oddjob_mkhomedir;
-		// --force overwrites any stock profile so directory login works headless.
-		if out, err := run("authselect", "select", "sssd", "with-mkhomedir", "--force"); err != nil {
-			return fmt.Errorf("authselect select sssd with-mkhomedir --force: %s: %w", strings.TrimSpace(string(out)), err)
+		args, replaced := authselectPlan(authselectCurrent(run))
+		if replaced != "" {
+			fmt.Printf("authselect: replacing profile %q\n", replaced)
+		}
+		if out, err := run("authselect", args...); err != nil {
+			return fmt.Errorf("authselect %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 		}
 		// pam_oddjob_mkhomedir asks oddjobd to create the home directory.
-		// There is no authselect rollback: the error names the profile left behind.
+		// There is no authselect rollback: the error names what is left behind.
 		if out, err := run("systemctl", "enable", "--now", "oddjobd"); err != nil {
-			return fmt.Errorf("systemctl enable --now oddjobd: %s: %w; the authselect profile \"sssd with-mkhomedir\" stays selected",
-				strings.TrimSpace(string(out)), err)
+			left := `the authselect profile "sssd with-mkhomedir" stays selected`
+			if args[0] == "enable-feature" {
+				left = "the authselect feature with-mkhomedir stays enabled"
+			}
+			return fmt.Errorf("systemctl enable --now oddjobd: %s: %w; %s", strings.TrimSpace(string(out)), err, left)
 		}
 		fmt.Println("SSSD PAM/nsswitch wired via authselect (with mkhomedir)")
 	default:
 		return fmt.Errorf("internal: unknown PamWiring %q", prof.PamWiring)
 	}
 	return nil
+}
+
+// authselectCurrent returns the active authselect profile with its features
+// ("sssd with-faillock"), "" when none is selected. `authselect current` fails
+// in that case (a minimal host) and prints why, which is no profile name; a
+// broken authselect fails again at the next command.
+func authselectCurrent(run commandRunner) string {
+	out, err := run("authselect", "current", "--raw")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// authselectPlan decides from the output of `authselect current --raw` (the
+// profile, then its features) how pam_oddjob_mkhomedir gets wired.
+//
+// With the sssd profile active only the feature is added: the features the
+// host has (with-faillock, with-sudo) stay. Everything else, also no profile at
+// all, gets `select sssd with-mkhomedir --force`: that is what wires pam_sss
+// into system-auth/password-auth (which the sshd PAM template includes) and
+// nsswitch, and --force overwrites a stock profile so the setup runs
+// headless. replaced names the profile this throws away, "" when there was
+// none.
+func authselectPlan(currentRaw string) (args []string, replaced string) {
+	current := strings.TrimSpace(currentRaw)
+	if f := strings.Fields(current); len(f) > 0 && f[0] == "sssd" {
+		return []string{"enable-feature", "with-mkhomedir"}, ""
+	}
+	return []string{"select", "sssd", "with-mkhomedir", "--force"}, current
 }
 
 // sssdEnabledNote, sssdEnableUnknownNote and sssdMaskedNote are the entries

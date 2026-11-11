@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strings"
 	"syscall"
 )
 
@@ -14,11 +14,33 @@ import (
 // Exported as a variable so tests can override it.
 var CacheDir = "/run/pam-device-auth"
 
-// validUsername guards the cache filename derived from the username. It allows
-// mixed case so case-preserving LDAP/preferred_username values keep a working
-// silent-refresh cache, while still excluding path separators, dots and other
-// metacharacters that could escape CacheDir.
-var validUsername = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`)
+// maxUsernameBytes is the longest user name that gets cache files. Encoded by
+// fileStem it stays far below the 255 bytes a file name may have.
+const maxUsernameBytes = 64
+
+// fileStem returns the stem of a user's cache file names: the user name with
+// every byte outside [A-Za-z0-9_-] written as %XX. A name of those characters
+// alone keeps the file name it always had; a name with a dot, an "@" or a
+// path separator gets files too, and no name can leave CacheDir or collide
+// with another one ("%" itself is encoded). The files of a user are
+// <stem>.json, <stem>.lock and the temporary <stem>.json.*: a stem holds no
+// dot, so none of them can be the file of another user.
+func fileStem(username string) (string, error) {
+	if len(username) == 0 || len(username) > maxUsernameBytes {
+		return "", fmt.Errorf("invalid username for cache: %q (1 to %d bytes)", username, maxUsernameBytes)
+	}
+	var b strings.Builder
+	for i := 0; i < len(username); i++ {
+		c := username[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String(), nil
+}
 
 // CachedSession holds a cached Refresh Token and known IPs for a user.
 type CachedSession struct {
@@ -61,15 +83,9 @@ func (s *CachedSession) AddIP(ip string) {
 	}
 }
 
-func validateUsername(username string) error {
-	if !validUsername.MatchString(username) {
-		return fmt.Errorf("invalid username for cache: %q", username)
-	}
-	return nil
-}
-
-func cachePath(username string) string {
-	return filepath.Join(CacheDir, username+".json")
+// cachePath is the session file of the user with this file stem (fileStem).
+func cachePath(stem string) string {
+	return filepath.Join(CacheDir, stem+".json")
 }
 
 // ErrCorrupt marks a cache file that exists but cannot be parsed. Callers may
@@ -79,11 +95,12 @@ var ErrCorrupt = errors.New("corrupt session cache")
 // Load reads a cached session for the given username.
 // Returns nil, nil if no cache file exists.
 func Load(username string) (*CachedSession, error) {
-	if err := validateUsername(username); err != nil {
+	stem, err := fileStem(username)
+	if err != nil {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(cachePath(username))
+	data, err := os.ReadFile(cachePath(stem))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -104,7 +121,8 @@ func Load(username string) (*CachedSession, error) {
 // user can no longer truncate each other's half-written temp (PDA-BUG-003);
 // last rename wins. Creates the cache directory if it doesn't exist.
 func Save(session *CachedSession) error {
-	if err := validateUsername(session.Username); err != nil {
+	stem, err := fileStem(session.Username)
+	if err != nil {
 		return err
 	}
 
@@ -117,9 +135,9 @@ func Save(session *CachedSession) error {
 		return fmt.Errorf("marshal cache: %w", err)
 	}
 
-	// validUsername forbids dots, so "<user>.json.*" temp names can never
-	// collide with another user's cache file and Load never picks them up.
-	tmp, err := os.CreateTemp(CacheDir, session.Username+".json.*")
+	// A stem holds no dot, so "<stem>.json.*" temp names can never collide
+	// with another user's cache file and Load never picks them up.
+	tmp, err := os.CreateTemp(CacheDir, stem+".json.*")
 	if err != nil {
 		return fmt.Errorf("create cache temp: %w", err)
 	}
@@ -141,7 +159,7 @@ func Save(session *CachedSession) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("close cache temp: %w", err)
 	}
-	if err := os.Rename(tmpName, cachePath(session.Username)); err != nil {
+	if err := os.Rename(tmpName, cachePath(stem)); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("rename cache: %w", err)
 	}
@@ -152,15 +170,16 @@ func Save(session *CachedSession) error {
 // rotate refresh tokens use it to cover the complete load/network/save cycle.
 // The lock is advisory and Linux-only, which matches the PAM module's platform.
 func WithUserLock(username string, fn func() error) error {
-	if err := validateUsername(username); err != nil {
+	stem, err := fileStem(username)
+	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(CacheDir, 0700); err != nil {
 		return fmt.Errorf("create cache dir: %w", err)
 	}
-	// validUsername forbids dots, so "<user>.lock" cannot collide with a
-	// cache file of another user.
-	lock, err := os.OpenFile(filepath.Join(CacheDir, username+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	// A stem holds no dot, so "<stem>.lock" cannot collide with a cache file
+	// of another user.
+	lock, err := os.OpenFile(filepath.Join(CacheDir, stem+".lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("open cache lock: %w", err)
 	}
@@ -194,11 +213,12 @@ func Update(username string, mutate func(*CachedSession)) error {
 // Delete removes the cached session for the given username.
 // Does not return an error if the file doesn't exist.
 func Delete(username string) error {
-	if err := validateUsername(username); err != nil {
+	stem, err := fileStem(username)
+	if err != nil {
 		return err
 	}
 
-	err := os.Remove(cachePath(username))
+	err = os.Remove(cachePath(stem))
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete cache: %w", err)
 	}

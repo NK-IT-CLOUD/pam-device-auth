@@ -1814,26 +1814,53 @@ func TestWireMkhomedirFailureIsError(t *testing.T) {
 	}
 }
 
+// authselectPlan reads the active profile from `authselect current --raw`. An
+// sssd profile keeps the features it has (with-faillock, with-sudo): only
+// with-mkhomedir is added. Everything else is replaced, and the replaced
+// profile is named so the setup can print it.
+func TestAuthselectPlan(t *testing.T) {
+	enable := "enable-feature with-mkhomedir"
+	selectSSSD := "select sssd with-mkhomedir --force"
+	for _, c := range []struct{ current, wantArgs, wantReplaced string }{
+		{"sssd with-faillock with-sudo\n", enable, ""},
+		{"sssd\n", enable, ""},
+		{"winbind with-mkhomedir\n", selectSSSD, "winbind with-mkhomedir"},
+		{"custom/corp with-faillock\n", selectSSSD, "custom/corp with-faillock"},
+		{"", selectSSSD, ""},
+	} {
+		args, replaced := authselectPlan(c.current)
+		if strings.Join(args, " ") != c.wantArgs || replaced != c.wantReplaced {
+			t.Errorf("authselectPlan(%q) = %q, %q; want %q, %q", c.current, args, replaced, c.wantArgs, c.wantReplaced)
+		}
+	}
+}
+
 func TestWireMkhomedirCommands(t *testing.T) {
+	const current = "authselect current --raw"
 	const selectCmd = "authselect select sssd with-mkhomedir --force"
+	const enableCmd = "authselect enable-feature with-mkhomedir"
 	const oddjobd = "systemctl enable --now oddjobd"
 	boom := fmt.Errorf("exit status 1")
 	cases := []struct {
 		name      string
 		wiring    string
 		results   map[string]error
+		outputs   map[string]string
 		wantCalls []string
 		wantErr   string
 	}{
-		{"debian ok", "pam-auth-update", nil, []string{"pam-auth-update --enable mkhomedir"}, ""},
-		{"rhel ok", "authselect", nil, []string{selectCmd, oddjobd}, ""},
-		{"rhel select fails, oddjobd not started", "authselect", map[string]error{selectCmd: boom}, []string{selectCmd}, "authselect"},
-		{"rhel oddjobd fails", "authselect", map[string]error{oddjobd: boom}, []string{selectCmd, oddjobd}, "oddjobd"},
+		{"debian ok", "pam-auth-update", nil, nil, []string{"pam-auth-update --enable mkhomedir"}, ""},
+		{"rhel, no profile yet", "authselect", map[string]error{current: boom}, nil, []string{current, selectCmd, oddjobd}, ""},
+		{"rhel, an sssd profile keeps its features", "authselect", nil, map[string]string{current: "sssd with-faillock\n"}, []string{current, enableCmd, oddjobd}, ""},
+		{"rhel, another profile is replaced", "authselect", nil, map[string]string{current: "winbind\n"}, []string{current, selectCmd, oddjobd}, ""},
+		{"rhel select fails, oddjobd not started", "authselect", map[string]error{selectCmd: boom}, nil, []string{current, selectCmd}, "authselect select"},
+		{"rhel enable-feature fails, oddjobd not started", "authselect", map[string]error{enableCmd: boom}, map[string]string{current: "sssd\n"}, []string{current, enableCmd}, "authselect enable-feature"},
+		{"rhel oddjobd fails", "authselect", map[string]error{oddjobd: boom}, nil, []string{current, selectCmd, oddjobd}, "oddjobd"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls []string
-			err := wireMkhomedir(distro.Profile{PamWiring: tc.wiring}, fakeRunner(tc.results, nil, &calls))
+			err := wireMkhomedir(distro.Profile{PamWiring: tc.wiring}, fakeRunner(tc.results, tc.outputs, &calls))
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("err = %v, want nil", err)
 			}
@@ -1844,5 +1871,21 @@ func TestWireMkhomedirCommands(t *testing.T) {
 				t.Errorf("calls = %q, want %q", calls, tc.wantCalls)
 			}
 		})
+	}
+}
+
+// `authselect current` fails on a host without a selected profile and prints
+// why; that text is no profile name.
+func TestAuthselectCurrent_FailureMeansNoProfile(t *testing.T) {
+	const current = "authselect current --raw"
+	var calls []string
+	run := fakeRunner(map[string]error{current: fmt.Errorf("exit status 2")},
+		map[string]string{current: "No existing configuration detected.\n"}, &calls)
+	if got := authselectCurrent(run); got != "" {
+		t.Errorf("authselectCurrent() = %q, want \"\" when the command fails", got)
+	}
+	run = fakeRunner(nil, map[string]string{current: "sssd with-faillock\n"}, &calls)
+	if got := authselectCurrent(run); got != "sssd with-faillock" {
+		t.Errorf("authselectCurrent() = %q, want the active profile", got)
 	}
 }

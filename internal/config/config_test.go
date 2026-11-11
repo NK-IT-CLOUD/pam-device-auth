@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -454,4 +455,95 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// loadString loads a config from a JSON string through Load.
+func loadString(t *testing.T, body string) (*Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+const supportedList = "RS256, RS384, RS512, ES256, ES384, ES512"
+
+// A misspelled key must not switch a protection off without a word: every
+// key the loader does not know is reported with its path. Keys match without
+// regard to case, as encoding/json reads them, and keys of earlier versions
+// stay silent.
+func TestLoad_UnknownKeys(t *testing.T) {
+	cfg, err := loadString(t, `{
+		"Issuer_URL": "https://sso.example.com/realms/test",
+		"client_id": "ssh-server",
+		"required_role": "ssh-access",
+		"requried_acr": ["gold"],
+		"create_user": true, "directory_mode": true, "ip_claim": "ips",
+		"ldap": {
+			"profile": "lldap", "uri": "ldaps://ldap.example.com:636",
+			"acess_group": "ssh-access",
+			"kerberos": {"realm": "EXAMPLE.COM", "kdc": "kdc.example.com", "relm": "X"},
+			"attributes": {"ssh_key": "sshPublicKey", "sshkey": "x"},
+			"id_range": {"min": 1000, "max": 2000, "maximum": 3}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("Load() error: %v (unknown keys must never fail a load)", err)
+	}
+	if cfg.IssuerURL != "https://sso.example.com/realms/test" {
+		t.Errorf("IssuerURL = %q: the key Issuer_URL must be read as issuer_url", cfg.IssuerURL)
+	}
+	want := []string{
+		`unknown key "ldap.acess_group" is ignored`,
+		`unknown key "ldap.attributes.sshkey" is ignored`,
+		`unknown key "ldap.id_range.maximum" is ignored`,
+		`unknown key "ldap.kerberos.relm" is ignored`,
+		`unknown key "requried_acr" is ignored`,
+	}
+	if got := cfg.Warnings(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Warnings() = %q\nwant %q", got, want)
+	}
+}
+
+func TestLoad_UnsupportedAlgorithm(t *testing.T) {
+	cfg, err := loadString(t, `{
+		"issuer_url": "https://sso.example.com/realms/test", "client_id": "ssh-server",
+		"required_role": "ssh-access", "allowed_algorithms": ["RS256", "rs256", "none"]
+	}`)
+	if err != nil {
+		t.Fatalf("Load() error: %v (one supported entry is enough to load)", err)
+	}
+	want := []string{
+		`allowed_algorithms: "rs256" is not supported (supported: ` + supportedList + `)`,
+		`allowed_algorithms: "none" is not supported (supported: ` + supportedList + `)`,
+	}
+	if got := cfg.Warnings(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Warnings() = %q\nwant %q", got, want)
+	}
+}
+
+// With no supported entry no token can ever validate: that is a config error.
+func TestLoad_NoSupportedAlgorithm(t *testing.T) {
+	_, err := loadString(t, `{
+		"issuer_url": "https://sso.example.com/realms/test", "client_id": "ssh-server",
+		"required_role": "ssh-access", "allowed_algorithms": ["rs256"]
+	}`)
+	want := "allowed_algorithms has no supported entry (supported: " + supportedList + ")"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Load() error = %v, want %q", err, want)
+	}
+}
+
+func TestLoad_CleanConfigHasNoWarnings(t *testing.T) {
+	cfg, err := loadString(t, `{
+		"issuer_url": "https://sso.example.com/realms/test", "client_id": "ssh-server",
+		"required_role": "ssh-access", "allowed_algorithms": ["ES256"], "ldap": null
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := cfg.Warnings(); len(w) != 0 {
+		t.Errorf("Warnings() = %q, want none", w)
+	}
 }

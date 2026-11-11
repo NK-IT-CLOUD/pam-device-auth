@@ -51,16 +51,23 @@ func (e loginEnv) hostKeyArgs() []string {
 	return []string{"-o", "StrictHostKeyChecking=accept-new"}
 }
 
+// sshCommand is the ssh client call every login test uses: only the given key,
+// the pinned or first-use host key, no stdin.
+func (e loginEnv) sshCommand(ctx context.Context, env []string, args ...string) *exec.Cmd {
+	full := append(append([]string{"-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes"}, e.hostKeyArgs()...), args...)
+	cmd := exec.CommandContext(ctx, "ssh", full...)
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Stdin = nil
+	return cmd
+}
+
 // ssh runs ssh with the given arguments and returns the combined output and the
 // exit code (-1 when the command did not finish within the timeout).
 func (e loginEnv) ssh(t *testing.T, timeout time.Duration, env []string, args ...string) (string, int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	full := append(append([]string{"-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes"}, e.hostKeyArgs()...), args...)
-	cmd := exec.CommandContext(ctx, "ssh", full...)
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdin = nil
+	cmd := e.sshCommand(ctx, env, args...)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	var ee *exec.ExitError
@@ -201,5 +208,97 @@ func TestLoginOIDCTierStartsDeviceFlow(t *testing.T) {
 	prompts, _ := os.ReadFile(logFile)
 	if !strings.Contains(string(prompts), "Authorize in browser") {
 		t.Fatalf("no device-flow prompt after the key was accepted; prompts seen: %q", prompts)
+	}
+}
+
+// helperPIDs returns the PIDs of the pam-device-auth helpers that run on the host.
+func (e loginEnv) helperPIDs(t *testing.T) []string {
+	t.Helper()
+	out, code := e.ssh(t, 20*time.Second, nil, "-o", "BatchMode=yes", e.root, "pgrep -x pam-device-auth; true")
+	if code != 0 {
+		t.Fatalf("listing the helper processes failed: %s", out)
+	}
+	var pids []string
+	for _, f := range strings.Fields(out) {
+		if _, err := strconv.Atoi(f); err == nil {
+			pids = append(pids, f)
+		}
+	}
+	return pids
+}
+
+// processAlive reports whether pid still exists on the host.
+func (e loginEnv) processAlive(t *testing.T, pid string) bool {
+	t.Helper()
+	out, code := e.ssh(t, 20*time.Second, nil, "-o", "BatchMode=yes", e.root, "test -d /proc/"+pid+" && echo alive || echo gone")
+	if code != 0 {
+		t.Fatalf("checking process %s failed: %s", pid, out)
+	}
+	return strings.Contains(out, "alive")
+}
+
+// The client disconnects at the device-flow prompt without answering it. sshd
+// then ends its PAM process; the helper must end with it instead of polling
+// the identity provider as an orphan until its own timeout.
+func TestLoginDisconnectAtPromptLeavesNoHelper(t *testing.T) {
+	e := loginSetup(t)
+	if e.root == "" {
+		t.Skip("PDA_LOGIN_ROOT is not set: the host's processes cannot be checked")
+	}
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "prompts")
+	askpass := filepath.Join(dir, "askpass.sh")
+	// Logs the prompt and never answers it.
+	script := "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$ASKPASS_LOG\"\nexec sleep 30\n"
+	if err := os.WriteFile(askpass, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"SSH_ASKPASS=" + askpass, "SSH_ASKPASS_REQUIRE=force", "ASKPASS_LOG=" + logFile}
+	key := filepath.Join(e.keyDir, "ci-oidc")
+
+	before := map[string]bool{}
+	for _, pid := range e.helperPIDs(t) {
+		before[pid] = true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	client := e.sshCommand(ctx, env, "-o", "NumberOfPasswordPrompts=1", "-i", key, "ci-oidc@"+e.host, "true")
+	if err := client.Start(); err != nil {
+		t.Fatalf("ssh: %v", err)
+	}
+	disconnected := false
+	disconnect := func() {
+		if !disconnected {
+			disconnected = true
+			client.Process.Kill()
+			client.Wait()
+		}
+	}
+	defer disconnect()
+
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		if prompts, _ := os.ReadFile(logFile); strings.Contains(string(prompts), "Authorize in browser") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no device-flow prompt within 20 s")
+		}
+	}
+	var started []string
+	for _, pid := range e.helperPIDs(t) {
+		if !before[pid] {
+			started = append(started, pid)
+		}
+	}
+	if len(started) != 1 {
+		t.Fatalf("expected one new helper for this login, found %v", started)
+	}
+
+	disconnect()
+
+	for deadline := time.Now().Add(5 * time.Second); e.processAlive(t, started[0]); time.Sleep(500 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("helper %s still runs 5 s after the client disconnected at the prompt", started[0])
+		}
 	}
 }

@@ -82,8 +82,10 @@ and is cleared on reboot.
 
 ## Features
 
-- Two factors for every non-root login: a key from the directory and an OIDC
-  approval, both checked again on each login.
+- Two factors for every interactive login: a key from the directory and an
+  OIDC sign-in. The key is needed for every login and the token is checked
+  again each time; a known address needs no new approval while the session at
+  the identity provider lives.
 - Any OIDC provider that supports the device grant. Keycloak with
   [LLDAP](https://github.com/lldap/lldap) or Samba AD is the tested setup, and
   templates for Auth0, Okta and Authentik are included.
@@ -128,6 +130,8 @@ and is cleared on reboot.
   Auth0, Okta or Authentik. It must serve its discovery, token and JWKS endpoints
   from the issuer host and issue an access token with `preferred_username`, the
   configured role claim, and either `azp` or a matching `aud`.
+  `preferred_username` must be the user's login name in the directory, and
+  users must not be able to change it.
 - A root SSH-key session during setup, so you can recover from configuration
   mistakes.
 
@@ -235,8 +239,10 @@ sudo pam-device-auth --enable       # activate the PAM/sshd config (restarts ssh
 >
 > **Existing local accounts.** `--setup-ldap` migrates same-name local accounts
 > that shadow a directory identity. It lists them, removes their local passwd and
-> shadow entries, keeps their homes and local groups (except `sudo`, `admin` and
-> `wheel`) and re-owns only the files of the old IDs. It sends no signal: an
+> shadow entries, keeps their homes and local groups (except privileged ones
+> such as `sudo`, `wheel`, `adm` and `docker`; the
+> [full list](docs/ldap-directory-setup.md#migration-on-existing-hosts-important)
+> is in the directory guide) and re-owns only the files of the old IDs. It sends no signal: an
 > account with running processes is skipped with a warning, so stop them and
 > run `--setup-ldap` again.
 
@@ -245,9 +251,9 @@ block and can be intentional, for example an access-group member who is
 deliberately not provisioned with an SSH key. The
 [preflight example](INSTALL.md#5-preflight-check) shows the full output.
 
-Commands: `--check`, `--setup-ldap`, `--enable`, `--migrate-config` (run by the
-package on upgrade), `--pam-acct` (internal, used by the PAM account phase),
-`--debug`, `--version`, `--help`.
+Commands: `--check`, `--setup-ldap`, `--enable`, `--migrate-config` and
+`--prepare-log` (both run by the package on install and upgrade), `--pam-acct`
+(internal, used by the PAM account phase), `--debug`, `--version`, `--help`.
 
 Every step of `--setup-ldap` is checked. A failed step aborts the setup with a
 `FAIL:` line that names the command and its output, what the rollback of
@@ -278,7 +284,10 @@ Every step of `--setup-ldap` is checked. A failed step aborts the setup with a
 `issuer_url`, `client_id`, `required_role`, `sudo_role`, `role_claim` and
 `auth_timeout`, through `PAM_DEVICE_AUTH_ISSUER`, `PAM_DEVICE_AUTH_CLIENT_ID`,
 `PAM_DEVICE_AUTH_REQUIRED_ROLE`, `PAM_DEVICE_AUTH_SUDO_ROLE`,
-`PAM_DEVICE_AUTH_ROLE_CLAIM` and `PAM_DEVICE_AUTH_TIMEOUT`. Every field is
+`PAM_DEVICE_AUTH_ROLE_CLAIM` and `PAM_DEVICE_AUTH_TIMEOUT`. They apply to a
+command run by hand and do not reach a login that sshd starts. sshd's
+`LoginGraceTime` (default 120 s) bounds the whole login, also the wait for the
+approval; see `auth_timeout` in the reference. Every field is
 described in [docs/configuration-reference.md](docs/configuration-reference.md).
 
 ### Group model
@@ -342,11 +351,13 @@ and Fedora, and `--setup-ldap` installs it. The whole pipeline is described in
 
 ## Security
 
-The first factor is a key from the directory, the second an OIDC approval, and
-both are checked on every login. The token is validated locally: signature,
+The first factor is a key from the directory, the second an OIDC sign-in. The
+key is checked on every login. So is the token: after a browser approval, or,
+from a known address, after a refresh that needs no approval while the session
+at the identity provider lives. The token is validated locally: signature,
 issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, required role, the optional
-authentication level (`required_acr`), algorithm and key-type binding (RS and
-ES, 256/384/512), a required `kid`, and no `none` or HMAC.
+authentication level (`required_acr`), algorithm, key-type and curve binding
+(RS and ES, 256/384/512), a required `kid`, and no `none` or HMAC.
 
 - **Source IP allowlist.** Enforced in the PAM account phase for every login. Only
   root is exempt.
@@ -357,8 +368,9 @@ ES, 256/384/512), a required `kid`, and no `none` or HMAC.
   `pam_sss`. Members of `ldap.nopasswd_sudo_groups` get `NOPASSWD:ALL`. There are
   no local passwords or `/etc/shadow` entries to drift.
 - **C PAM shim.** It uses fork and exec without a shell, `clearenv` with a
-  whitelisted environment, `pipe2(O_CLOEXEC)`, `strtok_r`, SIGPIPE handling, a
-  per-call timeout and log sanitization.
+  whitelisted environment, `pipe2(O_CLOEXEC)`, SIGPIPE handling, a
+  per-call timeout and log sanitization. The helper ends with the sshd process
+  that started it.
 - **Cache.** The refresh token lives in tmpfs at `/run/pam-device-auth/`
   (`0700 root:root`, cleared on reboot), and the list of known IPs is capped.
   Cached discovery and JWKS documents are read only from a root-owned directory,

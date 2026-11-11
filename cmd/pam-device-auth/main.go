@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,6 +59,9 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 	}
 
 	fmt.Printf("Config OK: issuer=%s client=%s role=%s sudo_role=%s\n", cfg.IssuerURL, cfg.ClientID, cfg.RequiredRole, cfg.SudoRole)
+	// The config loads, but a key the loader does not know or an algorithm it
+	// cannot verify is a blocker here: a login only logs it.
+	fails += reportConfigWarnings(cfg, os.Stdout)
 	if len(cfg.RequiredACR) > 0 {
 		fmt.Printf("Token policy: acr must be one of %s (checked at login; the IdP must issue the acr claim)\n", strings.Join(cfg.RequiredACR, ", "))
 	}
@@ -80,13 +85,17 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 	fmt.Println("OIDC:")
 	httpClient := newOIDCClient()
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	discoveryStart := time.Now()
 	endpoints, derr := discovery.Fetch(ctx, httpClient, cfg.IssuerURL)
+	discoveryTook := time.Since(discoveryStart)
 	cancel()
 	if derr != nil {
 		fmt.Printf("  [FAIL] discovery failed: %v\n", derr)
 		fails++
 	} else {
 		fmt.Printf("  [OK]   discovery reachable (device=%s)\n", endpoints.DeviceAuthorizationEndpoint)
+		tok, tokMsg, tbadMsg := discoveryTiming(discoveryTook)
+		chk(tok, false, tokMsg, tbadMsg)
 		chk(strings.TrimRight(endpoints.Issuer, "/") == cfg.IssuerURL, true,
 			"issuer matches config",
 			fmt.Sprintf("issuer mismatch: discovery=%q config=%q (MITM/misconfig)", endpoints.Issuer, cfg.IssuerURL))
@@ -161,8 +170,12 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 					fmt.Sprintf("ldap.kerberos.keytab: %v", kerr))
 			}
 		}
+		// Member names that start with '-' are left out of every per-member
+		// check below (see splitMembers) and reported once.
+		var optionLike []string
 		if cfg.LDAP.AccessGroup != "" {
-			members, gerr := getentGroup(cfg.LDAP.AccessGroup)
+			members, skipped, gerr := getentGroup(cfg.LDAP.AccessGroup)
+			optionLike = append(optionLike, skipped...)
 			chk(gerr == nil, true,
 				fmt.Sprintf("access group %q resolves via NSS (%d member(s)); %s", cfg.LDAP.AccessGroup, len(members), directoryPathOK(cfg.LDAP)),
 				accessGroupFailMessage(cfg.LDAP.AccessGroup))
@@ -177,7 +190,8 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 			}
 		}
 		for _, g := range cfg.LDAP.ServiceAccountGroups {
-			members, gerr := getentGroup(g)
+			members, skipped, gerr := getentGroup(g)
+			optionLike = append(optionLike, skipped...)
 			chk(gerr == nil, false,
 				fmt.Sprintf("service group %q resolves (%d member(s)); KEY-ONLY tier (no OIDC)", g, len(members)),
 				fmt.Sprintf("service group %q does NOT resolve via NSS; check it exists with a gidNumber", g))
@@ -191,6 +205,12 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 					fmt.Sprintf("%%d of %%d member(s) of service group %q have an UNPARSEABLE sshPublicKey; sshd will reject it: %%s", g))
 			}
 		}
+		if len(optionLike) > 0 {
+			slices.Sort(optionLike)
+			chk(false, false, "",
+				"group member name(s) that start with '-' are left out of every check and are refused at login: "+
+					strings.Join(slices.Compact(optionLike), ", "))
+		}
 		// IDs must exist in this host's user namespace, or the login fails in
 		// setresuid (unprivileged containers map only 65536 IDs; SSSD's AD ID
 		// mapping starts at 200000 unless ldap.id_range is set).
@@ -201,7 +221,7 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 			// group FAIL, service group WARN); it simply contributes no members.
 			var members []string
 			for _, g := range append([]string{cfg.LDAP.AccessGroup}, cfg.LDAP.ServiceAccountGroups...) {
-				m, _ := getentGroup(g)
+				m, _, _ := getentGroup(g)
 				members = append(members, m...)
 			}
 			checked, outside, unresolved := idMapReport(members, directoryUserIDs,
@@ -221,7 +241,7 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 			}
 		}
 		for _, g := range cfg.LDAP.NopasswdSudoGroups {
-			members, gerr := getentGroup(g)
+			members, _, gerr := getentGroup(g)
 			chk(gerr == nil, false,
 				fmt.Sprintf("nopasswd-sudo group %q resolves (%d member(s)); PASSWORDLESS sudo (elevated)", g, len(members)),
 				fmt.Sprintf("nopasswd-sudo group %q does NOT resolve via NSS; check it exists with a gidNumber", g))
@@ -243,13 +263,13 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 		// desired, every directory) user.
 		var probeUser string
 		if cfg.LDAP.AccessGroup != "" {
-			if members, gerr := getentGroup(cfg.LDAP.AccessGroup); gerr == nil && len(members) > 0 {
+			if members, _, gerr := getentGroup(cfg.LDAP.AccessGroup); gerr == nil && len(members) > 0 {
 				probeUser = members[0]
 			}
 		}
 		if probeUser == "" {
 			for _, g := range cfg.LDAP.ServiceAccountGroups {
-				if members, gerr := getentGroup(g); gerr == nil && len(members) > 0 {
+				if members, _, gerr := getentGroup(g); gerr == nil && len(members) > 0 {
 					probeUser = members[0]
 					break
 				}
@@ -304,12 +324,12 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 		}
 
 		if cfg.LDAP.AccessGroup != "" {
-			if members, gerr := getentGroup(cfg.LDAP.AccessGroup); gerr == nil {
+			if members, _, gerr := getentGroup(cfg.LDAP.AccessGroup); gerr == nil {
 				reportPinPosture(cfg.LDAP.AccessGroup, members, false)
 			}
 		}
 		for _, g := range cfg.LDAP.ServiceAccountGroups {
-			if members, gerr := getentGroup(g); gerr == nil {
+			if members, _, gerr := getentGroup(g); gerr == nil {
 				reportPinPosture(g, members, true)
 			}
 		}
@@ -337,9 +357,46 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 				"AuthorizedKeysCommand binary "+f[0]+" does not exist; sshd serves no directory key and non-root publickey logins fail; re-run 'pam-device-auth --setup-ldap'")
 		}
 		am, _ := sshdParam("authenticationmethods", "")
-		chk(strings.Contains(am, "publickey") && strings.Contains(am, "keyboard-interactive:pam"), false,
+		chk(methodsRequire2FA(am), false,
 			"non-root: "+am+" (2FA)",
-			"non-root AuthenticationMethods not 2FA (got "+am+"); expected publickey,keyboard-interactive:pam")
+			"non-root AuthenticationMethods not 2FA (got "+am+"); expected publickey,keyboard-interactive:pam "+
+				"(a space instead of the comma makes each factor enough on its own)")
+		// A Match block of another sshd drop-in can change the methods for
+		// single users, groups or addresses, so sshd is asked for every member.
+		if cfg.LDAP != nil {
+			var access, service []string
+			if cfg.LDAP.AccessGroup != "" {
+				access, _, _ = getentGroup(cfg.LDAP.AccessGroup)
+			}
+			for _, g := range cfg.LDAP.ServiceAccountGroups {
+				m, _, _ := getentGroup(g)
+				service = append(service, m...)
+			}
+			twoFactor, keyOnly, weak, notEvaluated := factorReport(access, service, func(spec string) (string, bool) {
+				return sshdParamFor("authenticationmethods", spec)
+			})
+			if len(twoFactor)+len(keyOnly)+len(weak) > 0 {
+				chk(len(weak) == 0, false,
+					fmt.Sprintf("SSH factors per member: %d with key and OIDC, %d key-only (service groups)", len(twoFactor), len(keyOnly)),
+					"member(s) whose SSH factors do not fit their tier (a Match block in another sshd drop-in?): "+strings.Join(weak, ", ")+
+						"; expected publickey,keyboard-interactive:pam, for service-group members publickey")
+			}
+			if len(notEvaluated) > 0 {
+				chk(false, false, "",
+					"SSH factors not evaluated for member(s) "+strings.Join(notEvaluated, ", ")+
+						" (the name cannot be written into an sshd connection spec, or sshd -T gave no answer)")
+			}
+		}
+		// Without PAM sshd runs neither the OIDC step nor the account phase
+		// (clients allowlist, access group); the OIDC step itself is a
+		// keyboard-interactive conversation.
+		for _, kw := range []struct{ key, name, why string }{
+			{"usepam", "UsePAM", "without PAM sshd runs neither the OIDC step nor the account phase (clients allowlist, access group)"},
+			{"kbdinteractiveauthentication", "KbdInteractiveAuthentication", "the OIDC step is a keyboard-interactive conversation"},
+		} {
+			v, _ := sshdParam(kw.key, "")
+			chk(v == "yes", true, kw.name+" yes", fmt.Sprintf("%s is %q, must be yes: %s", kw.name, v, kw.why))
+		}
 		rootPermit, rootAm, rootKeys, sources := rootSSHDPolicy(cfg.RootLoginSources)
 		rok, rfatal, rokMsg, rbadMsg := rootLoginWithSources(cfg.RootLogin, rootPermit, rootAm, rootKeys, sources)
 		chk(rok, rfatal, rokMsg, rbadMsg)
@@ -499,16 +556,19 @@ func serviceActive(name string) bool {
 
 // getentGroup resolves a group via NSS and returns its explicit member names. A
 // non-nil error means the group does not resolve (the SSSD→LDAP path is broken).
-func getentGroup(name string) ([]string, error) {
-	out, err := exec.Command("getent", "group", name).Output()
+// skipped holds the member names that must not become a command argument
+// (splitMembers); callers hand only members to per-member commands.
+func getentGroup(name string) (members, skipped []string, err error) {
+	out, err := exec.Command("getent", "group", "--", name).Output()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	parts := strings.SplitN(strings.TrimSpace(string(out)), ":", 4)
-	if len(parts) < 4 || parts[3] == "" {
-		return nil, nil
+	if len(parts) < 4 {
+		return nil, nil, nil
 	}
-	return strings.Split(parts[3], ","), nil
+	members, skipped = splitMembers(parts[3])
+	return members, skipped, nil
 }
 
 // userKeyStatus classifies the directory SSH key for a user, as sshd would see
@@ -519,7 +579,7 @@ func getentGroup(name string) ([]string, error) {
 //	"invalid" — a key is returned but it does not parse as an SSH public key
 //	"ok"      — at least one parseable key (the user can satisfy the publickey factor)
 func userKeyStatus(keysCmd, user string) string {
-	out, err := exec.Command(keysCmd, user).Output()
+	out, err := exec.Command(keysCmd, "--", user).Output()
 	if err != nil {
 		return "error"
 	}
@@ -588,12 +648,9 @@ func hasValidSSHKey(authKeys []byte) bool {
 }
 
 // sshdTOutput runs `sshd -T` with the given arguments; a seam for tests.
+// sshd is found through the fixed PATH of setSystemPath.
 var sshdTOutput = func(args ...string) ([]byte, error) {
-	bin := "sshd"
-	if _, err := exec.LookPath("sshd"); err != nil {
-		bin = "/usr/sbin/sshd"
-	}
-	return exec.Command(bin, args...).Output()
+	return exec.Command("sshd", args...).Output()
 }
 
 // sshdParamFor returns the effective value of an sshd_config keyword for the
@@ -664,7 +721,21 @@ func isEnabled() bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(data), "pam_device_auth.so")
+	return pamStackUsesModule(data)
+}
+
+// pamStackUsesModule reports whether a PAM stack has a line that names
+// pam_device_auth.so outside a comment. The package scripts use the same rule
+// (grep '^[^#]*pam_device_auth\.so'), so a commented-out line is "not active"
+// everywhere.
+func pamStackUsesModule(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		code, _, _ := strings.Cut(line, "#")
+		if strings.Contains(code, "pam_device_auth.so") {
+			return true
+		}
+	}
+	return false
 }
 
 // errNoPristinePAM marks a backupFile error where no pristine PAM stack is
@@ -1100,7 +1171,39 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
+// systemPath is the PATH of every command the helper runs. It is the value
+// the PAM module sets for the login modes (pam_device_auth.c).
+const systemPath = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+// setSystemPath replaces PATH with systemPath. The CLI commands run sshd,
+// visudo, pam-auth-update, sss_cache and userdel by name; a root shell that
+// came from `su` has no sbin directory in its PATH on Debian, and the caller's
+// PATH should not decide which binaries a root tool runs anyway.
+func setSystemPath() {
+	os.Setenv("PATH", systemPath)
+}
+
+// discoveryTimingLimit is how long the discovery request of --check may take
+// before it is reported.
+const discoveryTimingLimit = 2 * time.Second
+
+// discoveryTiming is the --check result for the duration of the discovery
+// request. Every login makes requests to the same host, so a slow answer here
+// is a slow login. The usual cause is DNS: the helper is a static binary and
+// uses Go's resolver, which has no cache and waits its full timeout (5 s per
+// name server) when the first name server of /etc/resolv.conf does not answer
+// properly, where the C library moves on at once.
+func discoveryTiming(d time.Duration) (ok bool, okMsg, badMsg string) {
+	d = d.Round(10 * time.Millisecond)
+	return d <= discoveryTimingLimit,
+		fmt.Sprintf("discovery answered in %s", d),
+		fmt.Sprintf("discovery took %s (more than %s): every login waits like this; check DNS first: "+
+			"the helper asks the name servers of /etc/resolv.conf in order and waits 5 s for one that does not answer properly",
+			d, discoveryTimingLimit)
+}
+
 func main() {
+	setSystemPath()
 	debug := hasFlag(os.Args[1:], "--debug")
 	for _, arg := range os.Args[1:] {
 		switch arg {
@@ -1108,13 +1211,14 @@ func main() {
 			fmt.Printf("pam-device-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--check] [--setup-ldap] [--enable] [--migrate-config] [--pam-acct] [--help]")
+			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--check] [--setup-ldap] [--enable] [--migrate-config] [--prepare-log] [--pam-acct] [--help]")
 			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
 			fmt.Println("")
 			fmt.Println("  --check       Pre-activation preflight: config, OIDC, directory/SSSD, sshd factors")
 			fmt.Println("  --setup-ldap  Configure the SSSD directory identity from config (NSS + sudo)")
 			fmt.Println("  --enable      Activate PAM authentication (runs --check first)")
 			fmt.Println("  --migrate-config  Set ldap.profile = \"lldap\" in a 0.6.x config that has none (run by the package on upgrade)")
+			fmt.Println("  --prepare-log  Create the log file or check it: a regular file, mode at most 0640 (run by the package on install and upgrade)")
 			fmt.Println("  --pam-acct    Run the PAM account-phase IP allowlist gate")
 			fmt.Println("  --debug       Run with debug logging")
 			fmt.Println("  --version     Show version")
@@ -1132,6 +1236,8 @@ func main() {
 			os.Exit(runMigrateConfig(config.DefaultConfigPath, os.Stdout, os.Stderr))
 		case "--pam-acct":
 			os.Exit(runPamAcct())
+		case "--prepare-log":
+			os.Exit(runPrepareLog())
 		}
 	}
 
@@ -1151,6 +1257,11 @@ func main() {
 	if err != nil {
 		log.Error("Config error: %v", err)
 		os.Exit(1)
+	}
+	// Findings that must not stop a login (an upgrade must not lock a host
+	// out over a stray key) but must not stay silent either.
+	for _, line := range configWarningLines(cfg) {
+		log.Warn("%s", line)
 	}
 
 	sshUser := os.Getenv("PAM_USER")
@@ -1172,7 +1283,10 @@ func main() {
 	// root-only metadata cache when fresh; a cached document runs through the
 	// same validation and the issuer pin below exactly like a live one.
 	discoveryCtx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	endpoints, err := discovery.FetchCached(discoveryCtx, httpClient, cfg.IssuerURL, log.Debug, log.Warn)
+	var endpoints *discovery.Endpoints
+	timed(log, "Discovery", func() {
+		endpoints, err = discovery.FetchCached(discoveryCtx, httpClient, cfg.IssuerURL, log.Debug, log.Warn)
+	})
 	cancel()
 	if err != nil {
 		log.Error("OIDC Discovery failed: %v", err)
@@ -1188,10 +1302,16 @@ func main() {
 	// Identity, groups, home and the sudo password come from the directory
 	// (via SSSD/NSS). pam-device-auth is only the OIDC SSH-login layer:
 	// it validates the OIDC token (signature/issuer/client/exp/iat, required
-	// role, optional IP allowlist) and grants or denies the login. It never
+	// role, optional required_acr) and grants or denies the login. It never
 	// reads /etc/shadow, prompts for a local password, or manages users.
-	directoryAuthFlow(log, cfg, httpClient, endpoints, sshUser, clientIP)
-	os.Exit(0)
+	// The exit status is the outcome of the flow and nothing else: 0 only for
+	// an explicit allow.
+	flow := &authFlow{
+		log: log, cfg: cfg, client: httpClient, endpoints: endpoints,
+		io:  &authIO{in: bufio.NewReader(os.Stdin), out: os.Stdout},
+		nss: nssLookup,
+	}
+	os.Exit(flow.run(sshUser, clientIP).exitCode())
 }
 
 // qrMaxURLBytes is the longest verification URL rendered as a QR: QR version 5

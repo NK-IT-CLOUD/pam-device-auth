@@ -37,7 +37,8 @@ func dirLookup(name string) (int, int, bool) {
 func TestFindShadowedAccounts(t *testing.T) {
 	got := findShadowedAccounts([]byte(testPasswd), []byte(testGroup), dirLookup)
 	want := []shadowedAccount{
-		{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker", "video"}},
+		{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000,
+			Groups: []string{"video"}, Dropped: []string{"sudo", "docker", "wheel"}},
 		{Name: "bob", Home: "/srv/bob", LocalUID: 1001, LocalGID: 1001, DirUID: 10002, DirGID: 6000},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -45,10 +46,37 @@ func TestFindShadowedAccounts(t *testing.T) {
 	}
 }
 
-func TestLocalSupplementaryGroupsSkipsPrivilegedAndPrimary(t *testing.T) {
-	got := localSupplementaryGroups([]byte(testGroup), "alice", 1000)
-	if !reflect.DeepEqual(got, []string{"docker", "video"}) {
-		t.Fatalf("got %v", got)
+// Groups that give root or near-root rights are not carried over to the
+// directory user: those rights come from the directory. They are returned
+// apart so the admin sees what the migration leaves out. The primary group
+// is in neither list.
+func TestLocalSupplementaryGroups_DropsPrivileged(t *testing.T) {
+	kept, dropped := localSupplementaryGroups([]byte(testGroup), "alice", 1000)
+	if !reflect.DeepEqual(kept, []string{"video"}) {
+		t.Errorf("kept = %v, want [video]", kept)
+	}
+	if !reflect.DeepEqual(dropped, []string{"sudo", "docker", "wheel"}) {
+		t.Errorf("dropped = %v, want [sudo docker wheel]", dropped)
+	}
+
+	const hostGroups = `root:x:0:alice
+adm:x:4:alice,syslog
+disk:x:6:alice
+shadow:x:42:alice
+staff:x:50:alice
+lxd:x:110:alice
+incus:x:111:alice
+libvirt:x:112:alice
+admin:x:113:alice
+audio:x:29:alice
+plugdev:x:46:alice
+`
+	kept, dropped = localSupplementaryGroups([]byte(hostGroups), "alice", 1000)
+	if !reflect.DeepEqual(kept, []string{"audio", "plugdev"}) {
+		t.Errorf("kept = %v, want [audio plugdev]", kept)
+	}
+	if want := []string{"root", "adm", "disk", "shadow", "staff", "lxd", "incus", "libvirt", "admin"}; !reflect.DeepEqual(dropped, want) {
+		t.Errorf("dropped = %v, want %v", dropped, want)
 	}
 }
 
@@ -275,9 +303,10 @@ func TestKeptSSSDConf(t *testing.T) {
 
 func TestMigrationPreview(t *testing.T) {
 	accounts := []shadowedAccount{
-		{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000, Groups: []string{"docker", "video"}},
+		{Name: "alice", Home: "/home/alice", LocalUID: 1000, LocalGID: 1000, DirUID: 10001, DirGID: 6000,
+			Groups: []string{"video"}, Dropped: []string{"sudo", "docker"}},
 		{Name: "bob", Home: "/srv/bob", LocalUID: 1001, LocalGID: 1001, DirUID: 10002, DirGID: 6000},
-		{Name: "carol", Home: "/home/carol", LocalUID: 1002, LocalGID: 1002, DirUID: 10003, DirGID: 6000, Groups: []string{"docker"}},
+		{Name: "carol", Home: "/home/carol", LocalUID: 1002, LocalGID: 1002, DirUID: 10003, DirGID: 6000, Groups: []string{"video"}},
 		{Name: "dave", Home: "/home/../srv/dave", LocalUID: 1003, LocalGID: 1003, DirUID: 10004, DirGID: 6000},
 		{Name: "erin", Home: "/home/erin/", LocalUID: 1004, LocalGID: 1004, DirUID: 10005, DirGID: 6000},
 	}
@@ -285,7 +314,7 @@ func TestMigrationPreview(t *testing.T) {
 	// missing; bob's and dave's lie outside /home, so it does not matter.
 	got := migrationPreview(accounts, map[string]int{"carol": 2, "bob": 0}, map[string]bool{"alice": true})
 	want := []string{
-		"local account alice (uid 1000) shadows the directory user (uid 10001); --setup-ldap will migrate it, keep groups [docker, video], re-own /home/alice",
+		"local account alice (uid 1000) shadows the directory user (uid 10001); --setup-ldap will migrate it, keep groups [video], not carry over the privileged groups [sudo, docker], re-own /home/alice",
 		"local account bob (uid 1001) shadows the directory user (uid 10002); --setup-ldap will migrate it, keep groups [], leave /srv/bob as it is (outside /home)",
 		"local account carol (uid 1002) shadows the directory user (uid 10003) but has 2 running process(es); --setup-ldap will skip it",
 		"local account dave (uid 1003) shadows the directory user (uid 10004); --setup-ldap will migrate it, keep groups [], leave /home/../srv/dave as it is (outside /home)",

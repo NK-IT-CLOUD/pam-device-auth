@@ -7,6 +7,7 @@ pam-device-auth \- two-factor SSH login (directory key + OIDC device grant)
 [\fB\-\-setup\-ldap\fR]
 [\fB\-\-enable\fR]
 [\fB\-\-migrate\-config\fR]
+[\fB\-\-prepare\-log\fR]
 [\fB\-\-debug\fR]
 [\fB\-\-version\fR]
 [\fB\-\-help\fR]
@@ -97,8 +98,18 @@ Run the pre-activation preflight: validate the config, test OIDC discovery and
 issuer match, verify the directory path (SSSD running, access group resolves via
 NSS, every access-group member has a valid
 .IR sshPublicKey ),
-the sshd factors (AuthorizedKeysCommand, non-root 2FA, root break-glass), IP
-allowlist posture, and SSSD InfoPipe health. It also verifies that
+the sshd factors (AuthorizedKeysCommand, UsePAM and
+KbdInteractiveAuthentication, non-root 2FA, the methods sshd applies to each
+member of the access group and the service groups, root break-glass), IP
+allowlist posture, and SSSD InfoPipe health. It reports how long OIDC
+discovery took and warns above 2 seconds. Config keys the loader does not know
+and
+.I allowed_algorithms
+entries the verifier does not support are [FAIL] items here, in
+.B \-\-enable
+and in
+.BR \-\-setup\-ldap ;
+a login logs them as warnings and goes on. It also verifies that
 .I sssd.conf
 exposes the
 .I clients
@@ -233,6 +244,14 @@ Enable verbose logging to
 .B \-\-version
 Print version and exit.
 .TP
+.B \-\-prepare\-log
+Create
+.I /var/log/pam-device-auth.log
+or check the existing one: it must be a regular file (a symlink, a FIFO or a
+directory at the path is an error), mode bits beyond 0640 are removed, and the
+file is given to root and the group adm where that group exists. The package
+runs it on install and upgrade.
+.TP
 .B \-\-help
 Print usage and exit.
 .PP
@@ -240,12 +259,12 @@ An additional
 .B \-\-pam\-acct
 mode exists for the PAM account phase to enforce the IP allowlist; it is
 invoked internally by the PAM stack and not meant to be run by hand. It exits
-0 (allow), 1 (deny for this user) or 3 when it cannot open its log, or the log
-is not 0640 and cannot be set to 0640: then it denies every non-root user and
-reports the reason to syslog
+0 (allow), 1 (deny for this user) or 3 when it cannot open its log, the log
+path is no regular file, or the log has mode bits beyond 0640 that cannot be
+removed: then it denies every non-root user and reports the reason to syslog
 .RB ( authpriv ).
 The PAM module logs exit 3 as an infrastructure failure and denies the login.
-A log that already is 0640 is not changed.
+A log with mode 0640 or stricter is not changed.
 .PP
 The authentication phase denies the login in the same case and reports it to
 syslog
@@ -284,6 +303,17 @@ required_acr	No	\-	Accepted acr claim values (exact match)
 root_login_sources	No	\-	Client IPs for root's policy in \-\-check
 ldap	setup	\-	Directory block for \-\-setup\-ldap (see below)
 .TE
+.PP
+sshd's
+.B LoginGraceTime
+(default 120 seconds, counted from the moment the connection is opened) bounds
+the whole login, including the wait for the approval, and is shorter than the
+default auth_timeout. To use a longer wait, set
+.B LoginGraceTime
+in a file in
+.I /etc/ssh/sshd_config.d/
+that sorts before
+.IR 10-pam-device-auth.conf .
 .PP
 The
 .I ldap
@@ -329,7 +359,9 @@ and is enforced for every login by the PAM account phase.
 .PP
 The fields issuer_url, client_id, required_role, sudo_role, role_claim and
 auth_timeout can be overridden via environment variables prefixed with
-.BR PAM_DEVICE_AUTH_ .
+.B PAM_DEVICE_AUTH_
+for a command run by hand. They do not reach a login that sshd starts: sshd
+runs the PAM conversation with an empty environment.
 .SH FILES
 .TP
 .I /etc/pam-device-auth/config.json
@@ -390,17 +422,19 @@ client supports UTF-8), authorizes in a browser. The token is validated
 values) and the login is granted.
 .PP
 .B Known IP:
-silent OIDC token refresh, re-validated, no browser round-trip. The SSH key
-factor is always required.
+silent OIDC token refresh, re-validated, no browser round-trip while the
+session at the identity provider lives. The SSH key factor is always required.
 .PP
-.B Root and other local users:
+.B Root:
 SSH key only
 .RB ( "AuthenticationMethods publickey" )
-against the local authorized_keys. Only root is exempt from the
+against root's local authorized_keys, and exempt from the
 .I clients
-IP allowlist check; local non-root users still go through the SSSD InfoPipe
-lookup and fail closed if it cannot be read. Root key-only login is the
-break-glass path, independent of OIDC/SSSD/LDAP availability. If
+IP allowlist check. Root key-only login is the break-glass path, independent
+of OIDC/SSSD/LDAP availability. Other local users cannot log in: sshd reads no
+local authorized_keys for them, the OIDC step requires a directory identity,
+and the account phase fails closed for a user the SSSD InfoPipe does not
+know. If
 .I root_login
 is set to
 .B disabled

@@ -68,8 +68,7 @@ func detectClient() string {
 		if ctx.Err() != nil {
 			break
 		}
-		out, err := exec.CommandContext(ctx, "/usr/bin/journalctl",
-			fmt.Sprintf("_PID=%d", pid), "-o", "cat", "--no-pager").Output()
+		out, err := exec.CommandContext(ctx, "/usr/bin/journalctl", journalArgs(pid)...).Output()
 
 		if err == nil {
 			if version := parseClientVersion(string(out)); version != "" {
@@ -90,6 +89,13 @@ func detectClient() string {
 	}
 
 	return "unknown"
+}
+
+// journalArgs is the journalctl query for the messages of one process. -b
+// limits it to the current boot: PIDs are reused, and without the bound the
+// journal also returns what an earlier process with the same PID logged.
+func journalArgs(pid int) []string {
+	return []string{"-b", fmt.Sprintf("_PID=%d", pid), "-o", "cat", "--no-pager"}
 }
 
 // parsePPID extracts the PPID (field 4) from /proc/<pid>/stat content.
@@ -145,10 +151,12 @@ func clientRendersQR(version string) bool {
 }
 
 // parseClientVersion extracts the SSH client version from journalctl output.
+// The newest line counts: within one boot a PID can be reused too, and the
+// journal lists the oldest entry first.
 func parseClientVersion(journalOutput string) string {
 	needle := "remote software version "
 	lower := strings.ToLower(journalOutput)
-	idx := strings.Index(lower, needle)
+	idx := strings.LastIndex(lower, needle)
 	if idx < 0 {
 		return ""
 	}

@@ -165,19 +165,39 @@ func TestSave_FilePermissions(t *testing.T) {
 	}
 }
 
-func TestInvalidUsername(t *testing.T) {
+// A user name with a dot, an "@", a space or a path separator gets a session
+// like any other: its file name is the encoded name, inside CacheDir.
+func TestNamesWithOtherCharactersGetACache(t *testing.T) {
 	setupTestDir(t)
 
-	for _, name := range []string{"../etc/passwd", "root@domain", "", "a b", "name.ext", "a/b"} {
-		if err := Save(&CachedSession{Username: name, RefreshToken: "token"}); err == nil {
-			t.Errorf("Save(%q) should fail", name)
+	for name, file := range map[string]string{
+		"name.ext":      "name%2Eext.json",
+		"root@domain":   "root%40domain.json",
+		"a b":           "a%20b.json",
+		"a/b":           "a%2Fb.json",
+		"../etc/passwd": "%2E%2E%2Fetc%2Fpasswd.json",
+	} {
+		if err := Save(&CachedSession{Username: name, RefreshToken: "token-" + name}); err != nil {
+			t.Errorf("Save(%q): %v", name, err)
+			continue
 		}
-		if _, err := Load(name); err == nil {
-			t.Errorf("Load(%q) should fail", name)
+		if _, err := os.Stat(filepath.Join(CacheDir, file)); err != nil {
+			t.Errorf("Save(%q) did not write %s: %v", name, file, err)
 		}
-		if err := Delete(name); err == nil {
-			t.Errorf("Delete(%q) should fail", name)
+		if s, err := Load(name); err != nil || s == nil || s.RefreshToken != "token-"+name {
+			t.Errorf("Load(%q) = %+v, %v", name, s, err)
 		}
+		if err := Delete(name); err != nil {
+			t.Errorf("Delete(%q): %v", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(CacheDir, file)); !os.IsNotExist(err) {
+			t.Errorf("Delete(%q) left %s", name, file)
+		}
+	}
+
+	// An empty name has no file.
+	if err := Save(&CachedSession{Username: "", RefreshToken: "token"}); err == nil {
+		t.Error("Save with an empty user name should fail")
 	}
 }
 
@@ -429,7 +449,7 @@ func TestUpdateCreatesSessionWhenMissing(t *testing.T) {
 
 func TestUpdateRejectsInvalidUsername(t *testing.T) {
 	CacheDir = t.TempDir()
-	if err := Update("../evil", func(s *CachedSession) {}); err == nil {
-		t.Fatal("expected error for invalid username")
+	if err := Update("", func(s *CachedSession) {}); err == nil {
+		t.Fatal("expected error for an empty username")
 	}
 }

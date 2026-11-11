@@ -38,7 +38,7 @@ jobs:
         if: ${{ !(vars.CI_RUNNER != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q gcc libpam0g-dev
+          sudo apt-get install -y -q gcc libpam0g-dev shellcheck
 
       - name: Format
         run: |
@@ -114,8 +114,13 @@ jobs:
       - name: Test
         run: make test
 
-      - name: Vet
+      # go vet, staticcheck, shellcheck
+      - name: Lint
         run: make lint
+
+      # The PAM module once more with gcc's static analyzer, warnings are errors.
+      - name: Analyze
+        run: make analyze
 
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

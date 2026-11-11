@@ -23,10 +23,10 @@ func stubGetent(t *testing.T, output string, exitCode int) string {
 	return argsFile
 }
 
-func TestNSSUserExistsQueriesSSSOnly(t *testing.T) {
+func TestNSSLookupQueriesSSSOnly(t *testing.T) {
 	argsFile := stubGetent(t, "alice:*:10000:10000::/home/alice:/bin/bash\n", 0)
-	if !nssUserExists("alice") {
-		t.Fatal("expected true for user present in sss")
+	if found, err := nssLookup("alice"); err != nil || !found {
+		t.Fatalf("nssLookup(\"alice\") = %v, %v; want found for a user present in sss", found, err)
 	}
 	got, err := os.ReadFile(argsFile)
 	if err != nil {
@@ -38,11 +38,11 @@ func TestNSSUserExistsQueriesSSSOnly(t *testing.T) {
 	}
 }
 
-func TestNSSUserExistsRejectsLocalOnlyUser(t *testing.T) {
+func TestNSSLookupRejectsLocalOnlyUser(t *testing.T) {
 	// getent -s sss exits 2 with no output when the user is not in sss —
 	// even if the user exists in /etc/passwd.
 	stubGetent(t, "", 2)
-	if nssUserExists("localonly") {
-		t.Fatal("expected false for user absent from sss")
+	if found, err := nssLookup("localonly"); err != nil || found {
+		t.Fatalf("nssLookup(\"localonly\") = %v, %v; want not found and no error for a user absent from sss", found, err)
 	}
 }

@@ -79,6 +79,7 @@ overrides:
       - sssd
       - sssd-ldap
       - sssd-tools
+      - sssd-dbus
 
 # Deterministic output for reproducible builds: nfpm v2.47.0 reads
 # SOURCE_DATE_EPOCH from the environment automatically when `mtime` is

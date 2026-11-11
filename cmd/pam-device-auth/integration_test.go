@@ -63,7 +63,7 @@ func configuredHost(t *testing.T) *config.Config {
 
 func accessMembers(t *testing.T, cfg *config.Config) []string {
 	t.Helper()
-	members, err := getentGroup(cfg.LDAP.AccessGroup)
+	members, _, err := getentGroup(cfg.LDAP.AccessGroup)
 	if err != nil || len(members) == 0 {
 		t.Skipf("access group %q has no resolvable members here: %v", cfg.LDAP.AccessGroup, err)
 	}

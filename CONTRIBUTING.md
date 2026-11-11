@@ -9,7 +9,8 @@ git clone https://github.com/NK-IT-CLOUD/pam-device-auth
 cd pam-device-auth
 
 # Prerequisites
-# - Go 1.26.8 (security-pinned by go.mod)
+# - Go 1.26 or later (go.mod pins the toolchain of the release; the go command
+#   fetches it when the installed one is older)
 # - GCC (for the C PAM module; the Go helper is CGO-free)
 # - libpam0g-dev
 
@@ -86,7 +87,7 @@ groups that the test host lists in its config as `access_group`,
 | `ci-nogroup` | valid key, member of no access group | refused by the access filter |
 | `ci-nokey` | service group, no `sshPublicKey` | refused (key factor) |
 | `ci-badkey` | service group, unparseable `sshPublicKey` | refused (key factor) |
-| `ci-oidc` | member of the access group, valid key | key accepted, then the device flow prompt appears |
+| `ci-oidc` | member of the access group, valid key | key accepted, then the device flow prompt appears; after a disconnect at the prompt no helper process stays behind (checked with `PDA_LOGIN_ROOT`) |
 
 The tests never use these accounts for anything else; give them no group that
 grants access elsewhere. Failed logins arrive in quick succession from one address,
@@ -103,7 +104,8 @@ or the old value stays in effect for up to 10 minutes.
 
 - **Zero external Go dependencies**: pure Go stdlib, CGO-free (`CGO_ENABLED=0`). This is a security-sensitive PAM module; the dependency surface must stay minimal. The only native artifact is the C PAM shim (links `libpam`).
 - Run `go fmt ./...` before committing
-- Run `go vet ./...` to catch issues (`make lint`)
+- Run `make lint` to catch issues: `go vet`, `staticcheck` (fetched at a pinned version with `go run`) and `shellcheck` for the maintainer scripts in `debian/` and the scripts in `packaging/`; `shellcheck` must be installed
+- Run `make analyze` after a change to the C module: one pass with gcc's static analyzer where every warning is an error (gcc 12 or later)
 - Run `go mod verify` to verify the module cache
 - Keep functions focused and testable
 
@@ -116,7 +118,9 @@ internal/
   config/                Config loading + validation
   device/                Device Authorization Grant + token refresh
   discovery/             OIDC Discovery
+  distro/                Supported platforms and their paths, tools and units
   logger/                Structured logging
+  oidccache/             Root-only cache for the discovery document and the JWKS
   qr/                    QR code encoder + terminal renderer
   sshclient/             SSH client version detection (QR auto-detect)
   token/                 JWKS fetch, JWT verification, role extraction
@@ -160,7 +164,7 @@ Go binary stdout          C module                    SSH client
 2. Make your changes
 3. Ensure all tests pass: `make test`
 4. Ensure code is formatted: `make format`
-5. Ensure no lint issues: `make lint`
+5. Ensure no lint issues: `make lint`, and `make analyze` after a change to the C module
 6. Submit a pull request with a clear description of the change
 
 ## Development workflow

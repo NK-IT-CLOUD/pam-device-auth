@@ -1,6 +1,7 @@
 package token
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -147,6 +148,39 @@ func TestValidate_ClockSkewExactBoundaries(t *testing.T) {
 			}
 			if !c.ok && err == nil {
 				t.Errorf("%s = now%+d should be rejected", c.claim, c.offset)
+			}
+		})
+	}
+}
+
+// RFC 7518 ties each ES algorithm to one curve. A key on another curve must be
+// refused by name before any signature math runs.
+func TestValidate_RejectsCurveThatDoesNotMatchAlgorithm(t *testing.T) {
+	for _, c := range []struct {
+		alg   string
+		curve elliptic.Curve
+		want  string
+	}{
+		{"ES256", elliptic.P384(), "requires curve P-256"},
+		{"ES256", elliptic.P521(), "requires curve P-256"},
+		{"ES384", elliptic.P256(), "requires curve P-384"},
+		{"ES512", elliptic.P384(), "requires curve P-521"},
+	} {
+		t.Run(c.alg+" with "+c.curve.Params().Name, func(t *testing.T) {
+			priv, err := ecdsa.GenerateKey(c.curve, rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			size, err := ecdsaCoordinateSize(c.alg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jwt := buildJWT(t, map[string]string{"alg": c.alg, "kid": "k", "typ": "JWT"}, validClaims(),
+				func(string) []byte { return bytes.Repeat([]byte{0x11}, 2*size) })
+			keys := map[string]crypto.PublicKey{"k": &priv.PublicKey}
+			_, err = Validate(jwt, keys, "https://sso.example.com/realms/test", "ssh-server", "", nil)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("Validate() error = %v, want it to say %q", err, c.want)
 			}
 		})
 	}

@@ -49,6 +49,21 @@ var DefaultHTTPTimeout = 10 * time.Second
 // issuer can deliver a body here, so this is defense-in-depth.
 const maxResponseBytes = 1 << 20 // 1 MiB
 
+// maxErrorTextBytes is how much of an answer of the provider goes into an
+// error text, and with it into one line of the helper's log.
+const maxErrorTextBytes = 512
+
+// clip shortens a part of the provider's answer for an error text.
+func clip(s string) string {
+	if len(s) <= maxErrorTextBytes {
+		return s
+	}
+	return fmt.Sprintf("%s… (%d bytes in all)", s[:maxErrorTextBytes], len(s))
+}
+
+// errBodyTooLarge is readResponse's error for a body beyond maxResponseBytes.
+var errBodyTooLarge = fmt.Errorf("response body exceeds %d byte limit", maxResponseBytes)
+
 // readResponse reads a response body up to maxResponseBytes, returning an error
 // if the body exceeds the cap (rather than silently truncating).
 func readResponse(r io.Reader) ([]byte, error) {
@@ -57,7 +72,7 @@ func readResponse(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	if len(body) > maxResponseBytes {
-		return nil, fmt.Errorf("response body exceeds %d byte limit", maxResponseBytes)
+		return nil, errBodyTooLarge
 	}
 	return body, nil
 }
@@ -81,7 +96,7 @@ func RequestCode(ctx context.Context, client *http.Client, endpoint, clientID st
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("device code request failed (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("device code request failed (status %d): %s", resp.StatusCode, clip(string(body)))
 	}
 
 	var dc DeviceCode
@@ -100,11 +115,39 @@ func RequestCode(ctx context.Context, client *http.Client, endpoint, clientID st
 	return &dc, nil
 }
 
-// PollToken polls the token endpoint until authorization completes, is denied, or times out.
+// minRetryBackoff is the shortest wait after a transient failure of the token
+// endpoint. A variable so tests can shrink it.
+var minRetryBackoff = time.Second
+
+// maxRetryBackoff caps the wait after repeated transient failures.
+const maxRetryBackoff = 30 * time.Second
+
+// nextBackoff returns the wait after one more consecutive transient failure:
+// the poll interval first (at least minRetryBackoff), then twice the previous
+// wait, capped at maxRetryBackoff (RFC 8628, section 3.5). The poll interval
+// stays the floor: the cap never makes the helper poll faster than the
+// provider allows.
+func nextBackoff(current, interval time.Duration) time.Duration {
+	if current == 0 {
+		return max(interval, minRetryBackoff)
+	}
+	return max(min(current*2, maxRetryBackoff), interval)
+}
+
+// PollToken polls the token endpoint until authorization completes, is denied,
+// or the context ends. The first request goes out at once: the caller starts
+// polling when the user says the code is approved. After that there is one
+// request per interval.
+//
+// A transport error, an HTTP 5xx, 408 or 429 and an error answer that is no
+// OAuth error document say nothing about the device code. They are retried
+// with a backoff (nextBackoff) until the context ends; the timeout error then
+// names the last such failure.
 func PollToken(ctx context.Context, client *http.Client, endpoint, clientID, deviceCode string, interval int) (*TokenResponse, error) {
 	if interval < MinPollInterval {
 		interval = MinPollInterval
 	}
+	wait := time.Duration(interval) * time.Second
 
 	data := url.Values{
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
@@ -112,27 +155,56 @@ func PollToken(ctx context.Context, client *http.Client, endpoint, clientID, dev
 		"client_id":   {clientID},
 	}
 
-	for {
-		timer := time.NewTimer(time.Duration(interval) * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, fmt.Errorf("device authorization timed out")
-		case <-timer.C:
+	var (
+		backoff     time.Duration // > 0 while transient failures repeat
+		lastFailure error
+	)
+	timedOut := func() error {
+		if lastFailure != nil {
+			return fmt.Errorf("device authorization timed out (last failure: %v)", lastFailure)
+		}
+		return fmt.Errorf("device authorization timed out")
+	}
+	transient := func(err error) {
+		lastFailure = err
+		backoff = nextBackoff(backoff, wait)
+	}
+
+	for first := true; ; first = false {
+		if !first {
+			pause := wait
+			if backoff > 0 {
+				pause = backoff
+			}
+			timer := time.NewTimer(pause)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, timedOut()
+			case <-timer.C:
+			}
 		}
 
 		resp, err := postForm(ctx, client, endpoint, data)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, fmt.Errorf("device authorization timed out")
+				return nil, timedOut()
 			}
-			return nil, fmt.Errorf("poll token: %w", err)
+			transient(fmt.Errorf("poll token: %w", err))
+			continue
 		}
 
 		body, err := readResponse(resp.Body)
 		resp.Body.Close()
-		if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
 			return nil, fmt.Errorf("read token response: %w", err)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, timedOut()
+			}
+			transient(fmt.Errorf("read token response: %w", err))
+			continue
 		}
 
 		if resp.StatusCode == http.StatusOK {
@@ -144,22 +216,24 @@ func PollToken(ctx context.Context, client *http.Client, endpoint, clientID, dev
 		}
 
 		var errResp errorResponse
-		if err := json.Unmarshal(body, &errResp); err != nil {
-			return nil, fmt.Errorf("parse error response (status %d): %w", resp.StatusCode, err)
+		isOAuthError := json.Unmarshal(body, &errResp) == nil && errResp.Error != ""
+		if !isOAuthError || resp.StatusCode >= 500 ||
+			resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests {
+			transient(fmt.Errorf("token endpoint answered status %d", resp.StatusCode))
+			continue
 		}
+		backoff, lastFailure = 0, nil
 
 		switch errResp.Error {
 		case "authorization_pending":
-			continue
 		case "slow_down":
-			interval += 5
-			continue
+			wait += 5 * time.Second
 		case "expired_token":
 			return nil, fmt.Errorf("device code expired")
 		case "access_denied":
 			return nil, fmt.Errorf("access denied by user")
 		default:
-			return nil, fmt.Errorf("token error: %s (%s)", errResp.Error, errResp.ErrorDescription)
+			return nil, fmt.Errorf("token error: %s (%s)", clip(errResp.Error), clip(errResp.ErrorDescription))
 		}
 	}
 }
@@ -198,9 +272,9 @@ func RefreshToken(ctx context.Context, client *http.Client, tokenEndpoint, clien
 		}
 		var errResp errorResponse
 		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != "" {
-			return nil, joinRefreshErr(wrapped, fmt.Sprintf("refresh failed: %s (%s)", errResp.Error, errResp.ErrorDescription))
+			return nil, joinRefreshErr(wrapped, fmt.Sprintf("refresh failed: %s (%s)", clip(errResp.Error), clip(errResp.ErrorDescription)))
 		}
-		return nil, joinRefreshErr(wrapped, fmt.Sprintf("refresh failed (status %d): %s", resp.StatusCode, string(body)))
+		return nil, joinRefreshErr(wrapped, fmt.Sprintf("refresh failed (status %d): %s", resp.StatusCode, clip(string(body))))
 	}
 
 	var token TokenResponse

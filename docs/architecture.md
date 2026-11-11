@@ -131,7 +131,8 @@ sshd ──► pam.so ──► helper:
   cache.Load(user)             → session missing / IP unknown
   Device Authorization Grant   → URL + user_code + verification_uri_complete
   print "Link / Code / QR" to SSH terminal (FLUSH)
-  poll token endpoint (≤ cfg.AuthTimeout, default 180 s)
+  wait for Enter               → no answer (client gone): exit 1
+  poll token endpoint (≤ cfg.AuthTimeout, default 180 s, first request at once)
   JWT validate                 → ok
   token.username == sshUser    → ok
   role check                   → ssh-access present
@@ -145,19 +146,25 @@ helper does not provision users or groups.
 
 ### 3 · Role / access revocation
 
-At token validation the helper checks `HasRole(result.Roles,
+After token validation the helper checks `HasRole(result.Roles,
 cfg.RequiredRole)`. If the role is gone:
 
 ```
-  log.Error("access denied: lacks required role …")
-  cache.Delete(sshUser)
+  cached login (flow 1):
+    log.Error("Directory: access revoked for <user> on known IP <ip>: …")
+    cache.Delete(sshUser)
+  device login (flow 2):
+    log.Error("Directory: access denied for <user>: …")
   print "Access denied: '<user>' lacks required role '<role>'."
   exit 2                        → hard deny (sshd won't retry)
 ```
 
-A token whose `acr` is missing or not in `required_acr` is denied the same way,
-with the reason `the token carries no authentication level (acr)` or
-`authentication level "<acr>" is not accepted`.
+After the device flow a token whose `acr` is missing or not in `required_acr`
+is denied the same way, with the reason
+`the token carries no authentication level (acr)` or
+`authentication level "<acr>" is not accepted`. In the cached login the same
+finding is no denial: the helper removes the cached session and goes on with
+flow 2, where a new sign-in can reach the level.
 
 Independently, SSSD's access control (`ldap_access_filter`, or
 `simple_allow_groups` with the `ad` profile) denies `pam_sss` for login/sudo once
@@ -165,13 +172,14 @@ the user is removed from the group. No `usermod` is involved.
 
 ### 4 · OIDC transient failure on the fast path
 
-Between a found cache and a fresh access token, several things can go wrong
-(refresh rejected, JWKS unreachable, token parse fails):
+Between a found cache and a fresh access token, several things can go wrong.
+Every one of them is logged at WARN and leads to flow 2; what happens to the
+cached session depends on what the failure says about it:
 
 ```
-  RefreshToken → fails (or JWKS/validate fails)
-  log.Warn(…)
-  cache.Delete(sshUser)
+  RefreshToken → rejected by the IdP (HTTP 4xx except 408, 429)  → cache.Delete
+  RefreshToken → network error, HTTP 5xx, 408 or 429             → cache kept
+  JWKS fetch or token validation fails after the refresh         → cache.Delete
   fall through to flow 2 (full device auth)
 ```
 
@@ -196,7 +204,8 @@ directory-provided `clients` source-IP/CIDR allowlist:
    PAM conversation, so no pipes are wired to the child beyond the closed
    fd table; the module only waits for an exit code.
 3. The helper (`cmd/pam-device-auth/acct.go`) opens its log first. If it
-   cannot open `/var/log/pam-device-auth.log` or set it to `0640`, there is no
+   cannot open `/var/log/pam-device-auth.log`, finds no regular file there or
+   cannot remove mode bits beyond `0640`, there is no
    audit log for the decision: it sends the reason to syslog (`authpriv`,
    tag `pam-device-auth`, ending in `; denying`) and exits 3 without reading
    `clients`. Otherwise it reads the user's `clients`
@@ -259,9 +268,22 @@ has no user interaction to wait on. On the auth-phase deadline:
 5. helper program timed out after 300 s → `PAM_SYSTEM_ERR`
 
 There is **no** `SIGALRM` or process-global state; all deadline state is
-stack-local per PAM call. This matters because sshd can call
-`pam_sm_authenticate` concurrently for multiplexed sessions in the same
-process.
+stack-local per PAM call. sshd runs the PAM conversation of each connection in
+a process of its own, so two logins never share one. The module relies on that
+in one place: it hands the user name and the client address to the helper
+through the environment of that process.
+
+sshd has its own limit for the whole login, `LoginGraceTime` (default 120 s,
+counted from the moment the connection is opened). It is shorter than the
+300 s above and, with the defaults, shorter than `auth_timeout`; when it
+expires, sshd ends the login and the helper with it
+([configuration reference](configuration-reference.md#auth_timeout)).
+
+Both children of the module (auth phase and account phase) ask the kernel for
+`SIGTERM` when the process that started them ends (`PR_SET_PDEATHSIG`). A
+helper therefore ends when its sshd process ends, for example when the SSH
+client disconnects while the helper waits for the approval. A helper that
+waits at the prompt also stops by itself when its input closes.
 
 ### Exit codes (auth phase)
 
@@ -272,14 +294,15 @@ uses 3 for an unusable log) is treated as an infrastructure failure and
 denies (see [Account phase](#account-phase-the-clients-ip-gate) above).
 
 Before the auth-phase helper does anything else it opens its log; if it
-cannot open it or set it to `0640`, it reports the reason to syslog
+cannot open it, finds no regular file at the path or cannot remove mode bits
+beyond `0640`, it reports the reason to syslog
 (`authpriv`, `...; denying login (fail closed)`) and exits 1 (`PAM_AUTH_ERR`).
 
 | Helper exit | PAM result | Meaning |
 |---|---|---|
 | 0 | `PAM_SUCCESS` | Authenticated |
-| 2 | `PAM_MAXTRIES` | Hard deny: required role or accepted `acr` missing, or the role revoked; sshd does not retry |
-| other | `PAM_AUTH_ERR` | Soft failure (user cancelled, bad password, timeout at device endpoint) |
+| 2 | `PAM_MAXTRIES` | Hard deny: no directory identity for the login name (also when the SSSD lookup fails), required role missing or revoked, or after the device flow an `acr` that is missing or not accepted; sshd does not retry |
+| other | `PAM_AUTH_ERR` | Soft failure: the device flow failed or timed out, the token did not validate, the SSH client went away at the prompt, a config error, an unusable log |
 | killed / timed-out | `PAM_SYSTEM_ERR` | Infrastructure failure |
 
 ## Session cache
@@ -295,11 +318,16 @@ cannot open it or set it to `0640`, it reports the reason to syslog
 }
 ```
 
+- The file name is the user name with every byte outside `[A-Za-z0-9_-]`
+  written as `%XX`: `alice.json`, `john%2Edoe.json` for `john.doe`. Every name
+  of up to 64 bytes has a session, and no name can leave the directory
 - Written atomically (`os.Rename` from a tmpfile)
 - `KnownIPs` capped at 20, FIFO eviction
 - `tmpfiles.d` recreates the directory on boot; sessions do not survive reboot
-- On role revocation or explicit denial, `cache.Delete` removes the file
-  before exiting
+- `cache.Delete` removes the file when the cached login finds the role gone,
+  the identity provider rejects the refresh token, the refreshed token does
+  not validate or does not meet `required_acr`, the file is corrupt, and when
+  a device login ends without a refresh token
 
 ## Token validation guarantees
 
@@ -311,11 +339,14 @@ cannot open it or set it to `0640`, it reports the reason to syslog
 3. Header `kid` is non-empty and present in the JWKS map (empty-kid
    collision prevented at both fetch and verify)
 4. Signature verifies under the matched key (algorithm-key type binding:
-   RS* requires RSA, ES* requires ECDSA in raw JWS r||s form)
+   RS* requires RSA, ES* requires ECDSA in raw JWS r||s form with the key on
+   the curve of the algorithm: P-256 for ES256, P-384 for ES384, P-521 for
+   ES512)
 5. Issuer equals configured `issuer_url`
 6. `azp` matches `client_id`; else `aud` contains `client_id`
-7. `exp` is in the future; `nbf` (if present) is in the past
-8. `iat` (if present) is not more than 60 s in the future
+7. `exp` is present and in the future; `nbf` (if present) is in the past
+8. `iat` is present and not in the future (all three with 60 s of clock skew
+   allowed)
 9. `preferred_username` is present
 10. Roles extracted from `realm_access.roles` + `resource_access.<client>.roles`
     (or from a custom `role_claim` path); `required_role` membership enforced
@@ -327,6 +358,8 @@ phase, not during token validation; see [ip-allowlist.md](ip-allowlist.md).
 
 Violation at any step is logged and the helper exits 1 (soft fail) or 2
 (hard deny for a missing role or an `acr` that is missing or not accepted).
+One exception: when a refreshed token of the cached login fails the `acr`
+check, the helper drops the cached session and starts the device flow.
 
 ## Process security
 
@@ -339,5 +372,6 @@ Violation at any step is logged and the helper exits 1 (soft fail) or 2
   secret-input path
 - `SIGPIPE` is ignored in the PAM parent to prevent the helper's exit from
   killing sshd
+- The helper ends with the sshd process that started it (`PR_SET_PDEATHSIG`)
 - No `setuid` helpers; no world-writable paths; cache dir is `0700`, config
   is `0600`, log is `0640 root:adm`

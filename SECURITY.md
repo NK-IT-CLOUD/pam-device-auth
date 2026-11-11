@@ -38,14 +38,17 @@ has running processes.
   depends on the directory or OIDC provider being reachable.
 - **OIDC token validation**: JWT signatures verified via JWKS; issuer
   cross-validated against discovery to prevent MITM; audience, expiry,
-  not-before and issued-at claims checked on every token (60 s clock-skew
-  tolerance on `iat`). Re-validated on the silent cached-refresh path too.
+  not-before and issued-at claims checked on every token (`exp` and `iat` are
+  required; 60 s of clock skew are tolerated). Re-validated on the silent
+  cached-refresh path too.
 - **Authentication level**: with `required_acr`, a token whose `acr` claim is
-  missing or not in the list is denied, after the device flow and after every
-  refresh.
+  missing or not in the list is never accepted. After the device flow the
+  login is denied; after a refresh the cached session is dropped and the
+  device flow starts.
 - **JWT algorithm/key-type binding**: RS256/384/512 requires RSA keys,
-  ES256/384/512 requires EC keys; `alg=none` and HMAC rejected; prevents
-  key-confusion. `allowed_algorithms` pins the accepted set.
+  ES256/384/512 requires EC keys on the curve of the algorithm (P-256, P-384,
+  P-521); `alg=none` and HMAC rejected; prevents key-confusion.
+  `allowed_algorithms` pins the accepted set.
 - **JWT `kid` collision closed**: JWK entries with empty `kid` are dropped at
   JWKS fetch, and JWT headers without `kid` are rejected at verification.
 - **OIDC endpoint transport enforcement**: production discovery, token, device
@@ -81,18 +84,27 @@ has running processes.
   unbounded cache growth.
 - **Cache in tmpfs**: refresh tokens stored in `/run/pam-device-auth/`
   (mode 0700 root:root), cleared on reboot; atomic writes prevent partial reads.
-  The cached-refresh fast path still requires the SSH key factor.
+  The cached-refresh fast path still requires the SSH key factor. From a known
+  address it needs no new approval while the session at the identity provider
+  lives: the helper refreshes the token and validates it again, so a revoked
+  session or role ends it at the next login.
 - **PAM module hardening**: fork/exec with bidirectional pipes (no popen, no
   shell), `clearenv` + whitelisted env, inherited-fd cleanup, `pipe2(O_CLOEXEC)`,
-  `strtok_r`, SIGPIPE handling, symlink-protected (`O_NOFOLLOW`) log opening,
-  sanitized log output (no tokens or unsanitized user input).
-- **Reentrant per-call deadline**: a single monotonic-clock deadline
-  (stack-local, no process globals, no SIGALRM) covers the full child lifecycle:
-  pipe reads via `poll()` and final `waitpid`. Concurrent PAM invocations in the
-  same sshd process cannot interfere; a child that hangs is killed and reaped.
-- **Log file perms `0640 root:adm`**: log contains PII (usernames, emails,
-  IPs, roles); tightened via postinst, logrotate, the Go logger `Chmod`, and
-  `O_NOFOLLOW` in the C module.
+  SIGPIPE handling, symlink-protected (`O_NOFOLLOW`) log opening,
+  sanitized log output (no tokens or unsanitized user input). The helper ends
+  with the sshd process that started it (`PR_SET_PDEATHSIG`), and it stops when
+  the SSH client goes away at the prompt.
+- **Per-call deadline**: a single monotonic-clock deadline (stack-local, no
+  process globals, no SIGALRM) covers the full child lifecycle: pipe reads via
+  `poll()` and final `waitpid`. A child that hangs is killed and reaped. sshd
+  runs the PAM conversation of each connection in a process of its own.
+- **Log file `0640 root:adm`, regular file only**: the log contains PII
+  (usernames, emails, IPs, roles). The helper and the C module open it with
+  `O_NOFOLLOW` and `O_NONBLOCK` and write only to a regular file, so a
+  symlink, a FIFO or a directory planted at the path is refused instead of
+  followed or blocked on; mode bits beyond `0640` are removed. The package
+  prepares the file through the helper (`--prepare-log`) on the open file,
+  never through `chmod`/`chown` on the path. logrotate creates `0640 root adm`.
 - **Setup-time injection guard**: `--setup-ldap` writes `/etc/sssd/sssd.conf`
   (0600 root). It rejects control characters in every `ldap` value, the bind
   password and the content of `bind_password_file` included, and
@@ -120,6 +132,14 @@ The security guarantees above depend on correct deployment:
   In Active Directory, users can write the *Personal Information* attributes of
   their own account by default; see
   [docs/active-directory-setup.md](docs/active-directory-setup.md#who-can-write-the-key-and-the-allowlist).
+- Make sure users cannot change the user name that the identity provider puts
+  into `preferred_username`, and that it names the same person as the
+  directory account of that name. The helper accepts a token only for the SSH
+  login name equal to this claim; that comparison is the only link between the
+  two accounts. Where users can rename themselves, an account that carries the
+  required role can pass the OIDC step for somebody else's login name. In
+  Keycloak leave **Edit username** off
+  ([docs/keycloak-setup.md](docs/keycloak-setup.md#user-names)).
 - Keep the OIDC provider, directory, host OS and SSH keys trusted and patched.
 - Pin `allowed_algorithms` to the algorithm used by the provider.
 - Review every `pam-device-auth --check` warning before activation.
@@ -162,10 +182,10 @@ The security guarantees above depend on correct deployment:
 | sudoers left behind after removal | postrm deletes `/etc/sudoers.d/pam-device-auth` on both remove and purge, on deb and rpm. |
 | Access revocation | Remove directory access membership and its mapped OIDC role; new login is denied after the relevant SSSD/provider caches update. Existing sessions require separate termination. |
 | Log exfiltration | No tokens, passwords, or unsanitized user input in logs; log file `0640 root:adm`; `O_NOFOLLOW`. |
-| Child process hang | Per-call monotonic deadline covering pipe reads + waitpid; reentrant under concurrent sshd auth calls. |
+| Child process hang | Per-call monotonic deadline covering pipe reads + waitpid; the helper ends with the sshd process that started it. |
 | Shell injection via PAM | No shell in auth path: fork/exec with pipes, no popen(). |
 | sssd.conf injection via config | `--setup-ldap` rejects control characters in every `ldap` value (bind password and `bind_password_file` content included) and LDAP-filter metacharacters in the base DNs and group names. |
-| Token accepted outside its validity window | Required `exp`, optional `nbf`, and required `iat` are checked; `iat` permits at most 60 seconds of future clock skew. |
+| Token accepted outside its validity window | Required `exp`, optional `nbf`, and required `iat` are checked, each with at most 60 seconds of clock skew. |
 
 ### Out of scope
 

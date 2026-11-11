@@ -31,7 +31,9 @@ configuration from the `ldap` block of `config.json` with `"profile": "ad"`;
 - **Login names.** The login name is the user's `sAMAccountName` (or the
   attribute in `attributes.username`), in lower case. The access token's
   `preferred_username` must be the same name: with Keycloak's LDAP federation,
-  set *Username LDAP attribute* to `sAMAccountName`.
+  set *Username LDAP attribute* to `sAMAccountName`. Users must not be able to
+  change that name at the identity provider
+  ([keycloak-setup.md](keycloak-setup.md#user-names)).
 
 ### Who can write the key and the allowlist
 
@@ -252,7 +254,8 @@ profiles.
 another UID (local UIDs 1000 to 64999): it removes the local entry, keeps the
 home directory, re-owns the files that belonged to the old IDs (home below
 `/home`, mail spool, crontab) and puts the user back into its local groups
-except `sudo`, `admin` and `wheel`. An account with running processes is skipped
+except the privileged ones (`sudo`, `admin`, `wheel`, `root`, `adm`, `shadow`,
+`disk`, `staff`, `docker`, `lxd`, `incus`, `libvirt`). An account with running processes is skipped
 with a warning; stop them and run `--setup-ldap` again. No process is killed.
 `--check` lists each such account as a `[WARN]` with what `--setup-ldap` will do
 (migrate, with the groups it keeps and the home it re-owns, or skip because of

@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +81,60 @@ func TestParseECKey_RejectsOffCurvePoint(t *testing.T) {
 	offY := new(big.Int).Add(priv.Y, big.NewInt(1)) // perturb Y -> off curve
 	if _, err := parseECKey(ecJWK(elliptic.P256(), priv.X, offY)); err == nil {
 		t.Error("off-curve EC point should be rejected")
+	}
+}
+
+// A JWK coordinate is the unsigned big-endian value. Leading zero bytes do not
+// change it: a coordinate with one left out and one with an extra one give the
+// same key. A value that does not fit the curve size is refused.
+func TestParseECKey_CoordinateLength(t *testing.T) {
+	// A key whose X starts with a zero byte, so the short form is 31 bytes.
+	var priv *ecdsa.PrivateKey
+	for i := 0; ; i++ {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k.X.BitLen() <= 248 {
+			priv = k
+			break
+		}
+		if i > 100000 {
+			t.Fatal("no key with a short X coordinate found")
+		}
+	}
+	full := ecJWK(elliptic.P256(), priv.X, priv.Y)
+	if _, err := parseECKey(full); err != nil {
+		t.Fatalf("full-length coordinates rejected: %v", err)
+	}
+
+	short := full
+	short.X = base64.RawURLEncoding.EncodeToString(priv.X.Bytes()) // 31 bytes or fewer
+	key, err := parseECKey(short)
+	if err != nil {
+		t.Fatalf("a coordinate without its leading zero byte was rejected: %v", err)
+	}
+	if !key.Equal(&priv.PublicKey) {
+		t.Error("the padded key differs from the original")
+	}
+
+	padded := full
+	xb := make([]byte, 33) // one zero byte in front
+	priv.X.FillBytes(xb)
+	padded.X = base64.RawURLEncoding.EncodeToString(xb)
+	key, err = parseECKey(padded)
+	if err != nil {
+		t.Fatalf("a coordinate with an extra leading zero byte was rejected: %v", err)
+	}
+	if !key.Equal(&priv.PublicKey) {
+		t.Error("the key from the zero-padded coordinate differs from the original")
+	}
+
+	tooLarge := full
+	xb[0] = 1 // 33 significant bytes: no P-256 field element
+	tooLarge.X = base64.RawURLEncoding.EncodeToString(xb)
+	_, err = parseECKey(tooLarge)
+	if err == nil || !strings.Contains(err.Error(), "longer than 32 bytes") {
+		t.Errorf("a coordinate of 33 significant bytes for P-256: err = %v, want the length error", err)
 	}
 }

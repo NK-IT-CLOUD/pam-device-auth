@@ -68,17 +68,104 @@ func (l LogLevel) String() string {
 type Logger struct {
 	level  LogLevel
 	logger *log.Logger
-	debug  bool
 	file   *os.File // track file handle for cleanup
 }
 
-// chmodLog sets the opened log file to 0640; a variable so tests can make it fail.
-var chmodLog = func(f *os.File) error { return f.Chmod(0640) }
+// logFileMode is the widest mode of the log file: owner rw, group r. The log
+// contains PII (usernames, emails, IPs, roles) and must not be world-readable;
+// the C PAM module creates it with the same mode.
+const logFileMode os.FileMode = 0640
 
-// ErrLogMode marks a NewLogger failure where the log file opened but its mode
-// could not be read, or was not 0640 and could not be set to 0640. The
-// wrapped *os.PathError names the operation and the path.
+// chmodLog sets the mode of the opened log file; a variable so tests can make
+// it fail.
+var chmodLog = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
+
+// chownLog sets owner and group of the opened log file; a variable so tests
+// can watch it and make it fail.
+var chownLog = func(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
+
+// ErrLogMode marks a failure where the log file opened but its mode could not
+// be read, or had bits beyond 0640 that could not be removed. The wrapped
+// *os.PathError names the operation and the path.
 var ErrLogMode = errors.New("cannot set log file mode 0640")
+
+// ErrLogNotRegular marks a log path that is no regular file: a symbolic link,
+// a FIFO, a directory or a device.
+var ErrLogNotRegular = errors.New("log path is not a regular file")
+
+// openLog opens the log file for appending, creating it with logFileMode, and
+// returns it only when it is a regular file without mode bits beyond
+// logFileMode.
+//
+// O_NOFOLLOW refuses a symlink at the path, which would redirect a
+// root-written log. O_NONBLOCK makes opening a FIFO fail at once instead of
+// blocking the login until someone reads it; it changes nothing for a regular
+// file. Whatever opens nevertheless (a FIFO that has a reader, a device) is
+// refused after fstat.
+//
+// Mode bits beyond logFileMode are removed (a log of an earlier version may
+// have 0644). A stricter mode stays, and a log with a fitting mode is never
+// chmod-ed, so an append-only log keeps working. Excess bits that cannot be
+// removed are a misconfiguration: fail instead of writing PII into the file.
+func openLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, logFileMode)
+	switch {
+	case errors.Is(err, syscall.ELOOP):
+		return nil, fmt.Errorf("%w: %s is a symbolic link", ErrLogNotRegular, path)
+	case errors.Is(err, syscall.ENXIO):
+		return nil, fmt.Errorf("%w: %s is a FIFO or a device", ErrLogNotRegular, path)
+	case errors.Is(err, syscall.EISDIR):
+		return nil, fmt.Errorf("%w: %s is a directory", ErrLogNotRegular, path)
+	case err != nil:
+		return nil, fmt.Errorf("failed to open log file: %v", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%w: %w", ErrLogMode, err)
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%w: %s is a %s", ErrLogNotRegular, path, fi.Mode().Type())
+	}
+	if perm := fi.Mode().Perm(); perm&^logFileMode != 0 {
+		if err := chmodLog(f, perm&logFileMode); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("%w: %w", ErrLogMode, err)
+		}
+	}
+	return f, nil
+}
+
+// PrepareLog creates the log file, or brings an existing one under the rules
+// of openLog, and with gid >= 0 gives it to the current user and that group.
+// The package's post-install script runs it through `--prepare-log`: every
+// step works on the open file, where touch, chmod and chown would follow a
+// symlink planted at the path.
+//
+// A log that already has that owner and group is not chown-ed: like chmod,
+// chown fails on an append-only file even when it changes nothing, and such a
+// log must not break a package upgrade.
+func PrepareLog(path string, gid int) error {
+	f, err := openLog(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if gid >= 0 {
+		uid := os.Geteuid()
+		fi, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("cannot read the owner of the log file: %w", err)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != uid || int(st.Gid) != gid {
+			if err := chownLog(f, uid, gid); err != nil {
+				return fmt.Errorf("cannot set the owner of the log file: %w", err)
+			}
+		}
+	}
+	return nil
+}
 
 // NewLogger creates a new logger instance
 func NewLogger(logFile string, debug bool) (*Logger, error) {
@@ -86,32 +173,9 @@ func NewLogger(logFile string, debug bool) (*Logger, error) {
 	var logFileHandle *os.File
 
 	if logFile != "" {
-		// 0640 (owner rw, group r) matches the C PAM module which writes to the
-		// same log file. Log contains PII (usernames, emails, IPs, roles) and
-		// must not be world-readable. The `adm` group can read via logrotate.
-		// O_NOFOLLOW: refuse to open the log if its final path component is a
-		// symlink (defeats a pre-created-symlink redirect of a root-written log).
-		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0640)
+		f, err := openLog(logFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open log file: %v", err)
-		}
-		// Defensive tightening for upgrades: existing log files created with
-		// earlier versions may have 0644. O_CREATE's mode only applies on
-		// creation, so check the mode here and chmod only when it is not
-		// 0640: a log with the right mode is never chmod-ed (an append-only
-		// log, where chmod fails, keeps working). A wrong mode that cannot be
-		// corrected (append-only file, a filesystem without chmod support) is
-		// a misconfiguration: fail instead of writing PII into it.
-		fi, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("%w: %w", ErrLogMode, err)
-		}
-		if fi.Mode().Perm() != 0640 {
-			if err := chmodLog(f); err != nil {
-				f.Close()
-				return nil, fmt.Errorf("%w: %w", ErrLogMode, err)
-			}
+			return nil, err
 		}
 		writer = f
 		logFileHandle = f
@@ -127,14 +191,8 @@ func NewLogger(logFile string, debug bool) (*Logger, error) {
 	return &Logger{
 		level:  level,
 		logger: logger,
-		debug:  debug,
 		file:   logFileHandle,
 	}, nil
-}
-
-// SetLevel sets the minimum log level
-func (l *Logger) SetLevel(level LogLevel) {
-	l.level = level
 }
 
 // Debug logs a debug message
@@ -171,24 +229,6 @@ func (l *Logger) log(level LogLevel, format string, v ...interface{}) {
 	message := sanitizeLog(fmt.Sprintf(format, v...))
 	logLine := fmt.Sprintf("%s [AUTH]   %-5s %s", timestamp, level.String(), message)
 	l.logger.Println(logLine)
-}
-
-// LogPhase logs a phase marker for easier log parsing
-func (l *Logger) LogPhase(phase string) {
-	l.Info("=== PHASE: %s ===", phase)
-}
-
-// LogSummary logs a summary section
-func (l *Logger) LogSummary(title string, items map[string]string) {
-	l.Info("=== %s ===", title)
-	for key, value := range items {
-		l.Info("- %s: %s", key, value)
-	}
-}
-
-// IsDebugEnabled returns true if debug logging is enabled
-func (l *Logger) IsDebugEnabled() bool {
-	return l.debug
 }
 
 // Close closes the logger's file handle if one was opened
