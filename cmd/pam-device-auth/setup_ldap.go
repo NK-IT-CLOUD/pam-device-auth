@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -917,13 +918,11 @@ func wireMkhomedir(prof distro.Profile, run commandRunner) error {
 			return fmt.Errorf("authselect %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 		}
 		// pam_oddjob_mkhomedir asks oddjobd to create the home directory.
-		// There is no authselect rollback: the error names what is left behind.
+		// There is no authselect rollback: the error names what is left behind
+		// (args is "select", the profile with its features, "--force").
 		if out, err := run("systemctl", "enable", "--now", "oddjobd"); err != nil {
-			left := `the authselect profile "sssd with-mkhomedir" stays selected`
-			if args[0] == "enable-feature" {
-				left = "the authselect feature with-mkhomedir stays enabled"
-			}
-			return fmt.Errorf("systemctl enable --now oddjobd: %s: %w; %s", strings.TrimSpace(string(out)), err, left)
+			return fmt.Errorf("systemctl enable --now oddjobd: %s: %w; the authselect profile %q stays selected",
+				strings.TrimSpace(string(out)), err, strings.Join(args[1:len(args)-1], " "))
 		}
 		fmt.Println("SSSD PAM/nsswitch wired via authselect (with mkhomedir)")
 	default:
@@ -945,21 +944,33 @@ func authselectCurrent(run commandRunner) string {
 }
 
 // authselectPlan decides from the output of `authselect current --raw` (the
-// profile, then its features) how pam_oddjob_mkhomedir gets wired.
+// profile, then its features) how pam_oddjob_mkhomedir gets wired. The plan is
+// always `select sssd <features> --force`: that is what wires pam_sss into
+// system-auth/password-auth (which the sshd PAM template includes) and
+// nsswitch.
 //
-// With the sssd profile active only the feature is added: the features the
-// host has (with-faillock, with-sudo) stay. Everything else, also no profile at
-// all, gets `select sssd with-mkhomedir --force`: that is what wires pam_sss
-// into system-auth/password-auth (which the sshd PAM template includes) and
-// nsswitch, and --force overwrites a stock profile so the setup runs
-// headless. replaced names the profile this throws away, "" when there was
-// none.
+// With the sssd profile active the features the host has (with-faillock,
+// with-sudo) are selected again, with with-mkhomedir added once: they stay.
+// Everything else, also no profile at all, becomes `sssd with-mkhomedir`;
+// replaced names the profile this throws away, "" when there was none.
+//
+// --force is needed on every run, not only to overwrite a stock profile:
+// ensureNsswitchSSS writes /etc/nsswitch.conf where the profile leaves sss out
+// of a line, which replaces authselect's symlink by a regular file. authselect
+// 1.2 (RHEL 9) then refuses every command without --force
+// ("[/etc/nsswitch.conf] was not created by authselect!"), `enable-feature`
+// included. authselect keeps a backup of the files it overwrites.
 func authselectPlan(currentRaw string) (args []string, replaced string) {
 	current := strings.TrimSpace(currentRaw)
+	features := []string{"with-mkhomedir"}
 	if f := strings.Fields(current); len(f) > 0 && f[0] == "sssd" {
-		return []string{"enable-feature", "with-mkhomedir"}, ""
+		current = ""
+		if features = f[1:]; !slices.Contains(features, "with-mkhomedir") {
+			features = append(features, "with-mkhomedir")
+		}
 	}
-	return []string{"select", "sssd", "with-mkhomedir", "--force"}, current
+	args = append([]string{"select", "sssd"}, features...)
+	return append(args, "--force"), current
 }
 
 // sssdEnabledNote, sssdEnableUnknownNote and sssdMaskedNote are the entries

@@ -22,10 +22,16 @@ Active Directory, see [active-directory-setup.md](active-directory-setup.md).
 4. **SSSD packages**: `sssd-ldap libnss-sss libpam-sss sssd-dbus sssd-tools` on Debian/Ubuntu,
    `sssd sssd-ldap sssd-tools sssd-dbus authselect oddjob-mkhomedir` on Rocky
    Linux and Fedora (`--setup-ldap` installs them if missing). On Rocky Linux
-   and Fedora `--setup-ldap` wires PAM and NSS through authselect: when the
-   `sssd` profile is active it only adds the feature `with-mkhomedir`, so
+   and Fedora `--setup-ldap` wires PAM and NSS through authselect
+   (`authselect select sssd … --force`): when the `sssd` profile is active it
+   selects it again with the features it has plus `with-mkhomedir`, so
    features such as `with-faillock` stay; any other profile is replaced by
    `sssd with-mkhomedir`, and the setup prints the profile it replaced.
+   `--force` is part of every run: the setup itself adds `sss` to
+   `/etc/nsswitch.conf` where the profile leaves it out, and authselect counts
+   that as a change made outside of it. Changes made by hand to the files
+   authselect manages are overwritten; authselect keeps a backup of them under
+   `/var/lib/authselect/backups/`.
    `sssd-dbus` provides the SSSD
    InfoPipe (`ifp`) responder. Without it sssd does not start, because `--setup-ldap`
    enables `ifp` in `sssd.conf`; `--check` reports a missing responder as a blocker.

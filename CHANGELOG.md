@@ -112,11 +112,12 @@ are; an upgrade needs no manual step.
   directory in this setup. `--setup-ldap` and the preview of `--check` name
   the groups that are not carried over.
 - On Rocky Linux and Fedora `--setup-ldap` keeps the authselect features of
-  a host that already uses the `sssd` profile (`with-faillock`, `with-sudo`)
-  and adds `with-mkhomedir` to them. Before, it always ran
-  `authselect select sssd with-mkhomedir --force`, which dropped every other
-  feature without a word. Another profile is still replaced, and the setup
-  prints which one: `authselect: replacing profile "winbind"`.
+  a host that already uses the `sssd` profile (`with-faillock`, `with-sudo`):
+  it selects the profile again with these features and `with-mkhomedir`.
+  Before, it always ran `authselect select sssd with-mkhomedir --force`,
+  which dropped every other feature without a word. Another profile is still
+  replaced, and the setup prints which one:
+  `authselect: replacing profile "winbind"`.
 - An `ES256`, `ES384` or `ES512` token passes only with a key on the curve of
   that algorithm (P-256, P-384, P-521; RFC 7518). Before, the verifier tied
   only the signature length to the algorithm. The log names the mismatch:

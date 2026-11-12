@@ -1815,15 +1815,22 @@ func TestWireMkhomedirFailureIsError(t *testing.T) {
 }
 
 // authselectPlan reads the active profile from `authselect current --raw`. An
-// sssd profile keeps the features it has (with-faillock, with-sudo): only
-// with-mkhomedir is added. Everything else is replaced, and the replaced
-// profile is named so the setup can print it.
+// sssd profile keeps the features it has (with-faillock, with-sudo): they are
+// selected again, with with-mkhomedir added once. Everything else is replaced,
+// and the replaced profile is named so the setup can print it.
+//
+// Every plan carries --force. The setup writes /etc/nsswitch.conf itself where
+// the profile leaves sss out of a line, which replaces authselect's symlink;
+// authselect 1.2 (RHEL 9) then refuses every command without --force
+// ("[/etc/nsswitch.conf] was not created by authselect!"), `enable-feature`
+// included, so the second --setup-ldap of a host failed.
 func TestAuthselectPlan(t *testing.T) {
-	enable := "enable-feature with-mkhomedir"
 	selectSSSD := "select sssd with-mkhomedir --force"
 	for _, c := range []struct{ current, wantArgs, wantReplaced string }{
-		{"sssd with-faillock with-sudo\n", enable, ""},
-		{"sssd\n", enable, ""},
+		{"sssd with-faillock with-sudo\n", "select sssd with-faillock with-sudo with-mkhomedir --force", ""},
+		{"sssd with-mkhomedir with-faillock\n", "select sssd with-mkhomedir with-faillock --force", ""},
+		{"sssd with-mkhomedir\n", selectSSSD, ""},
+		{"sssd\n", selectSSSD, ""},
 		{"winbind with-mkhomedir\n", selectSSSD, "winbind with-mkhomedir"},
 		{"custom/corp with-faillock\n", selectSSSD, "custom/corp with-faillock"},
 		{"", selectSSSD, ""},
@@ -1838,7 +1845,7 @@ func TestAuthselectPlan(t *testing.T) {
 func TestWireMkhomedirCommands(t *testing.T) {
 	const current = "authselect current --raw"
 	const selectCmd = "authselect select sssd with-mkhomedir --force"
-	const enableCmd = "authselect enable-feature with-mkhomedir"
+	const keepCmd = "authselect select sssd with-faillock with-mkhomedir --force"
 	const oddjobd = "systemctl enable --now oddjobd"
 	boom := fmt.Errorf("exit status 1")
 	cases := []struct {
@@ -1851,11 +1858,12 @@ func TestWireMkhomedirCommands(t *testing.T) {
 	}{
 		{"debian ok", "pam-auth-update", nil, nil, []string{"pam-auth-update --enable mkhomedir"}, ""},
 		{"rhel, no profile yet", "authselect", map[string]error{current: boom}, nil, []string{current, selectCmd, oddjobd}, ""},
-		{"rhel, an sssd profile keeps its features", "authselect", nil, map[string]string{current: "sssd with-faillock\n"}, []string{current, enableCmd, oddjobd}, ""},
+		{"rhel, an sssd profile keeps its features", "authselect", nil, map[string]string{current: "sssd with-faillock\n"}, []string{current, keepCmd, oddjobd}, ""},
 		{"rhel, another profile is replaced", "authselect", nil, map[string]string{current: "winbind\n"}, []string{current, selectCmd, oddjobd}, ""},
 		{"rhel select fails, oddjobd not started", "authselect", map[string]error{selectCmd: boom}, nil, []string{current, selectCmd}, "authselect select"},
-		{"rhel enable-feature fails, oddjobd not started", "authselect", map[string]error{enableCmd: boom}, map[string]string{current: "sssd\n"}, []string{current, enableCmd}, "authselect enable-feature"},
-		{"rhel oddjobd fails", "authselect", map[string]error{oddjobd: boom}, nil, []string{current, selectCmd, oddjobd}, "oddjobd"},
+		{"rhel select with the kept features fails, oddjobd not started", "authselect", map[string]error{keepCmd: boom}, map[string]string{current: "sssd with-faillock\n"}, []string{current, keepCmd}, keepCmd},
+		{"rhel oddjobd fails", "authselect", map[string]error{oddjobd: boom}, nil, []string{current, selectCmd, oddjobd}, `the authselect profile "sssd with-mkhomedir" stays selected`},
+		{"rhel oddjobd fails with kept features", "authselect", map[string]error{oddjobd: boom}, map[string]string{current: "sssd with-faillock\n"}, []string{current, keepCmd, oddjobd}, `the authselect profile "sssd with-faillock with-mkhomedir" stays selected`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
