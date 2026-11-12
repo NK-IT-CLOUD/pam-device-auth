@@ -572,9 +572,15 @@ library, and with it `curl`, `getent` and `dig`, moves on at once when a name
 server answers `REFUSED`, so these tools look fine on the same host.
 
 ```bash
-sudo pam-device-auth --check          # [WARN] discovery took 5.03s (more than 2s): …
+sudo pam-device-auth --check          # [WARN] discovery took 5.03s and 5.02s on two requests in a row (more than 2s): …
 dig @<first nameserver> <issuer host> # status: REFUSED, or no answer at all
 ```
+
+`--check` repeats a discovery request that took more than 2 seconds once, over
+a new connection with a new name lookup, and warns only when both were slow.
+A single slow answer, as a busy uplink or a name server that had to ask
+upstream first produces it, shows as
+`[OK]   discovery answered in 180ms (the first request took 3.76s)`.
 
 Remove the name server that does not answer for this host from
 `/etc/resolv.conf` (or from what generates it), or put a working one first.

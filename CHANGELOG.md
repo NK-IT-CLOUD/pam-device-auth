@@ -133,10 +133,13 @@ are; an upgrade needs no manual step.
 
 ### Added
 - `--check` reports a slow identity provider: `discovery answered in 80ms`,
-  or a warning above 2 s that names the usual cause, a name server in
+  or a warning that names the usual cause, a name server in
   `/etc/resolv.conf` that does not answer properly. The helper resolves names
   with Go's resolver and waits 5 s for such a server, where `curl` and
-  `getent` move on at once.
+  `getent` move on at once. A request that took more than 2 s is repeated once
+  over a new connection; only two slow requests in a row are a warning
+  (`discovery took 5.03s and 5.02s on two requests in a row`), a single one
+  shows as `discovery answered in 180ms (the first request took 3.76s)`.
 - A run by hand with `--debug` logs how long each request to the identity
   provider took (`Discovery took …`, `Device code request took …`,
   `Token refresh took …`, `JWKS fetch took …`).

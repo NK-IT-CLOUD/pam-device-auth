@@ -41,6 +41,23 @@ func newOIDCClient() *http.Client {
 	}
 }
 
+// timedDiscovery fetches the discovery document over a connection of its own
+// and returns how long that took: the name lookup, the TCP and TLS handshakes
+// and the request, as the first request of a login has them. newOIDCClient
+// shares the connection pool of http.DefaultTransport, where a second request
+// would reuse the open connection and measure the request alone.
+func timedDiscovery(issuerURL string) (*discovery.Endpoints, time.Duration, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
+	client := newOIDCClient()
+	client.Transport = transport
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	defer cancel()
+	start := time.Now()
+	endpoints, err := discovery.Fetch(ctx, client, issuerURL)
+	return endpoints, time.Since(start), err
+}
+
 // runPreflight runs every pre-activation check, printing [OK]/[WARN]/[FAIL] per
 // item, and returns the count of blockers and warnings. It is shared by --check
 // (which adds the verdict) and --enable (which refuses to activate on a blocker).
@@ -83,18 +100,16 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 
 	// --- OIDC ---
 	fmt.Println("OIDC:")
-	httpClient := newOIDCClient()
-	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	discoveryStart := time.Now()
-	endpoints, derr := discovery.Fetch(ctx, httpClient, cfg.IssuerURL)
-	discoveryTook := time.Since(discoveryStart)
-	cancel()
+	endpoints, discoveryTook, derr := timedDiscovery(cfg.IssuerURL)
 	if derr != nil {
 		fmt.Printf("  [FAIL] discovery failed: %v\n", derr)
 		fails++
 	} else {
 		fmt.Printf("  [OK]   discovery reachable (device=%s)\n", endpoints.DeviceAuthorizationEndpoint)
-		tok, tokMsg, tbadMsg := discoveryTiming(discoveryTook)
+		tok, tokMsg, tbadMsg := discoveryTiming(discoveryTook, func() (time.Duration, error) {
+			_, d, err := timedDiscovery(cfg.IssuerURL)
+			return d, err
+		})
 		chk(tok, false, tokMsg, tbadMsg)
 		chk(strings.TrimRight(endpoints.Issuer, "/") == cfg.IssuerURL, true,
 			"issuer matches config",
@@ -1193,13 +1208,28 @@ const discoveryTimingLimit = 2 * time.Second
 // uses Go's resolver, which has no cache and waits its full timeout (5 s per
 // name server) when the first name server of /etc/resolv.conf does not answer
 // properly, where the C library moves on at once.
-func discoveryTiming(d time.Duration) (ok bool, okMsg, badMsg string) {
-	d = d.Round(10 * time.Millisecond)
-	return d <= discoveryTimingLimit,
-		fmt.Sprintf("discovery answered in %s", d),
-		fmt.Sprintf("discovery took %s (more than %s): every login waits like this; check DNS first: "+
-			"the helper asks the name servers of /etc/resolv.conf in order and waits 5 s for one that does not answer properly",
-			d, discoveryTimingLimit)
+//
+// One slow request does not show that: a name server that had to ask upstream
+// first, or a busy identity provider, delays a single request. So a request
+// above the limit is repeated once (again, over a new connection with a new
+// name lookup), and only two slow requests in a row are reported.
+func discoveryTiming(first time.Duration, again func() (time.Duration, error)) (ok bool, okMsg, badMsg string) {
+	first = first.Round(10 * time.Millisecond)
+	if first <= discoveryTimingLimit {
+		return true, fmt.Sprintf("discovery answered in %s", first), ""
+	}
+	second, err := again()
+	second = second.Round(10 * time.Millisecond)
+	switch {
+	case err != nil:
+		return false, "", fmt.Sprintf("discovery took %s (more than %s) and a second request failed: %v",
+			first, discoveryTimingLimit, err)
+	case second <= discoveryTimingLimit:
+		return true, fmt.Sprintf("discovery answered in %s (the first request took %s)", second, first), ""
+	}
+	return false, "", fmt.Sprintf("discovery took %s and %s on two requests in a row (more than %s): every login waits like this; "+
+		"check DNS first: the helper asks the name servers of /etc/resolv.conf in order and waits 5 s for one that does not answer properly",
+		first, second, discoveryTimingLimit)
 }
 
 func main() {

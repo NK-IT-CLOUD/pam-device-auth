@@ -106,6 +106,13 @@ func TestIntegrationCheckPasses(t *testing.T) {
 		if !strings.Contains(line, "[WARN]") || strings.HasPrefix(strings.TrimSpace(line), "Critical checks passed") {
 			continue
 		}
+		// How long the identity provider takes to answer depends on the network
+		// at the moment of the run (a busy uplink delays requests by seconds) and
+		// says nothing about the package on this host.
+		if strings.Contains(line, "[WARN] discovery took ") {
+			t.Logf("--check, not a finding of this test: %s", strings.TrimSpace(line))
+			continue
+		}
 		known := false
 		for _, a := range allowed {
 			if strings.Contains(line, a) {
