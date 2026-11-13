@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.7.1] - unreleased
+## [0.7.1] - 2026-11-13
 
 Fixes from a review of 0.7.0. The sshd drop-in and `sssd.conf` stay as they
 are; an upgrade needs no manual step.
