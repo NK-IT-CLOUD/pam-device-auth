@@ -413,7 +413,8 @@ The variables do not reach a login that sshd starts: sshd runs the PAM
 conversation with an empty environment, so a value in the sshd unit or in
 `/etc/default/ssh` changes nothing there. Settings that logins should use
 belong in `config.json`. A `--check` run with one of the variables set checks
-other values than the logins use.
+other values than the logins use. The variables are deprecated; 0.8.0 removes
+them.
 
 ## Example configs
 

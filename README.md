@@ -38,10 +38,13 @@ that are already open stay open.
 1. The user runs `ssh user@host`.
 2. OpenSSH checks the user's public key, which it fetches from LDAP.
 3. pam-device-auth displays a URL, a code and an optional QR code.
-4. The user approves the login with the identity provider in a browser.
-5. pam-device-auth verifies the token, the required role and the optional source
-   IP restriction.
-6. The shell opens and the home directory is created if needed.
+4. The user approves the login with the identity provider in a browser and
+   presses Enter in the terminal.
+5. pam-device-auth fetches the token and verifies it, the required role and,
+   if configured, the authentication level.
+6. The PAM account phase checks the group membership and the optional source
+   IP allowlist.
+7. The shell opens and the home directory is created if needed.
 
 Later logins from a known IP can use a cached refresh token, so the user does not
 open the browser every time. The SSH key is still required on every login.
@@ -52,33 +55,41 @@ and never depends on LDAP or OIDC.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/auth-flow-dark.svg">
-  <img alt="A non-root SSH login passes three layers on the SSH host. Layer 1: sshd accepts only a public key that SSSD fetches from the LDAP directory; local authorized_keys files are ignored. Layer 2: pam-device-auth runs the OIDC sign-in with the identity provider, through a device flow or a cached refresh, and validates the token and role locally. Layer 3: the PAM account phase checks the per-user source-IP allowlist and the group membership. Service accounts use only their directory key and skip layer 2. Root uses only its local SSH key. A failure in any layer ends the login." src="docs/assets/auth-flow-light.svg" width="100%">
+  <img alt="A non-root SSH login passes three layers on the SSH host. Layer 1: sshd accepts only a public key that SSSD fetches from the directory, LLDAP or Active Directory; local authorized_keys files are ignored. Layer 2: pam-device-auth runs the OIDC sign-in with the identity provider, through a device flow or a cached refresh, and checks the token, the role and the optional authentication level locally. Layer 3: the PAM account phase checks the per-user source-IP allowlist and the group membership. Service accounts use only their directory key and skip layer 2. Root uses only its local SSH key. A failure in any layer ends the login. SSSD reads the directory over LDAPS, StartTLS or a Kerberos-sealed connection." src="docs/assets/auth-flow-light.svg" width="100%">
 </picture>
 
 Every non-root login passes three independent layers. A failure in any of them
-ends the login. Denials in layers 2 and 3 are written to
-`/var/log/pam-device-auth.log`; `sshd` logs a rejected key in layer 1.
+ends the login. pam-device-auth writes its denials in layers 2 and 3 to
+`/var/log/pam-device-auth.log`. `sshd` logs a rejected key in layer 1, and a
+login refused for missing group membership is logged by `pam_sss` in the
+system journal.
 
 | Layer | Enforced by | What it checks |
 |---|---|---|
-| 1. SSH key | `sshd` with `sss_ssh_authorizedkeys` | The public key comes from the directory (`sshPublicKey`). Local `authorized_keys` files are ignored for non-root users. |
+| 1. SSH key | `sshd` with `sss_ssh_authorizedkeys` | The public key comes from the directory (`sshPublicKey`, or the attribute named in `ldap.attributes.ssh_key`). Local `authorized_keys` files are ignored for non-root users. |
 | 2. OIDC sign-in | `pam_device_auth.so` (keyboard-interactive) | The user resolves through SSSD. Browser approval through the Device Authorization Grant, or a silent refresh from a known source IP. Token signature, issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, `kid`, username equal to the SSH user, the required role and, with `required_acr`, the authentication level (`acr`). |
-| 3. Account phase | `pam_device_auth.so --pam-acct` and `pam_sss` | The `clients` source-IP allowlist, which fails closed when it cannot be read. Membership in the access group or a service-account group. |
+| 3. Account phase | `pam_device_auth.so`, which runs `pam-device-auth --pam-acct`, and `pam_sss` | The `clients` source-IP allowlist, which fails closed when it cannot be read. Membership in the access group or a service-account group. |
 
 Service accounts skip layer 2 only: they still need their directory key and pass
-layer 3. Root logs in with its local SSH key only and skips layers 2 and 3, so it
-keeps working when LDAP, SSSD or the identity provider is down. With
-`root_login` set to `disabled`, root cannot log in over SSH at all.
+layer 3. Root logs in with its local SSH key only. It skips layer 2, and the
+account phase lets it through before it asks the helper or SSSD, so root keeps
+working when LDAP, SSSD or the identity provider is down. With `root_login` set
+to `disabled`, root cannot log in over SSH at all.
 
 #### Layer 2 in detail
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/oidc-sign-in-dark.svg">
-  <img alt="After the SSH key is accepted, pam-device-auth checks that the user resolves through SSSD. With a cached session for the same source IP it refreshes the token at the identity provider's token endpoint; otherwise it runs the device flow, where the user opens a link in the browser and approves the code. A rejected refresh clears the cache, a network error keeps it. The token is validated locally against the JWKS, which is cached for 10 minutes: signature, issuer, azp or aud, exp, nbf, iat, kid, the username and the required role. Layer 3 follows." src="docs/assets/oidc-sign-in-light.svg" width="100%">
+  <img alt="After the SSH key is accepted, pam-device-auth checks that the user resolves through SSSD. With a cached session for the same source IP it refreshes the token at the identity provider's token endpoint; otherwise it runs the device flow, where the user opens a link in the browser, signs in, approves the code and presses Enter. A rejected refresh, a refreshed token that fails validation or an authentication level that is not accepted clears the cache and falls back to the device flow; a network error keeps the cache and falls back as well. The token is validated locally against the JWKS, which is cached for 10 minutes: signature, issuer, azp or aud, exp, nbf, iat, kid, the username, the required role and the optional authentication level. A missing role ends the login, and so does an authentication level that is not accepted after the device flow. Layer 3 follows." src="docs/assets/oidc-sign-in-light.svg" width="100%">
 </picture>
 
 The cache holds the refresh token in tmpfs (`/run/pam-device-auth/`, `0700 root:root`)
-and is cleared on reboot.
+and is cleared on reboot. A refresh that the identity provider rejects, a
+refreshed token that fails validation and, with `required_acr`, one without an
+accepted authentication level remove the cached session; the login continues
+with the device flow. After a network error the session stays and the login
+continues with the device flow as well. A missing role ends the login on both
+paths.
 
 ## Features
 
@@ -127,9 +138,10 @@ and is cleared on reboot.
   group membership and SSH public key. LLDAP users also need a Unix ID; for
   Active Directory, SSSD derives it from the objectSid by default.
 - An OIDC provider with the Device Authorization Grant enabled, such as Keycloak,
-  Auth0, Okta or Authentik. It must serve its discovery, token and JWKS endpoints
-  from the issuer host and issue an access token with `preferred_username`, the
-  configured role claim, and either `azp` or a matching `aud`.
+  Auth0, Okta or Authentik. It must serve its discovery, device authorization,
+  token and JWKS endpoints from the issuer host and issue an access token with
+  `preferred_username`, the configured role claim, and either `azp` or a
+  matching `aud`.
   `preferred_username` must be the user's login name in the directory, and
   users must not be able to change it.
 - A root SSH-key session during setup, so you can recover from configuration
@@ -251,13 +263,17 @@ block and can be intentional, for example an access-group member who is
 deliberately not provisioned with an SSH key. The
 [preflight example](INSTALL.md#5-preflight-check) shows the full output.
 
-Commands: `--check`, `--setup-ldap`, `--enable`, `--migrate-config` and
-`--prepare-log` (both run by the package on install and upgrade), `--pam-acct`
-(internal, used by the PAM account phase), `--debug`, `--version`, `--help`.
+Commands: `--check`, `--setup-ldap`, `--enable`, `--migrate-config` (run by the
+package on upgrade), `--prepare-log` (run by the package on install and
+upgrade), `--pam-acct` (internal, used by the PAM account phase), `--debug`,
+`--version`, `--help`.
 
 Every step of `--setup-ldap` is checked. A failed step aborts the setup with a
 `FAIL:` line that names the command and its output, what the rollback of
-`/etc/sssd/sssd.conf` did, and the changes that stay on the host.
+`/etc/sssd/sssd.conf` did, and the changes that stay on the host. On Rocky
+Linux and Fedora the setup stops before it writes a configuration file when
+authselect reports a file that was changed outside of it: selecting the `sssd`
+profile would overwrite that change.
 
 ## Configuration
 
@@ -285,9 +301,12 @@ Every step of `--setup-ldap` is checked. A failed step aborts the setup with a
 `auth_timeout`, through `PAM_DEVICE_AUTH_ISSUER`, `PAM_DEVICE_AUTH_CLIENT_ID`,
 `PAM_DEVICE_AUTH_REQUIRED_ROLE`, `PAM_DEVICE_AUTH_SUDO_ROLE`,
 `PAM_DEVICE_AUTH_ROLE_CLAIM` and `PAM_DEVICE_AUTH_TIMEOUT`. They apply to a
-command run by hand and do not reach a login that sshd starts. sshd's
-`LoginGraceTime` (default 120 s) bounds the whole login, also the wait for the
-approval; see `auth_timeout` in the reference. Every field is
+command run by hand and do not reach a login that sshd starts. They are
+deprecated; 0.8.0 removes them. sshd's `LoginGraceTime` (default 120 s) bounds
+the whole login, also the wait for the approval; see `auth_timeout` in the
+reference. A key the loader does not know and an `allowed_algorithms` entry the
+verifier does not support are reported: `--check`, `--enable` and
+`--setup-ldap` stop on them, a login logs a warning and goes on. Every field is
 described in [docs/configuration-reference.md](docs/configuration-reference.md).
 
 ### Group model
@@ -304,8 +323,9 @@ Two group axes are independent of each other:
 
 ### Per-user IP allowlist
 
-The optional `clients` LDAP attribute holds a per-user list of source IPs or
-CIDRs. The PAM account phase (`--pam-acct`) enforces it on every login, including
+The optional `clients` LDAP attribute, or the one named in
+`ldap.attributes.clients`, holds a per-user list of source IPs or CIDRs. The
+PAM account phase (`--pam-acct`) enforces it on every login, including
 key-only service accounts. It reads `clients` for the logging-in user from the SSSD
 InfoPipe over `busctl`. Only root is exempt, because break-glass access must not
 depend on SSSD. Local non-root accounts are not a supported login tier and fail
@@ -381,7 +401,10 @@ authentication level (`required_acr`), algorithm, key-type and curve binding
   from `/etc/pam.d/sshd.original`, removes the sshd drop-in and deletes the
   managed `/etc/sudoers.d/pam-device-auth` file, so no `NOPASSWD` grant stays
   behind. Without a valid `sshd.original` the removal is refused while
-  `/etc/pam.d/sshd` uses the module. This applies to the `.deb` and the `.rpm`.
+  `/etc/pam.d/sshd` uses the module. SSSD stays configured, and the removal
+  says so: directory users can then log in with their directory password if
+  sshd allows password authentication. This applies to the `.deb` and the
+  `.rpm`.
 
 [SECURITY.md](SECURITY.md) has the threat model and how to report a
 vulnerability.

@@ -369,7 +369,8 @@ The fields issuer_url, client_id, required_role, sudo_role, role_claim and
 auth_timeout can be overridden via environment variables prefixed with
 .B PAM_DEVICE_AUTH_
 for a command run by hand. They do not reach a login that sshd starts: sshd
-runs the PAM conversation with an empty environment.
+runs the PAM conversation with an empty environment. The variables are
+deprecated; 0.8.0 removes them.
 .SH FILES
 .TP
 .I /etc/pam-device-auth/config.json
