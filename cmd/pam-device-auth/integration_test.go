@@ -125,6 +125,21 @@ func TestIntegrationCheckPasses(t *testing.T) {
 	}
 }
 
+// With profile "ad" the member lists of --check can miss an account that has a
+// group as its primary group, and the output says so. With "lldap" such an
+// account cannot log in, so the line would only be noise there.
+func TestIntegrationCheckMemberListNote(t *testing.T) {
+	cfg := configuredHost(t)
+	out, _ := runInstalled(t, nil, "--check")
+	note := memberListNote(cfg.LDAP)
+	switch {
+	case note != "" && !strings.Contains(out, "  [INFO] "+note+"\n"):
+		t.Errorf("profile %s: --check output lacks the member list note:\n%s", cfg.LDAP.Profile, out)
+	case note == "" && strings.Contains(out, "[INFO]"):
+		t.Errorf("profile %s: --check output has an [INFO] line, want none:\n%s", cfg.LDAP.Profile, out)
+	}
+}
+
 // Directory mode leaves no SSSD unit failed: the socket units of the responders
 // from the services line are masked, and nothing is left in a failed state.
 func TestIntegrationNoFailedSSSDUnits(t *testing.T) {

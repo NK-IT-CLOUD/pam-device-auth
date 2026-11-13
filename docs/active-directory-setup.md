@@ -55,6 +55,36 @@ To see what the service account reads:
       ldapsearch -x -H ldaps://dc1.example.com -D svc-sssd@example.com -W \
       -b DC=example,DC=com '(sAMAccountName=alice)' sshPublicKey exampleSshClients
 
+### A group as an account's primary group
+
+An account may have the access group or a service group as its primary group,
+for example a service account that is taken out of `Domain Users`. AD then
+keeps the membership on the account (`primaryGroupID`) and drops the account
+from the group's `member` attribute. Logins work as for every other member:
+sshd (`Match Group`), SSSD (`simple_allow_groups`) and sudo count the primary
+group.
+
+`--check` sees less. Its member counts and its checks per member (SSH key,
+allowlist, SSH factors, ID map) work on the members NSS lists, and SSSD lists
+such an account only once the host has resolved it: when it refreshes a group,
+it adds the accounts with that primary group from its own cache. A host that
+has never seen the account leaves it out, so the same directory can show
+`2 key-only` on one host and `3 key-only` on another. `--check` prints an
+`[INFO]` line about this with profile `ad`. To make a host list an account,
+resolve it, let the group expire and check again:
+
+    id svc-backup
+    sss_cache -G
+    pam-device-auth --check
+
+To look at one account directly:
+
+    id svc-backup                          # the groups, the primary group first
+    sss_ssh_authorizedkeys svc-backup      # the key sshd gets
+    sshd -T -C user=svc-backup | grep -i '^authenticationmethods'
+    busctl call org.freedesktop.sssd.infopipe /org/freedesktop/sssd/infopipe \
+      org.freedesktop.sssd.infopipe GetUserAttr sas svc-backup 1 clients
+
 ## Transport and bind
 
 pam-device-auth never binds in clear text. Pick one:

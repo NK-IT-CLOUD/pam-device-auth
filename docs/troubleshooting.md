@@ -251,9 +251,32 @@ Logins are not affected; the sssd monitor runs the responders either way.
 match an intentional operating state. For example, a directory access-group
 member without `sshPublicKey` is reported because that user cannot satisfy the
 first factor; this is harmless when the account is deliberately keyless.
+`[INFO]` entries name a limit of the check; they are neither warnings nor
+blockers.
 
 For a complete current output example, see
 [Installation: Preflight check](../INSTALL.md#5-preflight-check).
+
+### `--check` counts fewer members than the directory has (Active Directory)
+
+`--check` takes the members of the access group and the service groups from
+NSS (`getent group`). An account that has such a group as its **primary
+group** is not in the group's `member` attribute in AD, and SSSD adds it to
+the group from its own cache only, when it refreshes the group. A host that
+has never resolved the account does not list it: the count is too low, and the
+checks per member (SSH key, allowlist, SSH factors, ID map) leave the account
+out. Two hosts with the same directory can show different counts. Logins are
+not affected.
+
+With profile `ad`, `--check` prints an `[INFO]` line about this. To make a
+host list the account, resolve it, let the group expire and check again:
+
+    id svc-backup
+    sss_cache -G
+    pam-device-auth --check
+
+[Active Directory setup](active-directory-setup.md#a-group-as-an-accounts-primary-group)
+has the commands to look at one account directly.
 
 ### `FAIL: config error` on `--check`
 

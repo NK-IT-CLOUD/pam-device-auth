@@ -227,6 +227,8 @@ OIDC:
 Directory (SSSD/NSS):
   [OK]   sss_ssh_authorizedkeys present (publickey factor source)
   [OK]   /etc/sssd/sssd.conf present
+  [OK]   SSSD InfoPipe responder present: /usr/libexec/sssd/sssd_ifp
+  [OK]   no SSSD socket unit competes with a responder from the sssd.conf services line
   [OK]   sssd.conf exposes the clients attribute to the InfoPipe (IP allowlist gate input)
   [OK]   sssd service active
   [OK]   ldap.uri is a single URI, transport LDAPS (no cleartext bind)
@@ -235,6 +237,9 @@ Directory (SSSD/NSS):
   [OK]   access group "ssh-access" resolves via NSS (2 member(s)); SSSD↔LDAP↔CA path OK
   [WARN] 1 of 2 member(s) have NO sshPublicKey; locked out of non-root login until set: no-key-user
   [OK]   UIDs/GIDs of 2 directory user(s) exist in this host's ID map
+IP allowlist (account-phase gate):
+  [OK]   SSSD InfoPipe reachable (probed user=alice via busctl)
+  [OK]   group "ssh-access": 1 IP-pinned, 1 unrestricted, 0 unreadable (of 2 member(s))
 SSH daemon:
   [OK]   AuthorizedKeysCommand → sss_ssh_authorizedkeys (directory key = factor 1)
   [OK]   AuthorizedKeysCommand binary exists: /usr/bin/sss_ssh_authorizedkeys
@@ -244,6 +249,7 @@ SSH daemon:
   [OK]   KbdInteractiveAuthentication yes
   [OK]   root: publickey only (break-glass)
   [OK]   non-root: AuthorizedKeysFile none (directory key is the only publickey source)
+  [OK]   UseDNS no (PAM receives the client IP for the IP allowlist)
 
 Activation: not yet enabled; run 'pam-device-auth --enable' once checks are green.
 
@@ -256,6 +262,10 @@ Interpret the result as follows:
 - `[WARN]` is non-blocking but must match the intended state. A missing key is
   acceptable only for a user who is deliberately not allowed to SSH.
 - `[OK]` confirms live host state, not only JSON syntax.
+- `[INFO]` names a limit of the check and is neither a warning nor a blocker.
+  Profile `ad` prints one: an account that has the access group or a service
+  group as its primary group is listed only once the host has resolved it
+  ([Active Directory setup](docs/active-directory-setup.md#a-group-as-an-accounts-primary-group)).
 
 `--enable` runs the same preflight and refuses to activate when a blocker exists.
 

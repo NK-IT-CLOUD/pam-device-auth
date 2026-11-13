@@ -103,6 +103,11 @@ KbdInteractiveAuthentication, non-root 2FA, the methods sshd applies to each
 member of the access group and the service groups, root break-glass), IP
 allowlist posture, and SSSD InfoPipe health. It reports how long OIDC
 discovery took and warns when two requests in a row took more than 2 seconds.
+The member lists are what NSS reports. With profile
+.B ad
+an account that has the access group or a service group as its primary group
+is listed only once the host has resolved it; the checks per member can leave
+it out, and an [INFO] line says so.
 Config keys the loader does not know
 and
 .I allowed_algorithms

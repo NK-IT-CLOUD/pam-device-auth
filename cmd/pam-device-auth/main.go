@@ -261,6 +261,9 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 				fmt.Sprintf("nopasswd-sudo group %q resolves (%d member(s)); PASSWORDLESS sudo (elevated)", g, len(members)),
 				fmt.Sprintf("nopasswd-sudo group %q does NOT resolve via NSS; check it exists with a gidNumber", g))
 		}
+		// Every member count above and every check per member below works on
+		// these lists; with profile ad they can miss an account.
+		reportMemberListNote(cfg.LDAP, os.Stdout)
 	}
 
 	// --- IP allowlist (account-phase gate) ---

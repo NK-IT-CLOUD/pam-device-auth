@@ -3,6 +3,23 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.2] - unreleased
+
+### Changed
+- `--check` with profile `ad` says what its member lists can leave out. The
+  member counts and the checks per member (SSH key, allowlist, SSH factors,
+  ID map) work on the members NSS lists for the access group and the service
+  groups. An account that has such a group as its primary group is not in the
+  group's `member` attribute in Active Directory, and SSSD lists it only once
+  the host has resolved it. So far such an account went unchecked without a
+  word, and two hosts with the same directory could report different counts.
+  The new line:
+  ``[INFO] member lists are what NSS reports: an account with one of these groups as its primary group is listed only once this host has resolved it, so the checks per member can leave it out; `id <account>` and then `sss_cache -G` make this host list it``.
+  Logins are not affected, and neither is profile `lldap`, where an account
+  needs the membership itself to log in.
+- Documentation: the preflight example in INSTALL.md shows every line of the
+  current output.
+
 ## [0.7.1] - 2026-11-13
 
 Fixes from a review of 0.7.0. The sshd drop-in and `sssd.conf` stay as they
