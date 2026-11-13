@@ -1,5 +1,5 @@
 # pam-device-auth Build System
-VERSION=0.7.1-rc2
+VERSION=0.7.1-rc3
 MODULE=github.com/NK-IT-CLOUD/pam-device-auth
 
 # Directories
