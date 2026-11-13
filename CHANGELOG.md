@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.7.2] - unreleased
+## [0.7.2] - 2026-11-13
 
 ### Changed
 - `--check` with profile `ad` says what its member lists can leave out. The
