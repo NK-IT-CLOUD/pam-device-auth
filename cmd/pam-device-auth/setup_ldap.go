@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -812,6 +813,13 @@ func runSetupLDAP() {
 	if err := checkSSSDIfp(prof.SSSDIfpPath); err != nil {
 		fail("%v", err)
 	}
+	// Step 2 lets authselect write its PAM and nsswitch files again, which
+	// overwrites a change made to them by hand. Refuse now, like the checks above.
+	if prof.PamWiring == "authselect" {
+		if err := authselectGuard(execRunner, nsswitchConf, authselectNsswitchConf); err != nil {
+			fail("%v", err)
+		}
+	}
 
 	// 1) /etc/sssd/sssd.conf (0600 root).
 	sssdConf := renderSSSDConf(renderDataFor(l, bindPassword), caCertFor(l, prof))
@@ -910,7 +918,11 @@ func wireMkhomedir(prof distro.Profile, run commandRunner) error {
 		}
 		fmt.Println("pam_mkhomedir enabled")
 	case "authselect":
-		args, replaced := authselectPlan(authselectCurrent(run))
+		current, err := authselectCurrent(run)
+		if err != nil {
+			return err
+		}
+		args, replaced := authselectPlan(current)
 		if replaced != "" {
 			fmt.Printf("authselect: replacing profile %q\n", replaced)
 		}
@@ -931,16 +943,29 @@ func wireMkhomedir(prof distro.Profile, run commandRunner) error {
 	return nil
 }
 
+// Exit codes of authselect (authselect(8), RETURN CODES) this tool acts on.
+const (
+	authselectNotConfigured = 2 // "Profile or configuration was not found or the system was not configured with authselect."
+	authselectNotValid      = 3 // "Current configuration is not valid, it was edited without authselect."
+	authselectNoFiles       = 6 // "No configuration was detected.": 1.3 and later, when none of the files exists either
+)
+
 // authselectCurrent returns the active authselect profile with its features
-// ("sssd with-faillock"), "" when none is selected. `authselect current` fails
-// in that case (a minimal host) and prints why, which is no profile name; a
-// broken authselect fails again at the next command.
-func authselectCurrent(run commandRunner) string {
+// ("sssd with-faillock"), "" when none is selected (a minimal host, or after
+// `authselect opt-out`): `authselect current` exits 2 then and prints why,
+// which is no profile name. Every other failure is an error. It says nothing
+// about the profile, and "none" would send the setup on to a forced select.
+func authselectCurrent(run commandRunner) (string, error) {
 	out, err := run("authselect", "current", "--raw")
-	if err != nil {
-		return ""
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return strings.TrimSpace(string(out)), nil
+	case errors.As(err, &ee) && ee.ExitCode() == authselectNotConfigured:
+		return "", nil
+	default:
+		return "", fmt.Errorf("authselect current --raw: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-	return strings.TrimSpace(string(out))
 }
 
 // authselectPlan decides from the output of `authselect current --raw` (the
@@ -959,7 +984,9 @@ func authselectCurrent(run commandRunner) string {
 // of a line, which replaces authselect's symlink by a regular file. authselect
 // 1.2 (RHEL 9) then refuses every command without --force
 // ("[/etc/nsswitch.conf] was not created by authselect!"), `enable-feature`
-// included. authselect keeps a backup of the files it overwrites.
+// included. authselect keeps a backup of the files it overwrites, and
+// authselectGuard has stopped the setup before when one of them was changed
+// by hand.
 func authselectPlan(currentRaw string) (args []string, replaced string) {
 	current := strings.TrimSpace(currentRaw)
 	features := []string{"with-mkhomedir"}
@@ -971,6 +998,110 @@ func authselectPlan(currentRaw string) (args []string, replaced string) {
 	}
 	args = append([]string{"select", "sssd"}, features...)
 	return append(args, "--force"), current
+}
+
+// authselectGuard keeps the `select … --force` of wireMkhomedir from
+// overwriting what somebody changed by hand in a file authselect manages
+// (system-auth, password-auth, nsswitch.conf, …): it returns an error that
+// names the files and the command that overwrites them. nsswitch and
+// authselects are /etc/nsswitch.conf and authselect's copy of it.
+//
+// It knows what authselect knows. A host authselect has not configured (a
+// minimal one, or after `authselect opt-out`) has nothing to compare the
+// files with, and the setup selects the sssd profile as before. From 1.3 on
+// authselect no longer compares the content of its files, only whether each
+// one is still its symlink.
+func authselectGuard(run commandRunner, nsswitch, authselects string) error {
+	current, err := authselectCurrent(run)
+	if err != nil {
+		return err
+	}
+	changed, err := authselectForeignChanges(run, nsswitch, authselects)
+	if err != nil || len(changed) == 0 {
+		return err
+	}
+	args, _ := authselectPlan(current)
+	return fmt.Errorf("authselect reports changes made outside of it in %s. The setup runs `authselect %s`, which overwrites them, "+
+		"so it stops before it writes a file. Save what you need from these files, run that command yourself "+
+		"(authselect keeps a backup under /var/lib/authselect/backups/) and start --setup-ldap again",
+		strings.Join(changed, ", "), strings.Join(args, " "))
+}
+
+// authselectForeignChanges returns the files `authselect check` names as
+// changed outside authselect ("[error] [/etc/pam.d/system-auth] is not a
+// symbolic link!"), each once. /etc/nsswitch.conf is left out when it is this
+// tool's own edit (nsswitchIsOwnEdit). No file is changed when the check
+// passes, and when authselect has not configured the host (exit code 2, or 6
+// when none of the files exists either).
+//
+// An unclear answer is an error, never "nothing changed": a check that fails
+// with another exit code than 3 or names no file, and a nsswitch.conf that
+// cannot be compared.
+func authselectForeignChanges(run commandRunner, nsswitch, authselects string) ([]string, error) {
+	out, err := run("authselect", "check")
+	unclear := fmt.Errorf("authselect check: %s: %w", strings.TrimSpace(string(out)), err)
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return nil, nil
+	case !errors.As(err, &ee):
+		return nil, unclear
+	case ee.ExitCode() == authselectNotConfigured, ee.ExitCode() == authselectNoFiles:
+		return nil, nil
+	case ee.ExitCode() != authselectNotValid:
+		return nil, unclear
+	}
+	var named []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if _, rest, ok := strings.Cut(line, "[/"); ok {
+			if name, _, ok := strings.Cut(rest, "]"); ok && !slices.Contains(named, "/"+name) {
+				named = append(named, "/"+name)
+			}
+		}
+	}
+	if len(named) == 0 {
+		return nil, unclear
+	}
+	var foreign []string
+	for _, file := range named {
+		if file == nsswitchConf {
+			own, err := nsswitchIsOwnEdit(nsswitch, authselects)
+			if err != nil {
+				return nil, fmt.Errorf("authselect check names %s, which cannot be compared with authselect's own file: %w", nsswitchConf, err)
+			}
+			if own {
+				continue
+			}
+		}
+		foreign = append(foreign, file)
+	}
+	return foreign, nil
+}
+
+// nsswitchIsOwnEdit reports whether nsswitch (/etc/nsswitch.conf) is what
+// ensureNsswitchSSS leaves behind: a regular file that holds, byte for byte,
+// what nsswitchWithSSS makes of the nsswitch.conf authselect generated
+// (authselects). A symlink is not, whatever its target holds: somebody keeps
+// that file elsewhere. Nor is a regular file when the profile left nothing to
+// add: ensureNsswitchSSS does not write then.
+func nsswitchIsOwnEdit(nsswitch, authselects string) (bool, error) {
+	info, err := os.Lstat(nsswitch)
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	generated, err := os.ReadFile(authselects)
+	if err != nil {
+		return false, err
+	}
+	live, err := os.ReadFile(nsswitch)
+	if err != nil {
+		return false, err
+	}
+	own, added := nsswitchWithSSS(generated)
+	return added && bytes.Equal(own, live), nil
 }
 
 // sssdEnabledNote, sssdEnableUnknownNote and sssdMaskedNote are the entries
@@ -1167,10 +1298,17 @@ func nsswitchWithSSS(data []byte) ([]byte, bool) {
 	return []byte(strings.Join(lines, "\n")), changed
 }
 
+// nsswitchConf is the file ensureNsswitchSSS edits. On a host with authselect
+// it is a symlink to authselectNsswitchConf until that edit replaces it.
+const (
+	nsswitchConf           = "/etc/nsswitch.conf"
+	authselectNsswitchConf = "/etc/authselect/nsswitch.conf"
+)
+
 // ensureNsswitchSSS rewrites /etc/nsswitch.conf crash-safely: a torn write
 // here would break ALL name resolution on the host (PDA-BUG-004).
 func ensureNsswitchSSS() error {
-	data, err := os.ReadFile("/etc/nsswitch.conf")
+	data, err := os.ReadFile(nsswitchConf)
 	if err != nil {
 		return err
 	}
@@ -1178,7 +1316,7 @@ func ensureNsswitchSSS() error {
 	if !changed {
 		return nil
 	}
-	return atomicWriteFile("/etc/nsswitch.conf", out, 0644)
+	return atomicWriteFile(nsswitchConf, out, 0644)
 }
 
 // renderSudoers builds the single tool-managed sudoers drop-in. The admin group

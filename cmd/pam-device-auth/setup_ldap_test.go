@@ -1857,7 +1857,8 @@ func TestWireMkhomedirCommands(t *testing.T) {
 		wantErr   string
 	}{
 		{"debian ok", "pam-auth-update", nil, nil, []string{"pam-auth-update --enable mkhomedir"}, ""},
-		{"rhel, no profile yet", "authselect", map[string]error{current: boom}, nil, []string{current, selectCmd, oddjobd}, ""},
+		{"rhel, no profile yet", "authselect", map[string]error{current: exitErr(t, 2)}, nil, []string{current, selectCmd, oddjobd}, ""},
+		{"rhel, the profile cannot be read: nothing is selected", "authselect", map[string]error{current: boom}, nil, []string{current}, current},
 		{"rhel, an sssd profile keeps its features", "authselect", nil, map[string]string{current: "sssd with-faillock\n"}, []string{current, keepCmd, oddjobd}, ""},
 		{"rhel, another profile is replaced", "authselect", nil, map[string]string{current: "winbind\n"}, []string{current, selectCmd, oddjobd}, ""},
 		{"rhel select fails, oddjobd not started", "authselect", map[string]error{selectCmd: boom}, nil, []string{current, selectCmd}, "authselect select"},
@@ -1882,18 +1883,292 @@ func TestWireMkhomedirCommands(t *testing.T) {
 	}
 }
 
-// `authselect current` fails on a host without a selected profile and prints
-// why; that text is no profile name.
-func TestAuthselectCurrent_FailureMeansNoProfile(t *testing.T) {
+// `authselect current` exits 2 on a host without a selected profile and prints
+// why; that text is no profile name. Another failure is not "no profile".
+func TestAuthselectCurrent(t *testing.T) {
 	const current = "authselect current --raw"
-	var calls []string
-	run := fakeRunner(map[string]error{current: fmt.Errorf("exit status 2")},
-		map[string]string{current: "No existing configuration detected.\n"}, &calls)
-	if got := authselectCurrent(run); got != "" {
-		t.Errorf("authselectCurrent() = %q, want \"\" when the command fails", got)
+	for _, tc := range []struct {
+		name    string
+		failure error
+		output  string
+		want    string
+		wantErr string
+	}{
+		{"a profile with a feature", nil, "sssd with-faillock\n", "sssd with-faillock", ""},
+		{"no profile selected", exitErr(t, 2), "No existing configuration detected.\n", "", ""},
+		{"another exit code", exitErr(t, 1), "[error] Unable to get current configuration [5]: Input/output error\n", "", "authselect current --raw: [error] Unable to get current configuration"},
+		{"the command did not run", errors.New(`exec: "authselect": executable file not found in $PATH`), "", "", "executable file not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			got, err := authselectCurrent(fakeRunner(map[string]error{current: tc.failure}, map[string]string{current: tc.output}, &calls))
+			if got != tc.want {
+				t.Errorf("profile = %q, want %q", got, tc.want)
+			}
+			if tc.wantErr == "" && err != nil {
+				t.Errorf("err = %v, want nil", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("err = %v, want an error naming %q", err, tc.wantErr)
+			}
+		})
 	}
-	run = fakeRunner(nil, map[string]string{current: "sssd with-faillock\n"}, &calls)
-	if got := authselectCurrent(run); got != "sssd with-faillock" {
-		t.Errorf("authselectCurrent() = %q, want the active profile", got)
+}
+
+// What `authselect check` printed in containers of Rocky Linux 9 (authselect
+// 1.2.6), Rocky Linux 10 (1.5.2) and Fedora (1.8.0), one constant per state
+// of the host. Every version names a file twice when its symlink is gone.
+const (
+	// --setup-ldap ran before: ensureNsswitchSSS replaced authselect's symlink.
+	checkOwnNsswitch = "[error] [/etc/nsswitch.conf] is not a symbolic link!\n" +
+		"[error] [/etc/nsswitch.conf] was not created by authselect!\n" +
+		"Current configuration is not valid. It was probably modified outside authselect.\n"
+	// A line added to password-auth with an editor that writes through the
+	// symlink. Only 1.2 compares the content.
+	checkEditedPAM = "[error] [/etc/authselect/password-auth] has unexpected content!\n" +
+		"Current configuration is not valid. It was probably modified outside authselect.\n"
+	// system-auth replaced by a regular file (`sed -i`), on a host that
+	// --setup-ldap has configured.
+	checkReplacedPAM = "[error] [/etc/pam.d/system-auth] is not a symbolic link!\n" +
+		"[error] [/etc/pam.d/system-auth] was not created by authselect!\n" +
+		checkOwnNsswitch
+	checkRemovedPAM = "[error] [/etc/pam.d/postlogin] does not exist!\n" +
+		"[error] [/etc/pam.d/postlogin] was not created by authselect!\n" +
+		"Current configuration is not valid. It was probably modified outside authselect.\n"
+	checkEditedAndReplacedPAM = "[error] [/etc/authselect/password-auth] has unexpected content!\n" +
+		checkReplacedPAM
+	// A host authselect never configured.
+	checkNotConfigured = "System was not configured with authselect.\n"
+	// /etc/authselect/authselect.conf removed by hand, the files and symlinks
+	// of authselect still in place (shortened to one of the eight files).
+	// /etc/nsswitch.conf made a symlink to a file kept somewhere else.
+	checkLinkedNsswitch = "[error] Link [/etc/nsswitch.conf] does not point to [/etc/authselect/nsswitch.conf]\n" +
+		"[error] [/etc/nsswitch.conf] was not created by authselect!\n" +
+		"Current configuration is not valid. It was probably modified outside authselect.\n"
+	checkLeftovers = "[error] File [/etc/authselect/system-auth] is still present\n" +
+		"[error] Link [/etc/pam.d/system-auth] points to [/etc/authselect/system-auth]\n" +
+		"[error] Symbolic link [/etc/pam.d/system-auth] to [/etc/authselect/system-auth] still exists!\n" +
+		"Current configuration is not valid. It was probably modified outside authselect.\n"
+)
+
+// authselect's nsswitch.conf of the sssd profile (shortened); the same file
+// after ensureNsswitchSSS, which adds sss to the shadow line and nothing
+// else; and that file with a hosts line somebody changed.
+const (
+	nsswitchHead      = "# Generated by authselect\n# Do not modify this file manually.\n\npasswd:     sss files systemd\ngroup:      sss files systemd\n"
+	nsswitchGenerated = nsswitchHead + "shadow:     files\nhosts:      files dns myhostname\n"
+	nsswitchOwnEdit   = nsswitchHead + "shadow:     files sss\nhosts:      files dns myhostname\n"
+	nsswitchHandEdit  = nsswitchHead + "shadow:     files sss\nhosts:      files mdns4_minimal dns myhostname\n"
+)
+
+// nsswitchFixture builds the two nsswitch.conf files of a host in a temporary
+// directory and returns their paths: the host's file and authselect's.
+type nsswitchFixture func(t *testing.T) (nsswitch, authselects string)
+
+// nsswitchFiles makes both regular files; an empty content leaves that file out.
+func nsswitchFiles(generated, live string) nsswitchFixture {
+	return func(t *testing.T) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		nsswitch, authselects := filepath.Join(dir, "nsswitch.conf"), filepath.Join(dir, "authselect-nsswitch.conf")
+		for name, content := range map[string]string{authselects: generated, nsswitch: live} {
+			if content == "" {
+				continue
+			}
+			if err := os.WriteFile(name, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nsswitch, authselects
 	}
+}
+
+// nsswitchLink makes the host's file a symlink to a file with content that is
+// kept somewhere else.
+func nsswitchLink(generated, content string) nsswitchFixture {
+	return func(t *testing.T) (string, string) {
+		t.Helper()
+		nsswitch, authselects := nsswitchFiles(generated, "")(t)
+		target := filepath.Join(t.TempDir(), "nsswitch.conf")
+		if err := os.WriteFile(target, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, nsswitch); err != nil {
+			t.Fatal(err)
+		}
+		return nsswitch, authselects
+	}
+}
+
+// `authselect select … --force` overwrites every file authselect manages. The
+// files `authselect check` names are the ones somebody changed outside it;
+// /etc/nsswitch.conf is not among them when it holds this tool's own edit.
+func TestAuthselectForeignChanges(t *testing.T) {
+	const check = "authselect check"
+	invalid := exitErr(t, 3)
+	ownEdit, handEdit := nsswitchFiles(nsswitchGenerated, nsswitchOwnEdit), nsswitchFiles(nsswitchGenerated, nsswitchHandEdit)
+	for _, tc := range []struct {
+		name    string
+		output  string
+		failure error
+		files   nsswitchFixture
+		want    string // the files, separated by a space
+	}{
+		{"the check passes", "Current configuration is valid.\n", nil, ownEdit, ""},
+		// A minimal host, or one after `authselect opt-out`: authselect has
+		// nothing to compare the files with.
+		{"authselect has not configured the host", checkNotConfigured, exitErr(t, 2), nsswitchFiles("", nsswitchOwnEdit), ""},
+		// authselect 1.5 and 1.8 answer with 6 when none of the files exists
+		// either (1.2 answers with 2): nothing a select could overwrite.
+		{"neither a configuration nor one of the files", "No configuration detected.\n", exitErr(t, 6), nsswitchFiles("", ""), ""},
+		{"only the nsswitch.conf this tool wrote", checkOwnNsswitch, invalid, ownEdit, ""},
+		{"nsswitch.conf with a change of somebody else", checkOwnNsswitch, invalid, handEdit, "/etc/nsswitch.conf"},
+		// A profile that names sss on all three lines leaves the tool nothing
+		// to add, so it never writes the file: a regular copy with the bytes
+		// of authselect's file is somebody else's.
+		{"a regular nsswitch.conf where the tool had nothing to add", checkOwnNsswitch, invalid, nsswitchFiles(nsswitchOwnEdit, nsswitchOwnEdit), "/etc/nsswitch.conf"},
+		// The tool's edit leaves a regular file. A symlink to a file kept
+		// elsewhere is somebody's setup, whatever that file holds.
+		{"nsswitch.conf linked to a file with the bytes of the own edit", checkLinkedNsswitch, invalid, nsswitchLink(nsswitchGenerated, nsswitchOwnEdit), "/etc/nsswitch.conf"},
+		{"a PAM file edited in place", checkEditedPAM, invalid, ownEdit, "/etc/authselect/password-auth"},
+		{"a PAM file replaced, next to the own nsswitch.conf", checkReplacedPAM, invalid, ownEdit, "/etc/pam.d/system-auth"},
+		{"a PAM file removed", checkRemovedPAM, invalid, ownEdit, "/etc/pam.d/postlogin"},
+		{"two PAM files and the own nsswitch.conf", checkEditedAndReplacedPAM, invalid, ownEdit, "/etc/authselect/password-auth /etc/pam.d/system-auth"},
+		{"two PAM files and a foreign nsswitch.conf", checkEditedAndReplacedPAM, invalid, handEdit, "/etc/authselect/password-auth /etc/pam.d/system-auth /etc/nsswitch.conf"},
+		{"profile metadata gone, authselect's files still there", checkLeftovers, invalid, ownEdit, "/etc/authselect/system-auth /etc/pam.d/system-auth"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			run := fakeRunner(map[string]error{check: tc.failure}, map[string]string{check: tc.output}, &calls)
+			nsswitch, authselects := tc.files(t)
+			got, err := authselectForeignChanges(run, nsswitch, authselects)
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if strings.Join(got, " ") != tc.want {
+				t.Errorf("files = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// An answer this tool does not understand is an error: "nothing was changed
+// by hand" would let --force overwrite. Only exit code 3 means "changed
+// outside authselect", and then a file has to be named; a nsswitch.conf that
+// cannot be compared is not the tool's own edit.
+func TestAuthselectForeignChanges_UnclearAnswerIsAnError(t *testing.T) {
+	const check = "authselect check"
+	invalid := exitErr(t, 3)
+	ownEdit := nsswitchFiles(nsswitchGenerated, nsswitchOwnEdit)
+	for _, tc := range []struct {
+		name    string
+		failure error
+		output  string
+		files   nsswitchFixture
+		wantErr string
+	}{
+		{"not valid, but no file named", invalid, "Current configuration is not valid. It was probably modified outside authselect.\n", ownEdit, "authselect check: Current configuration is not valid."},
+		{"a profile that does not exist", invalid, "[error] Unable to load profile [custom/gone] [2]: No such file or directory\nCurrent configuration is not valid. It was probably modified outside authselect.\n", ownEdit, "authselect check: [error] Unable to load profile [custom/gone]"},
+		{"authselect's nsswitch.conf is gone", invalid, checkOwnNsswitch, nsswitchFiles("", nsswitchOwnEdit), "cannot be compared"},
+		{"nsswitch.conf is gone", invalid, checkOwnNsswitch, nsswitchFiles(nsswitchGenerated, ""), "cannot be compared"},
+		{"another failure that names a file", exitErr(t, 1), "[error] Unable to read [/etc/authselect/authselect.conf]\n", ownEdit, "authselect check: [error] Unable to read"},
+		{"the command did not run", errors.New(`exec: "authselect": executable file not found in $PATH`), "", ownEdit, "authselect check: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			run := fakeRunner(map[string]error{check: tc.failure}, map[string]string{check: tc.output}, &calls)
+			nsswitch, authselects := tc.files(t)
+			got, err := authselectForeignChanges(run, nsswitch, authselects)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("files = %q, err = %v; want an error naming %q", got, err, tc.wantErr)
+			}
+			if len(got) != 0 {
+				t.Errorf("files = %q next to the error, want none", got)
+			}
+		})
+	}
+}
+
+func TestAuthselectGuard(t *testing.T) {
+	const current, check = "authselect current --raw", "authselect check"
+	invalid, none := exitErr(t, 3), exitErr(t, 2)
+	ownEdit := nsswitchFiles(nsswitchGenerated, nsswitchOwnEdit)
+	guard := func(t *testing.T, results map[string]error, outputs map[string]string, files nsswitchFixture) error {
+		t.Helper()
+		var calls []string
+		nsswitch, authselects := files(t)
+		return authselectGuard(fakeRunner(results, outputs, &calls), nsswitch, authselects)
+	}
+	names := func(t *testing.T, err error, wants ...string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("err = nil, want a refusal")
+		}
+		for _, want := range wants {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %q, want it to name %s", err, want)
+			}
+		}
+	}
+
+	// The first --setup-ldap of a minimal host: authselect has configured
+	// nothing, so there is nothing somebody could have changed in it.
+	t.Run("authselect has not configured the host", func(t *testing.T) {
+		err := guard(t, map[string]error{current: none, check: none},
+			map[string]string{current: "No existing configuration detected.\n", check: checkNotConfigured}, nsswitchFiles("", nsswitchOwnEdit))
+		if err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+	})
+
+	// The second --setup-ldap of a host: the only change is the tool's own.
+	t.Run("a host this tool has configured before", func(t *testing.T) {
+		err := guard(t, map[string]error{check: invalid},
+			map[string]string{current: "sssd with-mkhomedir\n", check: checkOwnNsswitch}, ownEdit)
+		if err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+	})
+
+	// The refusal names the changed file and the command that overwrites it,
+	// with the features of this host: that is what the admin runs next.
+	t.Run("a file changed by hand", func(t *testing.T) {
+		err := guard(t, map[string]error{check: invalid},
+			map[string]string{current: "sssd with-faillock\n", check: checkReplacedPAM}, ownEdit)
+		names(t, err, "/etc/pam.d/system-auth", "`authselect select sssd with-faillock with-mkhomedir --force`")
+		if strings.Contains(err.Error(), "/etc/nsswitch.conf") {
+			t.Errorf("err = %q, names the tool's own edit of /etc/nsswitch.conf as a change", err)
+		}
+	})
+
+	// authselect.conf removed by hand: `authselect current` knows no profile,
+	// but the files authselect wrote are still there and `authselect check`
+	// names them. The forced select would overwrite them like any other.
+	t.Run("profile metadata gone, authselect's files still there", func(t *testing.T) {
+		err := guard(t, map[string]error{current: none, check: invalid},
+			map[string]string{current: "No existing configuration detected.\n", check: checkLeftovers}, ownEdit)
+		names(t, err, "/etc/authselect/system-auth", "/etc/pam.d/system-auth", "`authselect select sssd with-mkhomedir --force`")
+	})
+
+	t.Run("a check that cannot be read", func(t *testing.T) {
+		err := guard(t, map[string]error{check: invalid},
+			map[string]string{current: "sssd with-mkhomedir\n", check: "[error] Unable to read the configuration\n"}, ownEdit)
+		names(t, err, "authselect check: [error] Unable to read the configuration")
+	})
+
+	// "No profile" (exit code 2) is the one failure of `authselect current`
+	// the setup goes on from. Any other failure stops it here, before a file
+	// is written, and not only at the forced select.
+	t.Run("a profile that cannot be read", func(t *testing.T) {
+		for name, failure := range map[string]error{
+			"another exit code": exitErr(t, 1),
+			"did not run":       errors.New(`exec: "authselect": executable file not found in $PATH`),
+		} {
+			err := guard(t, map[string]error{current: failure},
+				map[string]string{current: "[error] Unable to get current configuration [5]: Input/output error\n", check: "Current configuration is valid.\n"}, ownEdit)
+			if err == nil || !strings.Contains(err.Error(), "authselect current --raw") {
+				t.Errorf("%s: err = %v, want an error naming the failed command", name, err)
+			}
+		}
+	})
 }

@@ -110,11 +110,50 @@ on the new file, or `could NOT roll back sssd.conf: …`), and after
 mkhomedir wiring, `sss` in `/etc/nsswitch.conf`, the sudoers and sshd drop-ins,
 masked SSSD socket units, an enabled sssd). Failures before `sssd.conf` is
 written (package index, package install, marking the packages, a missing
-`sss_ssh_authorizedkeys`, `sssd_ifp` or login shell) write no configuration
+`sss_ssh_authorizedkeys`, `sssd_ifp` or login shell, a file of authselect that
+was changed by hand) write no configuration
 file; packages installed so far stay installed. A failed
 local-account migration keeps the new `sssd.conf` (`kept the new sssd.conf:
 …`) and names the steps to finish by hand. Fix the cause and run
 `--setup-ldap` again.
+
+### `--setup-ldap` stops with `authselect reports changes made outside of it`
+
+Rocky Linux and Fedora. `--setup-ldap` wires PAM and NSS with
+`authselect select sssd … --force`, and authselect then writes every file it
+manages again: `system-auth`, `password-auth`, `postlogin`, `nsswitch.conf`
+and others. Before the setup writes anything it runs `authselect check`. When
+that names a file other than the setup's own edit of `/etc/nsswitch.conf`,
+somebody changed the file: by hand, or with a tool such as `sed -i`, which
+puts a regular file where authselect's symlink was. The setup stops and lists
+these files, because the next step would overwrite them.
+
+1. See what authselect reports: `authselect check`.
+2. Save what you still need from the listed files. No change to them survives
+   the next `authselect select`, whoever runs it.
+3. Run the command the message names, for example
+   `authselect select sssd with-mkhomedir --force`. authselect stores the
+   previous files under `/var/lib/authselect/backups/`.
+4. Run `--setup-ldap` again.
+
+A message that starts with `authselect current --raw:` or `authselect check:`,
+or names a file that `cannot be compared`, means the setup could not read
+authselect's answer or its `/etc/authselect/nsswitch.conf`; the text after it
+is the cause. The setup does not go on then either: without that answer it
+cannot tell whether a file was changed.
+
+When `/etc/authselect/authselect.conf` is gone but the files authselect wrote
+are still there, `authselect check` names all of them (`… is still present`,
+`Symbolic link … still exists!`) and the setup stops with that list. The
+command from the message puts authselect in order again.
+
+The check sees what authselect sees. A host that authselect has not
+configured (`authselect check` prints `System was not configured with
+authselect`, as on a minimal install or after `authselect opt-out`) gets the
+`sssd` profile without this stop. authselect 1.3 and later (Rocky Linux 10,
+Fedora) report a replaced or missing file, but not a line edited in place in
+one of their files; such a line is gone after the next `authselect select` or
+`authselect apply-changes`.
 
 ## Auth fails for every user
 

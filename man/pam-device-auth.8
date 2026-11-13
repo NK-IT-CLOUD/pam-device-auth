@@ -179,7 +179,14 @@ when unset), the package index refresh
 on Debian and Ubuntu), the package install and marking the packages as
 manually installed, and that
 .B sss_ssh_authorizedkeys
-and the InfoPipe responder are present. Every later step is checked too. A
+and the InfoPipe responder are present. On Rocky Linux and Fedora it also runs
+.B authselect check
+and stops when that names a file changed outside of authselect, other than
+this command's own edit of
+.IR /etc/nsswitch.conf :
+the
+.B authselect select
+of the setup would overwrite it. Every later step is checked too. A
 failed step aborts with one
 .B FAIL:
 line naming the command and its output, what the rollback did (the previous

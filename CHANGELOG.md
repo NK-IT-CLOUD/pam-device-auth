@@ -146,6 +146,20 @@ are; an upgrade needs no manual step.
   `Token refresh took …`, `JWKS fetch took …`).
 
 ### Changed
+- On Rocky Linux and Fedora `--setup-ldap` stops when authselect reports a
+  file that was changed outside of it, for example a `system-auth` edited by
+  hand. The setup runs `authselect select sssd … --force`, which writes every
+  file authselect manages again; so far that overwrote such a change without
+  a word. Now the setup asks `authselect check` before it writes anything and
+  names the files and the command to run once the changes are saved:
+  ``FAIL: authselect reports changes made outside of it in /etc/pam.d/system-auth. The setup runs `authselect select sssd with-mkhomedir --force`, which overwrites them, …``.
+  The setup's own edit of `/etc/nsswitch.conf` does not count. An
+  `authselect current` or `authselect check` that fails for another reason
+  stops the setup too; before, a failed `authselect current` counted as "no
+  profile". Two cases pass as before: a host that authselect has not
+  configured (a minimal install, or after `authselect opt-out`) gets the
+  `sssd` profile, and authselect 1.3 and later (Rocky Linux 10, Fedora)
+  report a replaced or missing file but not a line edited in place.
 - Removing the package prints what stays behind when sssd is configured:
   `sssd stays configured: directory users can log in over SSH with their directory password if sshd allows password authentication; review PasswordAuthentication and /etc/sssd/sssd.conf`.
   The removal deletes the sshd drop-in that required the key and the OIDC

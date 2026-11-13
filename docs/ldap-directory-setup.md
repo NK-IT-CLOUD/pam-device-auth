@@ -29,9 +29,17 @@ Active Directory, see [active-directory-setup.md](active-directory-setup.md).
    `sssd with-mkhomedir`, and the setup prints the profile it replaced.
    `--force` is part of every run: the setup itself adds `sss` to
    `/etc/nsswitch.conf` where the profile leaves it out, and authselect counts
-   that as a change made outside of it. Changes made by hand to the files
-   authselect manages are overwritten; authselect keeps a backup of them under
-   `/var/lib/authselect/backups/`.
+   that as a change made outside of it. `--force` writes every other file
+   authselect manages again as well (`system-auth`, `password-auth` and
+   others), so the setup runs `authselect check` first and stops, before it
+   writes a file, when that names anything but its own edit of
+   `/etc/nsswitch.conf`
+   ([troubleshooting](troubleshooting.md#--setup-ldap-stops-with-authselect-reports-changes-made-outside-of-it)).
+   Two cases pass that check: a host that authselect has not configured (a
+   minimal install, or after `authselect opt-out`) gets the `sssd` profile, and
+   authselect 1.3 and later (Rocky Linux 10, Fedora) do not report a line
+   edited in place in one of their files. authselect keeps a backup of what
+   it overwrites under `/var/lib/authselect/backups/`.
    `sssd-dbus` provides the SSSD
    InfoPipe (`ifp`) responder. Without it sssd does not start, because `--setup-ldap`
    enables `ifp` in `sssd.conf`; `--check` reports a missing responder as a blocker.
