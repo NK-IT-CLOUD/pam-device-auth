@@ -143,9 +143,11 @@ The `clients` attribute is a per-user source-IP/CIDR allowlist, enforced on ever
 login, including key-only service accounts, by the PAM account phase. It reads
 `clients` from the SSSD InfoPipe over D-Bus (`busctl`), not from the OIDC token.
 
-- root alone is exempt: this is the break-glass path and never touches SSSD.
-  Local non-root users are not exempt, preventing same-name local entries from
-  bypassing directory IP policy.
+- root is exempt: this is the break-glass path and never touches SSSD. The
+  local accounts listed in `break_glass_users` are exempt as well, as long as
+  the directory does not know their names. Every other local account is not
+  exempt, preventing same-name local entries from bypassing directory IP
+  policy.
 - if a directory user has no `clients` attribute, the login is unrestricted.
 - if the InfoPipe read fails for any reason, the gate fails closed and denies the
   login. This means an SSSD or InfoPipe outage denies all directory users, not
@@ -181,6 +183,13 @@ from the directory in this setup. The list of accounts names them
 needed through a directory group. An account with running processes is
 skipped with a warning; stop them and run `--setup-ldap` again. No process is
 killed. Genuine local-only accounts and same-uid entries are left untouched.
+
+An account listed in `break_glass_users` is never migrated: it is the local
+account on purpose. If the directory has an account of the same name, the
+setup prints `break-glass account <name> also resolves in the directory (uid
+<n>); it is not migrated, and its logins are denied until the local account or
+the directory user is renamed`, and `--check` reports the name as a blocker
+([configuration reference](configuration-reference.md#a-directory-account-of-the-same-name)).
 
 `--check` shows this decision beforehand and changes nothing: one `[WARN]` per
 account, `local account <name> (uid <local>) shadows the directory user (uid
@@ -264,7 +273,9 @@ the module ([INSTALL.md](../INSTALL.md#uninstall)). This applies to both
   Root stays key-only (break-glass), unless `root_login` is set to `disabled` (see the
   [configuration reference](configuration-reference.md#root_login)): a `Match User root` block in the drop-in restores
   `AuthorizedKeysFile .ssh/authorized_keys` for root only, so `/root/.ssh/authorized_keys`
-  keeps working; root never uses OIDC/SSSD.
+  keeps working; root never uses OIDC/SSSD. The accounts in `break_glass_users` get a block of
+  the same kind, with `AuthorizedKeysCommand none` in addition
+  ([configuration reference](configuration-reference.md#break_glass_users)).
 - **Activation ordering (avoid lockout)**: the AND drop-in takes effect on the next sshd restart
   (done by `--enable`). Populate `sshPublicKey` for every SSH user in LLDAP before that restart:
   a non-root user without a key in LLDAP cannot satisfy the publickey factor and is locked out

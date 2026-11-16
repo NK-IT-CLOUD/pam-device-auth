@@ -131,8 +131,8 @@ includes the optional `service_account_groups` and `nopasswd_sudo_groups` groups
 For an optional source-IP restriction, set the multi-valued `clients` attribute
 on the user in the directory. pam-device-auth reads it from SSSD in the PAM
 account phase and denies logins from any address not on the list. A user without
-a `clients` attribute is unrestricted. Only root is exempt; unsupported local
-non-root users fail closed.
+a `clients` attribute is unrestricted. Only root and the accounts in
+`break_glass_users` are exempt; every other local account fails closed.
 See [docs/ip-allowlist.md](docs/ip-allowlist.md).
 
 ## 3. Configure pam-device-auth
@@ -354,8 +354,10 @@ restart.
 The package does not install
 `/etc/ssh/sshd_config.d/10-pam-device-auth.conf`; only `--setup-ldap` writes
 it, and `--enable` re-renders it when it does not reference the platform's
-`sss_ssh_authorizedkeys` path. Both validate it with `sshd -t` and roll back
-on rejection. The package changes one line of it: in a drop-in with
+`sss_ssh_authorizedkeys` path, when its `PermitRootLogin` line does not fit
+`root_login`, or when its break-glass section is not the one
+`break_glass_users` and `break_glass_sources` ask for. Both validate it with
+`sshd -t` and roll back on rejection. The package changes one line of it: in a drop-in with
 `LogLevel DEBUG1`, that line becomes `LogLevel VERBOSE` plus a `LogVerbose` line,
 validated with `sshd -t`; if sshd rejects it, the previous drop-in is put back
 and the post-install script fails. Hosts installed before the
@@ -419,15 +421,22 @@ is recommended for every entry in `service_account_groups`.
 depends on SSSD/InfoPipe, so an SSSD outage cannot lock out the local
 break-glass key.
 
+**Named break-glass accounts are exempt too.** A local account listed in
+[`break_glass_users`](docs/configuration-reference.md#break_glass_users) logs
+in with its own SSH key and skips the `clients` read, as long as it has an
+entry in `/etc/passwd` and the directory does not know its name. Use one when
+you want an emergency login that is not root; the package does not create the
+account.
+
 **Fail-closed:** the gate is enforced through the SSSD InfoPipe (`ifp`
 responder), which `--setup-ldap` configures automatically; it installs the
 `sssd-dbus` package that provides the responder, and the helper reads it with
 `busctl` from systemd. The account phase reads `clients` for
 every directory user, so if InfoPipe is unavailable the lookup fails and the
 login is denied. This denies **every directory user** at the account phase,
-whether or not `clients` is set, until InfoPipe is restored. Only root is
-exempt (root break-glass never touches SSSD/InfoPipe), so the recovery path
-stays open during an outage.
+whether or not `clients` is set, until InfoPipe is restored. Only root and the
+break-glass accounts are exempt (neither reads the InfoPipe), so the recovery
+path stays open during an outage.
 
 `sudo pam-device-auth --check` reports InfoPipe health and lists which
 directory members are IP-pinned versus unrestricted, warning on service

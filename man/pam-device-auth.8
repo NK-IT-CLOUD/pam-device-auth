@@ -54,8 +54,10 @@ Every login, including key-only service accounts, is checked against a
 per-user source-IP/CIDR allowlist read from the directory
 .I clients
 attribute, enforced in the PAM account phase over the SSSD InfoPipe
-(busctl). Only root is exempt from this check (break-glass); it never touches
-SSSD for root. Local non-root users still go through the SSSD InfoPipe lookup.
+(busctl). Only root and the local accounts listed in
+.I break_glass_users
+are exempt from this check (break-glass); it never touches SSSD for root.
+Every other local account still goes through the SSSD InfoPipe lookup.
 The check fails closed: if the
 .I clients
 lookup for a directory user or a local non-root user fails, that login is denied, so an InfoPipe/SSSD outage denies all
@@ -100,7 +102,10 @@ NSS, every access-group member has a valid
 .IR sshPublicKey ),
 the sshd factors (AuthorizedKeysCommand, UsePAM and
 KbdInteractiveAuthentication, non-root 2FA, the methods sshd applies to each
-member of the access group and the service groups, root break-glass), IP
+member of the access group and the service groups, root break-glass), the
+accounts in
+.I break_glass_users
+(local entry, directory lookup, key file, password aging, sshd policy), IP
 allowlist posture, and SSSD InfoPipe health. It reports how long OIDC
 discovery took and warns when two requests in a row took more than 2 seconds.
 The member lists are what NSS reports. With profile
@@ -314,6 +319,8 @@ show_qr	No	auto	QR display: true/false/auto-detect
 root_login	No	key	key (root SSH key) or disabled
 required_acr	No	\-	Accepted acr claim values (exact match)
 root_login_sources	No	\-	Client IPs for root's policy in \-\-check
+break_glass_users	No	\-	Local accounts with a key-only emergency login
+break_glass_sources	No	any	Client IPs/CIDRs for the break-glass accounts
 ldap	setup	\-	Directory block for \-\-setup\-ldap (see below)
 .TE
 .PP
@@ -445,7 +452,8 @@ SSH key only
 against root's local authorized_keys, and exempt from the
 .I clients
 IP allowlist check. Root key-only login is the break-glass path, independent
-of OIDC/SSSD/LDAP availability. Other local users cannot log in: sshd reads no
+of OIDC/SSSD/LDAP availability. Local users other than the break-glass
+accounts below cannot log in: sshd reads no
 local authorized_keys for them, the OIDC step requires a directory identity,
 and the account phase fails closed for a user the SSSD InfoPipe does not
 know. If
@@ -455,6 +463,26 @@ is set to
 in the configuration, the sshd drop-in sets
 .B PermitRootLogin no
 and root cannot log in over SSH at all.
+.PP
+.B Break-glass accounts:
+the local accounts listed in
+.I break_glass_users
+log in with their own SSH key
+.RB ( "AuthenticationMethods publickey" ,
+.BR "AuthorizedKeysCommand none" ),
+from the addresses in
+.I break_glass_sources
+when that is set, and are exempt from the
+.I clients
+check. Such an account must have an entry in /etc/passwd, and its name must
+not resolve in the directory: a name the directory knows is denied and
+reported by
+.B \-\-check
+as a blocker. A listed name never gets an OIDC login. Unlike root, these
+accounts need the helper and a config.json that parses as JSON, and
+pam_nologin and pam_unix (account expiry, password aging) apply to them.
+The package does not create the accounts. Apply a change of either key with
+.BR \-\-enable .
 .SH SECURITY
 .PP
 Two factors (directory SSH key + OIDC), with full token validation on every

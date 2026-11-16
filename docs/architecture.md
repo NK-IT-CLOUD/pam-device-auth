@@ -95,6 +95,15 @@ SSSD will not resolve it.
 > **Root break-glass:** `Match User root` overrides to `AuthenticationMethods
 > publickey` against root's local `authorized_keys`. Root never depends on
 > OIDC/SSSD/LDAP availability.
+>
+> **Named break-glass accounts:** the local accounts in `break_glass_users` get
+> a `Match User` block of their own, in front of every other `Match` block:
+> `AuthenticationMethods publickey`, their local `authorized_keys` and
+> `AuthorizedKeysCommand none`, so the directory can never supply a key for
+> such a name. With `break_glass_sources` the block is limited to those
+> addresses and a second block leaves every other address without a key
+> source. See the
+> [configuration reference](configuration-reference.md#break_glass_users).
 
 Revocation: removing a user from the access group (or stripping their
 `required_role`) denies the next login and sudo. The OIDC factor is mandatory,
@@ -196,19 +205,33 @@ SSSD access filter (`pam_sss` in the distribution's account stack). It enforces 
 directory-provided `clients` source-IP/CIDR allowlist:
 
 1. Root is exempt and returns `PAM_SUCCESS` immediately, before any fork or
-   network activity. It is the sole break-glass path and never touches the
-   helper, SSSD, or the IdP. Local non-root users are not exempt because a
-   same-named directory identity could otherwise bypass its IP policy.
+   network activity. It is the one path that never touches the helper, SSSD,
+   or the IdP. Local non-root users are not exempt because a same-named
+   directory identity could otherwise bypass its IP policy; the exception is
+   an account the admin lists in `break_glass_users`, which the helper
+   decides in step 3.
 2. For every non-root user, the module forks and `execl`s the helper as
    `pam-device-auth --pam-acct`. This run is non-interactive: there is no
    PAM conversation, so no pipes are wired to the child beyond the closed
    fd table; the module only waits for an exit code.
-3. The helper (`cmd/pam-device-auth/acct.go`) opens its log first. If it
+3. The helper (`cmd/pam-device-auth/acct.go`) reads `break_glass_users` and
+   `break_glass_sources` from `config.json`, and only these two keys, then
+   opens its log. If it
    cannot open `/var/log/pam-device-auth.log`, finds no regular file there or
    cannot remove mode bits beyond `0640`, there is no
    audit log for the decision: it sends the reason to syslog (`authpriv`,
    tag `pam-device-auth`, ending in `; denying`) and exits 3 without reading
-   `clients`. Otherwise it reads the user's `clients`
+   `clients`. A break-glass account is decided without the log as well and,
+   when allowed, reported to syslog like root. With a log, a user listed in
+   `break_glass_users` is allowed when it has an entry in `/etc/passwd`,
+   `PAM_RHOST` is inside `break_glass_sources` (when set), and `getent -s sss
+   passwd` does not answer with that name within 3 seconds; a name the
+   directory knows is denied, a lookup without an answer is not. `clients` is
+   never read for such an account. A user that the break-glass section of the
+   sshd drop-in still names, but the config no longer lists, is denied as
+   well: sshd accepted its local key without OIDC. For every other user the
+   helper reads the
+   user's `clients`
    attribute from SSSD over D-Bus (`busctl … GetUserAttr sas <user> 1
    clients`, the SSSD InfoPipe `ifp` responder) and compares it against
    `PAM_RHOST`.

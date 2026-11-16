@@ -201,7 +201,7 @@ func TestWritersRefuseUnreadableExistingFile(t *testing.T) {
 		"sssd.conf": func(path string) error { _, err := writeSSSDConfAt(path, "[new]\n"); return err },
 		"sshd drop-in": func(path string) error {
 			sshdDropinPath = path
-			return writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+			return writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 		},
 		"sudoers": func(path string) error { return writeSudoersAt(path, "%ssh-admin ALL=(ALL:ALL) ALL\n", noCheck) },
 	} {
@@ -249,7 +249,7 @@ func TestValidatedWritersAfterDirSyncFailure(t *testing.T) {
 	for name, w := range map[string]writer{
 		"sshd drop-in": {"sshd -t", func(path string, validate func() ([]byte, error)) error {
 			sshdDropinPath, sshdTest = path, validate
-			return writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+			return writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 		}},
 		"sudoers": {"visudo -c", func(path string, validate func() ([]byte, error)) error {
 			return writeSudoersAt(path, "%ssh-admin ALL=(ALL:ALL) ALL\n", validate)
@@ -584,7 +584,7 @@ func TestAtomicWriteFile_ErrorLeavesTargetUntouched(t *testing.T) {
 }
 
 func TestSshdDropinDisablesLocalKeysForNonRoot(t *testing.T) {
-	content := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+	content := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 	matchIdx := strings.Index(content, "Match User root")
 	if matchIdx < 0 {
 		t.Fatal("drop-in must contain a 'Match User root' block")
@@ -600,7 +600,7 @@ func TestSshdDropinDisablesLocalKeysForNonRoot(t *testing.T) {
 }
 
 func TestSshdDropinLogsOnlyClientVersion(t *testing.T) {
-	content := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+	content := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 	global := content[:strings.Index(content, "Match ")]
 	if !strings.Contains(global, "\nLogLevel VERBOSE\n") || strings.Contains(content, "DEBUG") {
 		t.Errorf("drop-in must set LogLevel VERBOSE and no debug level:\n%s", content)
@@ -611,14 +611,14 @@ func TestSshdDropinLogsOnlyClientVersion(t *testing.T) {
 }
 
 func TestSshdDropinNoServiceGroupsUnchanged(t *testing.T) {
-	got := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+	got := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 	if strings.Contains(got, "Match Group") {
 		t.Fatalf("no service groups but Match Group present:\n%s", got)
 	}
 }
 
 func TestSshdDropinServiceGroupKeyOnly(t *testing.T) {
-	got := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", []string{"ssh-service", "ci"}, "")
+	got := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", []string{"ssh-service", "ci"}, "", config.BreakGlass{})
 	if !strings.Contains(got, "Match Group ssh-service,ci\n    AuthenticationMethods publickey\n") {
 		t.Fatalf("service Match block wrong:\n%s", got)
 	}
@@ -649,7 +649,7 @@ func TestNsswitchWithSSS(t *testing.T) {
 }
 
 func TestSshdDropinUsesProfileSSSPath(t *testing.T) {
-	got := renderSshdDropin("/usr/libexec/sssd/sss_ssh_authorizedkeys", nil, "")
+	got := renderSshdDropin("/usr/libexec/sssd/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 	if !strings.Contains(got, "AuthorizedKeysCommand /usr/libexec/sssd/sss_ssh_authorizedkeys") {
 		t.Fatalf("sshd drop-in missing RHEL SSS path:\n%s", got)
 	}
@@ -690,7 +690,7 @@ func TestSSSDConfUsesDebianCAPathByDefault(t *testing.T) {
 }
 
 func TestSshdDropinUsesDebianSSSPathByDefault(t *testing.T) {
-	got := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+	got := renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 	if !strings.Contains(got, "AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys") {
 		t.Fatalf("sshd drop-in missing Debian SSS path:\n%s", got)
 	}
@@ -1773,7 +1773,7 @@ func TestSshdDropin_ProfileNeutralCommentsOnly(t *testing.T) {
 		if err != nil || len(old) == 0 {
 			t.Fatalf("%s: embedded fixture missing or empty: %v", c.file, err)
 		}
-		got := renderSshdDropin(c.sssCmd, c.groups, c.rootLogin)
+		got := renderSshdDropin(c.sssCmd, c.groups, c.rootLogin, config.BreakGlass{})
 		if strings.Contains(strings.ToLower(got), "lldap") {
 			t.Errorf("%s: drop-in names LLDAP:\n%s", c.file, got)
 		}

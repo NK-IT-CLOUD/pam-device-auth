@@ -103,6 +103,17 @@ func (f *authFlow) run(sshUser, clientIP string) outcome {
 		return denyHard
 	}
 
+	// A break-glass account logs in with its local key and nothing else. sshd
+	// asks these accounts for publickey only, so this phase is not reached; if
+	// it is (drop-in not rendered yet, another sshd config), the name gets no
+	// OIDC login, whatever the directory says about it: on this host the name
+	// belongs to the local account, like root.
+	if f.cfg.BreakGlass().Has(sshUser) {
+		f.log.Error("Directory: %s is a break-glass account (break_glass_users); it never signs in through the identity provider; denying", sshUser)
+		f.deny("Access denied: no directory identity for this user.")
+		return denyHard
+	}
+
 	// Defensive NSS identity gate. In directory mode the SSH user MUST resolve
 	// via NSS (SSSD/LDAP). The deployed sshd config already guarantees this —
 	// publickey is served from the directory by sss_ssh_authorizedkeys, so an
@@ -433,7 +444,14 @@ func identityGate(user string, found bool, lookupErr error) (allow bool, logMsg,
 // (timeout, SSSD down, exec error) is returned as err so callers can log an
 // outage instead of claiming the account does not exist.
 func nssLookup(username string) (found bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	return sssLookup(username, 5*time.Second)
+}
+
+// sssLookup is nssLookup with the time limit as a parameter: the account
+// phase gives the lookup of a break-glass account less time
+// (breakGlassLookupTimeout).
+func sssLookup(username string, timeout time.Duration) (found bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "getent", "-s", "sss", "passwd", "--", username).Output()
 	if err != nil {

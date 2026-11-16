@@ -117,7 +117,7 @@ func TestPamAccount_RefusesDashName(t *testing.T) {
 	}
 	called := false
 	read := func(string) ([]string, error) { called = true; return nil, nil }
-	if code := pamAccount(log, "--address=unixexec:path=/tmp/x", "192.0.2.10", read); code != 1 {
+	if code := pamAccount(log, "--address=unixexec:path=/tmp/x", "192.0.2.10", acctInputs{read: read}); code != 1 {
 		t.Errorf("pamAccount() = %d, want 1 (deny)", code)
 	}
 	if called {

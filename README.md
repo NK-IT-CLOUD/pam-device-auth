@@ -292,6 +292,8 @@ profile would overwrite that change.
 | `root_login` | no | `key` (default) keeps root's local SSH key as the emergency path; `disabled` refuses every SSH login of root, so root is reachable only through a console |
 | `required_acr` | no | accepted values of the token's `acr` claim (exact match); a token without `acr` or with another value is denied |
 | `root_login_sources` | no | client IPs for which `--check` evaluates root's sshd policy (`Match Address` blocks) |
+| `break_glass_users` | no | local accounts that log in with their own SSH key while LDAP, SSSD or the identity provider is down; never a directory login |
+| `break_glass_sources` | no | client IPs and CIDR ranges the break-glass accounts may log in from (default: any) |
 | `ldap` | setup/check | directory settings for `--setup-ldap` and the directory preflight: `profile` (`lldap` or `ad`), `uri`, `base_dn`, `bind_dn`, `bind_password` or `bind_password_file` (none with a Kerberos keytab), `access_group`, `admin_group`; optional `ca_file`, `attributes`, `id_mapping`, `id_range`, `home`, `shell`, `kerberos`, `user_search_base`, `group_search_base`, `service_account_groups`, `nopasswd_sudo_groups` |
 
 `--setup-ldap` reads `ldap.bind_password` or the file in
@@ -327,9 +329,9 @@ The optional `clients` LDAP attribute, or the one named in
 `ldap.attributes.clients`, holds a per-user list of source IPs or CIDRs. The
 PAM account phase (`--pam-acct`) enforces it on every login, including
 key-only service accounts. It reads `clients` for the logging-in user from the SSSD
-InfoPipe over `busctl`. Only root is exempt, because break-glass access must not
-depend on SSSD. Local non-root accounts are not a supported login tier and fail
-the check closed.
+InfoPipe over `busctl`. Only root and the accounts named in `break_glass_users`
+are exempt, because break-glass access must not depend on SSSD. Every other
+local account is no login tier and fails the check closed.
 
 The check fails closed: if the InfoPipe lookup for a directory user errors out,
 that login is denied. An SSSD or InfoPipe outage therefore denies all directory
@@ -380,7 +382,7 @@ authentication level (`required_acr`), algorithm, key-type and curve binding
 (RS and ES, 256/384/512), a required `kid`, and no `none` or HMAC.
 
 - **Source IP allowlist.** Enforced in the PAM account phase for every login. Only
-  root is exempt.
+  root and the break-glass accounts are exempt.
 - **Directory revocation.** Remove a user from the access group and from its
   mapped OIDC access role. New logins are denied after SSSD and identity-provider
   caches expire. Existing sessions are not terminated.
@@ -397,6 +399,12 @@ authentication level (`required_acr`), algorithm, key-type and curve binding
   and never through a symlink.
 - **Root break-glass.** Key-only, independent of OIDC, SSSD and LDAP. Switch it off
   with `root_login: disabled`.
+- **Named break-glass accounts.** `break_glass_users` lists local accounts that
+  log in with their local SSH key while the directory or the identity provider
+  is down, from `break_glass_sources` only when that is set. A listed name is
+  never a directory login on that host, and a directory account of the same
+  name gets the login denied, never merged. See the
+  [configuration reference](docs/configuration-reference.md#break_glass_users).
 - **Uninstall.** Removing the package restores the original `/etc/pam.d/sshd`
   from `/etc/pam.d/sshd.original`, removes the sshd drop-in and deletes the
   managed `/etc/sudoers.d/pam-device-auth` file, so no `NOPASSWD` grant stays

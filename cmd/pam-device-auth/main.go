@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -354,7 +353,7 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 
 		// Migration preview: what --setup-ldap would do with local accounts
 		// that shadow a directory user. A warning, never a blocker.
-		preview, perr := shadowingPreview("/proc")
+		preview, perr := shadowingPreview("/proc", cfg.BreakGlass())
 		if perr != nil {
 			chk(false, false, "", "local accounts that shadow directory users were NOT checked: "+perr.Error())
 		}
@@ -430,12 +429,28 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 		if useDNS, ok := sshdParam("usedns", ""); ok {
 			chk(useDNS != "yes", false,
 				"UseDNS no (PAM receives the client IP for the IP allowlist)",
-				"sshd has UseDNS yes; PAM receives the client host name instead of its IP and the account-phase IP gate denies every user with a clients allowlist; set UseDNS no")
+				useDNSWarning(len(cfg.BreakGlassUsers) > 0 && len(cfg.BreakGlassSources) > 0))
 		}
 	} else {
 		// Fatal: if sshd -T cannot be evaluated the effective sshd policy is
 		// unverified (or the config is invalid), so --enable must not proceed.
 		chk(false, true, "", "could not run 'sshd -T' to verify the sshd factors (run as root; if it fails, the sshd config is invalid)")
+	}
+
+	// --- Break-glass accounts (nothing without break_glass_users, unless the
+	// drop-in still holds a section for accounts that were taken out) ---
+	bg := cfg.BreakGlass()
+	staleDropin := breakGlassDropinStaleOnDisk(bg)
+	bgLines := breakGlassSection(bg.Users, cfg.RootLoginIsDisabled(), staleDropin, func(user string) ([]checkLine, bool) {
+		facts := gatherBreakGlassFacts(user, bg.Sources)
+		facts.DropinStale = staleDropin
+		return breakGlassVerdicts(user, facts)
+	})
+	if len(bgLines) > 0 {
+		fmt.Println("Break-glass accounts:")
+		for _, l := range bgLines {
+			chk(l.ok, l.fatal, l.msg, l.msg)
+		}
 	}
 
 	return fails, warns
@@ -658,12 +673,7 @@ func reportMemberKeyStatus(keysCmd string, members []string, okMsg, noKeyFmt, ba
 
 // hasValidSSHKey reports whether an authorized_keys blob contains at least one
 // key that parses, using ssh-keygen -l (the same parser family as sshd).
-func hasValidSSHKey(authKeys []byte) bool {
-	c := exec.Command("ssh-keygen", "-l", "-f", "/dev/stdin")
-	c.Stdin = bytes.NewReader(authKeys)
-	out, err := c.Output()
-	return err == nil && strings.TrimSpace(string(out)) != ""
-}
+func hasValidSSHKey(authKeys []byte) bool { return countSSHKeys(authKeys) > 0 }
 
 // sshdTOutput runs `sshd -T` with the given arguments; a seam for tests.
 // sshd is found through the fixed PATH of setSystemPath.
@@ -823,7 +833,7 @@ func backupFile(src, dst string) (bool, error) {
 // sss_ssh_authorizedkeys path. The latter catches a stale drop-in that names
 // another AuthorizedKeysCommand path, which would otherwise leave sshd serving
 // no directory key.
-func dropinNeedsRender(path, sssCmd, rootLogin string) bool {
+func dropinNeedsRender(path, sssCmd, rootLogin string, bg config.BreakGlass) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return true
@@ -835,6 +845,10 @@ func dropinNeedsRender(path, sssCmd, rootLogin string) bool {
 		want = "\nPermitRootLogin no\n"
 	}
 	if !strings.Contains(string(data), want) {
+		return true
+	}
+	// A changed break-glass section must reach sshd as well.
+	if breakGlassDropinStale(string(data), bg) {
 		return true
 	}
 	return sssCmd != "" && !strings.Contains(string(data), sssCmd)
@@ -1135,7 +1149,7 @@ func runEnable() {
 		// template, so it matches the checked binary. writeSshdDropin validates
 		// with `sshd -t` and rolls back on rejection.
 		renderDropin: func() error {
-			if !dropinNeedsRender(sshdConf, sssCmd, cfg.RootLogin) {
+			if !dropinNeedsRender(sshdConf, sssCmd, cfg.RootLogin, cfg.BreakGlass()) {
 				return nil
 			}
 			if err := checkSSSAuthKeys(sssCmd); err != nil {
@@ -1145,7 +1159,7 @@ func runEnable() {
 			if cfg.LDAP != nil {
 				serviceGroups = cfg.LDAP.ServiceAccountGroups
 			}
-			if err := writeSshdDropin(sssCmd, serviceGroups, cfg.RootLogin); err != nil {
+			if err := writeSshdDropin(sssCmd, serviceGroups, cfg.RootLogin, cfg.BreakGlass()); err != nil {
 				return fmt.Errorf("cannot write %s: %w", sshdConf, err)
 			}
 			fmt.Println("Installed SSH config")
@@ -1175,6 +1189,18 @@ func runEnable() {
 		fmt.Println("Root: SSH key only (no OIDC)")
 	}
 	fmt.Println("Other users: SSH key + OIDC Device Authorization")
+	if line := breakGlassEnableLine(cfg.BreakGlass()); line != "" {
+		fmt.Println(line)
+	}
+}
+
+// breakGlassEnableLine is the closing line of --enable that names the
+// break-glass accounts, "" when there are none.
+func breakGlassEnableLine(bg config.BreakGlass) string {
+	if len(bg.Users) == 0 {
+		return ""
+	}
+	return "Break-glass accounts: SSH key only, local (" + strings.Join(bg.Users, ", ") + ")"
 }
 
 // hasFlag reports whether flag appears anywhere in args. The dispatch loop in

@@ -20,9 +20,13 @@ accounts that never complete an OIDC device flow.
 See `cmd/pam-device-auth/acct.go` for the account-phase logic and
 `cmd/pam-device-auth/main.go` (`matchesAllowedIP`) for the IP/CIDR matching.
 
-**Only root is exempt.** Local non-root accounts are not a supported login tier
-and fail closed at the InfoPipe lookup. This prevents a local `/etc/passwd`
-entry with the same name as a directory identity from bypassing its IP policy.
+**Only root and the accounts in `break_glass_users` are exempt.** Every other
+local account is not a supported login tier and fails closed at the InfoPipe
+lookup. This prevents a local `/etc/passwd` entry with the same name as a
+directory identity from bypassing its IP policy. A break-glass account is
+exempt only while the directory does not know its name, and its own address
+limit is [`break_glass_sources`](configuration-reference.md#break_glass_sources),
+not `clients`.
 
 **The check fails closed.** If the `clients` lookup for a directory user errors
 (SSSD down, InfoPipe unreachable, D-Bus timeout), that login is denied, not

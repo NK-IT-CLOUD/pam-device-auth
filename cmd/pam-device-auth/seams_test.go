@@ -58,10 +58,10 @@ func TestPamAccount_DecisionTable(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			log, done := testLog(t)
 			called := false
-			got := pamAccount(log, c.user, c.rhost, func(string) ([]string, error) {
+			got := pamAccount(log, c.user, c.rhost, acctInputs{read: func(string) ([]string, error) {
 				called = true
 				return c.clients, c.readErr
-			})
+			}})
 			done()
 			if got != c.want {
 				t.Errorf("pamAccount() = %d, want %d", got, c.want)
@@ -77,9 +77,9 @@ func TestPamAccount_DecisionTable(t *testing.T) {
 // entry next to it must still be honoured.
 func TestPamAccount_LogsInvalidAllowlistEntries(t *testing.T) {
 	log, done := testLog(t)
-	got := pamAccount(log, "nk", "198.51.100.2", func(string) ([]string, error) {
+	got := pamAccount(log, "nk", "198.51.100.2", acctInputs{read: func(string) ([]string, error) {
 		return []string{"198.51.100.0/33", "not-an-ip", "198.51.100.2"}, nil
-	})
+	}})
 	out := done()
 	if got != 0 {
 		t.Errorf("valid entry next to invalid ones must still allow, got %d", got)
@@ -90,9 +90,9 @@ func TestPamAccount_LogsInvalidAllowlistEntries(t *testing.T) {
 
 	// With only invalid entries the user is denied, and the log says why.
 	log, done = testLog(t)
-	if got := pamAccount(log, "nk", "198.51.100.2", func(string) ([]string, error) {
+	if got := pamAccount(log, "nk", "198.51.100.2", acctInputs{read: func(string) ([]string, error) {
 		return []string{"198.51.100.0/33"}, nil
-	}); got != 1 {
+	}}); got != 1 {
 		t.Errorf("only invalid entries must deny, got %d", got)
 	}
 	if out := done(); !strings.Contains(out, "198.51.100.0/33") {

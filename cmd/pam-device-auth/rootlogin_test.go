@@ -16,7 +16,7 @@ const testSSSCmd = "/usr/bin/sss_ssh_authorizedkeys"
 
 func TestRenderSshdDropin_RootLoginModes(t *testing.T) {
 	for _, mode := range []string{"", "key"} {
-		got := renderSshdDropin(testSSSCmd, nil, mode)
+		got := renderSshdDropin(testSSSCmd, nil, mode, config.BreakGlass{})
 		for _, want := range []string{"\nPermitRootLogin prohibit-password\n", "Match User root", "AuthorizedKeysFile .ssh/authorized_keys"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("mode %q: drop-in lacks %q:\n%s", mode, want, got)
@@ -24,7 +24,7 @@ func TestRenderSshdDropin_RootLoginModes(t *testing.T) {
 		}
 	}
 
-	got := renderSshdDropin(testSSSCmd, []string{"ssh-service"}, "disabled")
+	got := renderSshdDropin(testSSSCmd, []string{"ssh-service"}, "disabled", config.BreakGlass{})
 	if !strings.Contains(got, "\nPermitRootLogin no\n") {
 		t.Errorf("disabled: drop-in lacks PermitRootLogin no:\n%s", got)
 	}
@@ -43,29 +43,29 @@ func TestRenderSshdDropin_RootLoginModes(t *testing.T) {
 
 // The default drop-in must stay byte-for-byte what it was before root_login existed.
 func TestRenderSshdDropin_DefaultUnchanged(t *testing.T) {
-	if renderSshdDropin(testSSSCmd, nil, "") != renderSshdDropin(testSSSCmd, nil, "key") {
+	if renderSshdDropin(testSSSCmd, nil, "", config.BreakGlass{}) != renderSshdDropin(testSSSCmd, nil, "key", config.BreakGlass{}) {
 		t.Error("an empty root_login and \"key\" must render the same drop-in")
 	}
 }
 
 func TestDropinNeedsRender_RootLoginChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "10-pam-device-auth.conf")
-	if err := os.WriteFile(path, []byte(renderSshdDropin(testSSSCmd, nil, "")), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(renderSshdDropin(testSSSCmd, nil, "", config.BreakGlass{})), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if dropinNeedsRender(path, testSSSCmd, "") || dropinNeedsRender(path, testSSSCmd, "key") {
+	if dropinNeedsRender(path, testSSSCmd, "", config.BreakGlass{}) || dropinNeedsRender(path, testSSSCmd, "key", config.BreakGlass{}) {
 		t.Error("an up-to-date default drop-in must not be re-rendered")
 	}
-	if !dropinNeedsRender(path, testSSSCmd, "disabled") {
+	if !dropinNeedsRender(path, testSSSCmd, "disabled", config.BreakGlass{}) {
 		t.Error("switching root_login to disabled must re-render the drop-in")
 	}
-	if err := os.WriteFile(path, []byte(renderSshdDropin(testSSSCmd, nil, "disabled")), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(renderSshdDropin(testSSSCmd, nil, "disabled", config.BreakGlass{})), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if dropinNeedsRender(path, testSSSCmd, "disabled") {
+	if dropinNeedsRender(path, testSSSCmd, "disabled", config.BreakGlass{}) {
 		t.Error("an up-to-date disabled drop-in must not be re-rendered")
 	}
-	if !dropinNeedsRender(path, testSSSCmd, "") {
+	if !dropinNeedsRender(path, testSSSCmd, "", config.BreakGlass{}) {
 		t.Error("switching root_login back to key must re-render the drop-in")
 	}
 }
@@ -75,7 +75,7 @@ func TestWriteSshdDropin_WritesRootLoginMode(t *testing.T) {
 	t.Cleanup(func() { sshdDropinPath, sshdTest = oldPath, oldTest })
 	sshdDropinPath = filepath.Join(t.TempDir(), "10-pam-device-auth.conf")
 	sshdTest = func() ([]byte, error) { return nil, nil }
-	if err := writeSshdDropin(testSSSCmd, nil, "disabled"); err != nil {
+	if err := writeSshdDropin(testSSSCmd, nil, "disabled", config.BreakGlass{}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(sshdDropinPath)

@@ -43,6 +43,14 @@ type Config struct {
 	// RootLoginSources are client addresses for which --check additionally
 	// evaluates root's sshd policy (Match Address blocks). Used by --check only.
 	RootLoginSources []string `json:"root_login_sources,omitempty"`
+	// BreakGlassUsers are local accounts that log in with their local SSH key
+	// while the directory, SSSD or the identity provider is down. Used by
+	// --setup-ldap and --enable (sshd drop-in), by --check and by the login
+	// (account and auth phase).
+	BreakGlassUsers []string `json:"break_glass_users,omitempty"`
+	// BreakGlassSources are the client addresses and CIDR ranges the
+	// break-glass accounts may come from; empty means any address.
+	BreakGlassSources []string `json:"break_glass_sources,omitempty"`
 	// LDAP holds the directory settings consumed ONLY by `--setup-ldap` to write
 	// /etc/sssd/sssd.conf. It is not used by the auth runtime (SSSD owns the
 	// bind), so it may be absent in the deployed runtime config.
@@ -229,6 +237,9 @@ func Load(configPath string) (*Config, error) {
 				alg, strings.Join(SupportedAlgorithms, ", ")))
 		}
 	}
+	if len(cfg.BreakGlassSources) > 0 && len(cfg.BreakGlassUsers) == 0 {
+		cfg.warnings = append(cfg.warnings, "break_glass_sources is set but break_glass_users is empty; it has no effect")
+	}
 
 	return cfg, nil
 }
@@ -309,5 +320,5 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("root_login_sources entries must be IP addresses (no CIDR, no host name), got %q", s)
 		}
 	}
-	return nil
+	return validateBreakGlass(c.BreakGlassUsers, c.BreakGlassSources)
 }

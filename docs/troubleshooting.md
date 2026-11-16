@@ -169,8 +169,9 @@ from "read failed" once the read itself fails.
 
 Root never touches SSSD or InfoPipe, so root keeps working during an
 outage. This is deliberate: it is the break-glass path back into the box.
-Every other account, including non-root local ones, goes through the
-InfoPipe read and is denied while it is down.
+The local accounts in `break_glass_users` keep working as well; they skip the
+InfoPipe read. Every other account, including other local ones, goes through
+the InfoPipe read and is denied while it is down.
 
 Confirm sssd and the InfoPipe responder are up:
 
@@ -513,7 +514,8 @@ sudo lsattr /var/log/pam-device-auth.log  # an "a" or "i" flag blocks it
 sudo chattr -a -i /var/log/pam-device-auth.log
 ```
 
-Root's key-only break-glass login is unaffected.
+Root's key-only break-glass login is unaffected, and so are the accounts in
+`break_glass_users`: both are decided without the log.
 
 ### Root cannot log in over SSH
 
@@ -529,6 +531,49 @@ root while `root_login` is `"key"`, so an override from another file shows up th
 If root is meant to log in only from some addresses (a `Match User root Address`
 block), list them in `root_login_sources`; `--check` then judges root's policy
 per address ([configuration reference](configuration-reference.md#root_login_sources)).
+
+### A break-glass account cannot log in
+
+Start with `sudo pam-device-auth --check`: its section `Break-glass accounts:`
+has one verdict per account in `break_glass_users`
+([what each line means](configuration-reference.md#what---check-reports)).
+Then go by what the client sees:
+
+- **`Permission denied (publickey)`**: sshd has no key for the account from
+  your address. Ask sshd what it applies:
+
+  ```bash
+  sudo sshd -T -C user=<name>,addr=<your address> | grep -Ei '^(authenticationmethods|authorizedkeysfile|authorizedkeyscommand) '
+  ```
+
+  It must print `publickey`, `.ssh/authorized_keys` and `none`. If it prints
+  the global values (`publickey,keyboard-interactive:pam`, key file `none`),
+  the drop-in has no block for the account yet (run `sudo pam-device-auth
+  --enable`), or your address is not in `break_glass_sources`. If the values
+  are right, sshd refuses the key file: the home, `.ssh` and the file must
+  belong to the account or root, must not be writable by group or others, and
+  the account itself must be able to read the file (a key file owned by root
+  with mode 0600 is not).
+- **`Too many authentication failures`**: `MaxAuthTries` is 3 and your SSH
+  agent offered other keys first. Use `ssh -o IdentitiesOnly=yes -i <key>
+  <name>@<host>`.
+- **`Connection closed`** right after the key was accepted: the account phase
+  denied the login. `/var/log/pam-device-auth.log` has the reason in a line
+  that starts with `pam-acct: user=<name>`: no entry in `/etc/passwd`, an
+  address outside `break_glass_sources`, a directory account of the same
+  name, or a name that was taken out of `break_glass_users` while its block
+  is still in the drop-in
+  ([log lines](configuration-reference.md#break_glass_users)). A line
+  `pam-acct: break_glass_users not read, no break-glass exemption: …` means
+  that `config.json` is not valid JSON; until it is fixed the account is
+  treated like any other local account and denied.
+- **A prompt to change the password, or `Your account has expired`**: this
+  comes from `pam_unix`. `sudo chage -l <name>` shows the dates; `sudo chage
+  -M -1 -E -1 <name>` switches aging and expiry off for the account, and
+  `sudo chage -d <today> <name>` clears a forced password change.
+- **`System is booting up` or `System is going down`**: `/run/nologin` exists
+  and `pam_nologin` refuses every account but root. Wait until the boot has
+  finished, or use a console.
 
 ### sshd changes from `--setup-ldap` have no effect
 
@@ -690,8 +735,10 @@ Three cases, in decreasing likelihood:
    `user_attributes = +clients` in the `[ifp]` section, then
    `systemctl restart sssd`. Re-running `sudo pam-device-auth --setup-ldap`
    renders both correctly.
-3. **User is root**: root alone is exempt (break-glass) and never checked.
-   Unsupported local non-root users fail closed at the InfoPipe lookup.
+3. **User is root or a break-glass account**: root is exempt and never
+   checked. An account in `break_glass_users` is limited by
+   `break_glass_sources`, not by `clients`. Every other local account fails
+   closed at the InfoPipe lookup.
 
 ### `/var/log/pam-device-auth.log` missing / empty
 

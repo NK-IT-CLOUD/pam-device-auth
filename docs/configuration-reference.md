@@ -48,6 +48,8 @@ returns `PAM_AUTH_ERR`.
 | [`root_login`](#root_login) | string | no | `"key"` | `"key"` keeps root's own SSH key as the emergency path. `"disabled"` refuses every SSH login of root. Applied by `--setup-ldap` and `--enable`. |
 | [`required_acr`](#required_acr) | string[] | no | `[]` (no check) | Accepted values of the access token's `acr` claim, exact match. A token without `acr` or with another value is denied. |
 | [`root_login_sources`](#root_login_sources) | string[] | no | `[]` | Client IP addresses for which `--check` evaluates root's sshd policy (`Match Address` blocks). Used by `--check` only. |
+| [`break_glass_users`](#break_glass_users) | string[] | no | `[]` | Local accounts that log in with their own SSH key while LDAP, SSSD or the identity provider is down. Applied by `--setup-ldap` and `--enable`, read at every login. |
+| [`break_glass_sources`](#break_glass_sources) | string[] | no | `[]` (any address) | Client IP addresses and CIDR ranges the break-glass accounts may log in from. |
 | [`ldap`](#ldap) | object | setup only | (none) | Directory wiring consumed by `--setup-ldap` to write `/etc/sssd/sssd.conf`, and checked by `--check`. `ldap.profile` is required in it. Not used by the auth runtime. |
 
 A field that is not in this table is reported; see
@@ -115,8 +117,9 @@ and was retired.
 The account-phase gate reads the LDAP `clients` attribute straight from SSSD over
 the InfoPipe D-Bus interface (`busctl`), not from a JWT. A directory user without
 `clients` is unrestricted; one whose lookup fails is denied (fail-closed). Only
-root is exempt. Local non-root accounts are unsupported and fail closed at the
-InfoPipe lookup. A config that still carries
+root and the accounts in [`break_glass_users`](#break_glass_users) are exempt.
+Every other local account is unsupported and fails closed at the InfoPipe
+lookup. A config that still carries
 `ip_claim` loads without error; the field is ignored. See
 [ip-allowlist.md](ip-allowlist.md).
 
@@ -228,7 +231,13 @@ the drop-in, and one that sorts after it has no effect.
 > including automation that uses a root key. Give automation a service account
 > (`service_account_groups`) with passwordless sudo (`nopasswd_sudo_groups`), and
 > make sure you can reach a console. If LDAP or the identity provider is down,
-> the console is then the only way in.
+> the console is then the only way in, unless the host has a break-glass
+> account ([`break_glass_users`](#break_glass_users)).
+>
+> Software that connects from host to host as root over SSH needs root as
+> well: the nodes of a Proxmox VE or Proxmox Mail Gateway cluster do, for
+> example. Keep `"key"` on such hosts; a break-glass account does not replace
+> root there.
 
 To allow root only from some addresses, keep `"key"`, restrict root in sshd
 yourself and list the addresses in [`root_login_sources`](#root_login_sources).
@@ -310,6 +319,206 @@ with `"root_login_sources": ["192.0.2.10"]` in `config.json`. Keep the
 everyone else, and only its own `Match User root` block (with `root_login`
 `"key"`) gives root its key file back. With the line, the address keeps root's
 `~/.ssh/authorized_keys` whatever the drop-in contains.
+
+### `break_glass_users`
+
+Local accounts that log in with their own SSH key while LDAP, SSSD or the
+identity provider is down: a named emergency account next to root, or in its
+place when `root_login` is `"disabled"`. Empty or absent: there are none, and
+nothing in this section applies.
+
+```json
+"break_glass_users": ["breakglass"],
+"break_glass_sources": ["192.0.2.0/24"]
+```
+
+The package creates neither the account nor its key nor a sudo rule:
+
+1. Create the account, for example `useradd -m -s /bin/bash breakglass`, and
+   put the public key into its `~/.ssh/authorized_keys` (home and `.ssh` not
+   writable by group or others). Keep the private key where you can reach it
+   when the directory is down.
+2. If the account needs sudo, give it a rule in `/etc/sudoers.d/`. With a
+   locked password the rule has to be `NOPASSWD`.
+3. Add the name to `break_glass_users`, run `--check`, then `--enable` (it
+   renders the sshd drop-in again and restarts sshd), then `--check` again.
+
+`--enable` is also what applies a later change of this key or of
+[`break_glass_sources`](#break_glass_sources): it renders the drop-in again
+whenever its break-glass section is not the one the config asks for, also
+after the last account was removed. `--setup-ldap` writes the same section.
+Between taking a name out of the config and the next `--enable`, sshd still
+accepts that account's key; the account phase denies the login.
+
+A name must match `[a-z_][a-z0-9_-]*`, have at most 32 characters and must not
+be `root` (root has [`root_login`](#root_login)). An invalid name or a name
+listed twice is a config error.
+
+What a listed account gets:
+
+- **sshd.** The drop-in gets a block in front of every other `Match` block:
+
+  ```
+  # Break-glass accounts (break_glass_users): local key only, never OIDC or the
+  # directory.
+  Match User breakglass
+      AuthenticationMethods publickey
+      AuthorizedKeysFile .ssh/authorized_keys
+      AuthorizedKeysCommand none
+  ```
+
+  sshd reads no key for the account from the directory:
+  `AuthorizedKeysCommand none` keeps it from accepting a key that the
+  directory serves for the same name. A user CA that you configured in sshd
+  (`TrustedUserCAKeys`) keeps applying to these accounts as to every other
+  one; `--check` names it.
+- **Account phase.** The account is exempt from the `clients` gate like root,
+  but only on local facts, checked in this order: it has an entry in
+  `/etc/passwd`; the client address is in `break_glass_sources` when that key
+  is set; and its name does not resolve in the directory (`getent -s sss`, at
+  most 3 s). A local entry never stands in for a directory identity: when the
+  directory knows the name, the login is denied. Only that positive answer
+  denies. A stopped SSSD allows the login, and so does one that does not
+  answer in time (with a warning in the log): that is the situation the
+  account is for.
+- **Auth phase.** A listed name gets no OIDC login, whatever the directory says
+  about it. With `publickey` alone that phase is not reached.
+- **`--setup-ldap`** never migrates a listed account (see "A directory account
+  of the same name" below).
+
+Every other local account stays what it was: no key source in sshd and denied
+in the account phase.
+
+Log lines of the account phase (`/var/log/pam-device-auth.log`):
+
+| Line | Meaning |
+|---|---|
+| `pam-acct: user=<name> local break-glass account; exempt, allow` | Allowed. |
+| `pam-acct: user=<name> local break-glass account; directory lookup failed (<error>), treated as not in the directory; exempt, allow` | Allowed; SSSD gave no answer within 3 s. |
+| `pam-acct: user=<name> is listed in break_glass_users but has no entry in /etc/passwd; deny` | The account does not exist on this host. |
+| `pam-acct: user=<name> rhost=<address> break-glass account, address not in break_glass_sources <list>; deny` | The client address is outside the sources. |
+| `pam-acct: user=<name> is a break-glass account but the name also resolves in the directory; deny (rename the local account or the directory user)` | The directory has an account of the same name. |
+| `pam-acct: user=<name> has a break-glass block in the sshd drop-in but is not in break_glass_users; deny (run 'pam-device-auth --enable')` | The name was taken out of the config, and the drop-in was not rendered since. |
+
+The helper reads only `break_glass_users` and `break_glass_sources` for this
+decision. A mistake in another key, which stops every OIDC login, does not
+close the emergency path; a `config.json` that is not JSON does (the log then
+has `pam-acct: break_glass_users not read, no break-glass exemption: <error>`).
+A log file that cannot be opened does not close it either: the decision is
+reported to syslog, as for root.
+
+#### What `--check` reports
+
+With accounts configured, `--check` prints a section `Break-glass accounts:`
+with one verdict per account:
+
+| Line | When |
+|---|---|
+| `[OK]   break-glass <name>: local account (uid <n>), not in the directory, <n> key(s) in <home>/.ssh/authorized_keys, sshd: publickey only` | The path works. With sources the line goes on with ` from <sources>, no key source from any other address`, and on a host with `TrustedUserCAKeys` with `; certificates of the user CA <file> are accepted as well (TrustedUserCAKeys)`. |
+| `[FAIL] break-glass <name>: the name also resolves in the directory; logins of this account are denied until the local account or the directory user is renamed` | See below. A blocker: `--enable` refuses to run. |
+| `[FAIL] break-glass <name>: the name is a directory user and has no entry in /etc/passwd; a listed name never logs in through the directory on this host. Take the name out of break_glass_users` | A directory user was listed. That user cannot log in to this host while the name is in the list. |
+| `[WARN] break-glass <name>: no entry in /etc/passwd; the package does not create the account` | The account is missing. |
+| `[WARN] break-glass <name>: no valid key in <home>/.ssh/authorized_keys` | No file, or no line `ssh-keygen -l` accepts. |
+| `[WARN] break-glass <name>: sshd will not use <home>/.ssh/authorized_keys: <path> …` | The home, `.ssh` or the file `belongs to uid <n>, not to the account or root`, `is writable by group or others (mode <mode>)` or `cannot be entered by the account` (the file: `cannot be read by the account`; sshd opens it as the account, so a key file that only root can read does not count), or the file `is not a regular file`. |
+| `[WARN] break-glass <name>: the account expired on <date>; pam_unix denies the login (chage -E -1 <name>)` | Account expiry in `/etc/shadow`; a date ahead reads `the account expires on <date>; from then on …`. |
+| `[WARN] break-glass <name>: the password reached its maximum age of <n> days on <date>; pam_unix demands a password change at login, which a key-only login cannot complete (chage -M -1 <name>)` | Password aging in `/etc/shadow`; a date ahead reads `the password reaches its maximum age of <n> days on <date>; from then on …`. A password that must be changed at the next login is reported the same way. |
+| `[WARN] break-glass <name>: sshd does not apply the break-glass policy from <source> (AuthenticationMethods …, AuthorizedKeysFile …, AuthorizedKeysCommand …); run 'pam-device-auth --enable', and if this line stays look for a file in /etc/ssh/sshd_config.d that sorts before 10-pam-device-auth.conf` | The drop-in was not rendered yet, or another file overrides it: the policy is `publickey`, the key file `.ssh/authorized_keys` and no key command. Without sources `<source>` is `any address`. |
+| `[WARN] break-glass <name>: sshd leaves a key source open from addresses outside break_glass_sources (…)` | sshd would read a key for the account from an address the config does not list. |
+| `[WARN] break-glass <name>: the sshd drop-in holds another break-glass section than the config asks for; run 'pam-device-auth --enable' (until then the account phase denies what the config no longer allows)` | Accounts or sources changed since the drop-in was rendered. |
+| `[WARN] root_login is 'disabled' and no break-glass account is usable; there is no emergency path over SSH if LDAP, SSSD or the identity provider fail` | Root is switched off and every configured account has a finding that stops its login. |
+
+Without accounts the section is absent. One line can still appear: `[WARN] the
+sshd drop-in still holds a break-glass section although break_glass_users is
+empty; run 'pam-device-auth --enable' to remove it (…)`, after the last name
+was taken out of the config and before `--enable` ran.
+
+`--check` asks sshd for the account's policy with
+`sshd -T -C user=<name>,addr=<address>`, once per entry of `break_glass_sources`
+(for a range with its first address) and once without an address for "any other
+address".
+
+#### A directory account of the same name
+
+A break-glass name must not exist in the directory. If it does:
+
+- the login of the local account is denied in the account phase, and `--check`
+  reports the `[FAIL]` line above, until one of the two is renamed;
+- `--setup-ldap` does not migrate the account. Its last step removes the local
+  entry of an account whose name resolves in the directory with another UID
+  (see [ldap-directory-setup.md](ldap-directory-setup.md)); for a listed
+  account it prints `break-glass account <name> also resolves in the directory
+  (uid <n>); it is not migrated, and its logins are denied until the local
+  account or the directory user is renamed` and leaves the account as it is.
+
+Whoever can create accounts in the directory can therefore switch this
+emergency path off. `--check` shows it; root's own key (`root_login` `"key"`)
+has no such dependency.
+
+#### How it differs from root
+
+Root is exempted in the PAM module before the helper is started. A break-glass
+account is decided by the helper, and the distribution's account stack applies
+to it:
+
+- It needs the helper binary and a `config.json` that parses as JSON. Root
+  needs neither.
+- `pam_nologin` applies: no login while `/etc/nologin` or `/run/nologin`
+  exists (during boot and shutdown).
+- `pam_unix` applies: an expired account is denied, and an aged password
+  demands a password change that a key-only login cannot complete. Switch
+  aging off for the account (`chage -M -1 -E -1 <name>`, and `chage -d <today>
+  <name>` when a password change at the next login was forced); `--check`
+  warns.
+- sudo is yours to set up.
+- While SSSD runs but its server does not answer, the first login can take a
+  few seconds longer: sshd asks NSS for the account's groups, and the helper
+  waits up to 3 s for the directory lookup.
+- A directory account of the same name switches the path off (see above).
+- `MaxAuthTries` is 3: an SSH agent that offers other keys first uses the
+  tries up. Log in with `ssh -o IdentitiesOnly=yes -i <key> <name>@<host>`.
+
+A console stays the last way in. On a host whose software connects as root
+over SSH, a break-glass account does not replace root; see the note under
+[`root_login`](#root_login).
+
+### `break_glass_sources`
+
+Client addresses the break-glass accounts may log in from: IP addresses and
+CIDR ranges, IPv4 and IPv6. Empty or absent: any address. The key applies to
+every account in [`break_glass_users`](#break_glass_users).
+
+- Write a range in its network form: `192.0.2.0/24`, not `192.0.2.5/24` (sshd
+  refuses a range with bits set after the prefix length). A pattern
+  (`192.0.2.*`), a host name, an address with a zone, the IPv4-mapped IPv6
+  form (`::ffff:192.0.2.1`) and an entry listed twice are config errors.
+- With sources the drop-in has two blocks for the accounts. The first applies
+  to the listed addresses; the second leaves every other address without a
+  key source:
+
+  ```
+  # Break-glass accounts (break_glass_users): local key only, never OIDC or the
+  # directory. From an address outside break_glass_sources they have no key source.
+  Match User breakglass Address 192.0.2.0/24,2001:db8:1::/48
+      AuthenticationMethods publickey
+      AuthorizedKeysFile .ssh/authorized_keys
+      AuthorizedKeysCommand none
+  Match User breakglass
+      AuthorizedKeysFile none
+      AuthorizedKeysCommand none
+  ```
+
+- The account phase compares the client address with the list as well, so a
+  narrowed list holds from the next login on, before `--enable` has rendered
+  the drop-in again. It gets the address from sshd through PAM: with `UseDNS
+  yes` that is a host name, and every break-glass login is denied. `--check`
+  warns about `UseDNS yes`.
+- Without `break_glass_users` the key does nothing, and that is reported:
+  `config: break_glass_sources is set but break_glass_users is empty; it has no
+  effect` (a blocker in `--check`, `--enable` and `--setup-ldap`, a line in the
+  log at a login).
+
+This key is written into sshd. [`root_login_sources`](#root_login_sources)
+is not: it only tells `--check` which addresses to evaluate for root.
 
 ### `ldap`
 

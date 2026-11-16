@@ -40,8 +40,9 @@ IP allowlist below. Any new LLDAP group used in either list needs a POSIX
 The `clients` attribute on an LLDAP user is a per-user source-IP/CIDR
 allowlist, enforced on every login (including key-only service accounts)
 by the PAM account phase, which reads `clients` from the SSSD InfoPipe
-responder over `busctl`. Only root is exempt: this is the break-glass path and
-it never touches SSSD. Unsupported local non-root users fail closed.
+responder over `busctl`. Only root and the accounts in `break_glass_users` are
+exempt: these are the break-glass paths, and they never read the InfoPipe.
+Every other local account fails closed.
 
 The check is fail-closed: if the InfoPipe lookup for a directory user
 errors for any reason (SSSD down, D-Bus unreachable, timeout), that login

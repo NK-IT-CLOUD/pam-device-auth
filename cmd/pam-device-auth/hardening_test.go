@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
 )
 
 func TestValidateLDAPURI(t *testing.T) {
@@ -102,20 +104,20 @@ func TestRenderedSSSDConfExposesClients(t *testing.T) {
 func TestDropinNeedsRender(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "10-pam-device-auth.conf")
-	if !dropinNeedsRender(path, "/usr/bin/sss_ssh_authorizedkeys", "") {
+	if !dropinNeedsRender(path, "/usr/bin/sss_ssh_authorizedkeys", "", config.BreakGlass{}) {
 		t.Error("missing drop-in must be rendered")
 	}
-	if err := os.WriteFile(path, []byte(renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(renderSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if dropinNeedsRender(path, "/usr/bin/sss_ssh_authorizedkeys", "") {
+	if dropinNeedsRender(path, "/usr/bin/sss_ssh_authorizedkeys", "", config.BreakGlass{}) {
 		t.Error("drop-in with the resolved path must be kept")
 	}
 	// RHEL: stale template path from an older version, binary lives elsewhere.
-	if !dropinNeedsRender(path, "/usr/libexec/sssd/sss_ssh_authorizedkeys", "") {
+	if !dropinNeedsRender(path, "/usr/libexec/sssd/sss_ssh_authorizedkeys", "", config.BreakGlass{}) {
 		t.Error("stale drop-in (wrong AuthorizedKeysCommand path) must be re-rendered")
 	}
-	if dropinNeedsRender(path, "", "") {
+	if dropinNeedsRender(path, "", "", config.BreakGlass{}) {
 		t.Error("unresolved sss path must not trigger a render")
 	}
 }
@@ -179,7 +181,7 @@ func TestWriteSshdDropin_RollsBackOnRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	sshdTest = rejected
-	err := writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "")
+	err := writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{})
 	if err == nil || !strings.Contains(err.Error(), "sshd -t rejected") {
 		t.Fatalf("writeSshdDropin() = %v; want sshd -t rejection", err)
 	}
@@ -189,7 +191,7 @@ func TestWriteSshdDropin_RollsBackOnRejection(t *testing.T) {
 
 	// No previous drop-in: the rejected file must be removed.
 	os.Remove(sshdDropinPath)
-	if err := writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, ""); err == nil {
+	if err := writeSshdDropin("/usr/bin/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{}); err == nil {
 		t.Fatal("expected rejection error")
 	}
 	if _, err := os.Stat(sshdDropinPath); err == nil {
@@ -198,7 +200,7 @@ func TestWriteSshdDropin_RollsBackOnRejection(t *testing.T) {
 
 	// Accepted: the drop-in stays and references the resolved path.
 	sshdTest = accepted
-	if err := writeSshdDropin("/usr/libexec/sssd/sss_ssh_authorizedkeys", nil, ""); err != nil {
+	if err := writeSshdDropin("/usr/libexec/sssd/sss_ssh_authorizedkeys", nil, "", config.BreakGlass{}); err != nil {
 		t.Fatalf("writeSshdDropin() accepted case: %v", err)
 	}
 	if got, _ := os.ReadFile(sshdDropinPath); !strings.Contains(string(got), "/usr/libexec/sssd/sss_ssh_authorizedkeys") {

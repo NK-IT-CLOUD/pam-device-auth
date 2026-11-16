@@ -291,3 +291,9 @@ with a warning; stop them and run `--setup-ldap` again. No process is killed.
 (migrate, with the groups it keeps and the home it re-owns, or skip because of
 running processes), as long as SSSD already resolves the AD users; see
 [the migration section](ldap-directory-setup.md#migration-on-existing-hosts-important).
+
+A local account listed in `break_glass_users` is never migrated, and its name
+must not exist in AD: while it does, the account's logins are denied and
+`--check` reports a blocker. AD compares names without regard to case, so an
+AD account `BreakGlass` collides with the local `breakglass`. See the
+[configuration reference](configuration-reference.md#a-directory-account-of-the-same-name).

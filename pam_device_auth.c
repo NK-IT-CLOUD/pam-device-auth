@@ -36,6 +36,10 @@
 // Wall-clock budget for the account-phase (--pam-acct) helper invocation.
 // This mode does only a bounded busctl round-trip (~5s, see internal Go
 // helper) plus a local /etc/passwd read — no LDAP/network calls of its own.
+// For an account listed in break_glass_users it asks SSSD instead whether the
+// name exists in the directory (getent -s sss, at most 3s, see
+// breakGlassLookupTimeout in acct.go). That lookup must end before this
+// budget does: no answer has to become the helper's allow, not the deny here.
 // Set a bit above the Go-side busctl bound so a clean per-user deny from the
 // helper (exit 0/1) normally wins the race before this C-side timeout ever
 // fires; the timeout is purely a backstop against a hung/wedged helper.

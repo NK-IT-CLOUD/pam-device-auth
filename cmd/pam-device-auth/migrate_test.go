@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
 )
 
 const testPasswd = `root:x:0:0:root:/root:/bin/bash
@@ -325,5 +327,25 @@ func TestMigrationPreview(t *testing.T) {
 	}
 	if migrationPreview(nil, nil, nil) != nil {
 		t.Error("no shadowing account must give no line")
+	}
+}
+
+// A break-glass account is the local account by intent: the migration, which
+// removes the local entry of a shadowing account, must leave it out.
+func TestSplitBreakGlass(t *testing.T) {
+	accounts := []shadowedAccount{
+		{Name: "alice", LocalUID: 1000, DirUID: 20001},
+		{Name: "breakglass", LocalUID: 1001, DirUID: 20002},
+	}
+	migrate, kept := splitBreakGlass(accounts, config.BreakGlass{Users: []string{"breakglass"}})
+	if len(migrate) != 1 || migrate[0].Name != "alice" || len(kept) != 1 || kept[0].Name != "breakglass" {
+		t.Errorf("migrate = %+v, kept = %+v", migrate, kept)
+	}
+	if migrate, kept = splitBreakGlass(accounts, config.BreakGlass{}); len(migrate) != 2 || len(kept) != 0 {
+		t.Errorf("without break-glass accounts: migrate = %+v, kept = %+v", migrate, kept)
+	}
+	want := "break-glass account breakglass also resolves in the directory (uid 20002); it is not migrated, and its logins are denied until the local account or the directory user is renamed"
+	if got := breakGlassShadowWarning(accounts[1]); got != want {
+		t.Errorf("warning = %q, want %q", got, want)
 	}
 }

@@ -870,7 +870,7 @@ func runSetupLDAP() {
 	// 5) sshd drop-in: non-root needs key (from the directory via sss_ssh_authorizedkeys)
 	//    AND OIDC; root stays key-only (break-glass via local authorized_keys).
 	//    The AuthorizedKeysCommand is the platform's path, checked above.
-	if err := writeSshdDropin(prof.SSSAuthKeysPath, l.ServiceAccountGroups, cfg.RootLogin); err != nil {
+	if err := writeSshdDropin(prof.SSSAuthKeysPath, l.ServiceAccountGroups, cfg.RootLogin, cfg.BreakGlass()); err != nil {
 		abort("sshd config: %v", err)
 	}
 	remaining = append(remaining, "sshd drop-in "+sshdDropinPath+" (active at the next sshd restart)")
@@ -890,7 +890,7 @@ func runSetupLDAP() {
 
 	// 8) A migrated account resolves only through the directory, so from here
 	//    on a failure keeps the new sssd.conf instead of restoring it.
-	if removed, err := migrateLocalShadowing(); err != nil {
+	if removed, err := migrateLocalShadowing(cfg.BreakGlass()); err != nil {
 		fail("%s", setupAbortMessage(err.Error(), keptSSSDConf(removed), remaining))
 	}
 
@@ -1424,10 +1424,11 @@ const sshdLogVerbose = "LogVerbose kex.c:kex_exchange_identification():*"
 // of serviceGroups, already name-validated by validateLDAPConfig before this is
 // called) get a Match Group block overriding AuthenticationMethods to
 // publickey-only, since automation cannot complete an interactive OIDC prompt.
-// Root: local key only (break-glass), restored via the Match block. Pure
-// transform — no I/O — so it is testable independent of the
-// atomic-write/sshd-t validation path.
-func renderSshdDropin(sssAuthKeysPath string, serviceGroups []string, rootLogin string) string {
+// Root: local key only (break-glass), restored via the Match block. Break-glass
+// accounts (bg, validated by config.Load) get their blocks in front of every
+// other Match block (renderBreakGlassBlocks). Pure transform — no I/O — so it
+// is testable independent of the atomic-write/sshd-t validation path.
+func renderSshdDropin(sssAuthKeysPath string, serviceGroups []string, rootLogin string, bg config.BreakGlass) string {
 	// root_login = "disabled" refuses every SSH login of root; anything else
 	// keeps the key-only emergency path.
 	permitRoot := "prohibit-password"
@@ -1453,6 +1454,10 @@ AuthorizedKeysFile none
 AuthorizedKeysCommand %s
 AuthorizedKeysCommandUser nobody
 `, permitRoot, sshdLogVerbose, sssAuthKeysPath)
+
+	// sshd keeps the first value it reads for a keyword, so these blocks come
+	// before the service-group block and before root's.
+	base += renderBreakGlassBlocks(bg)
 
 	// Service accounts (automation/management): directory key ONLY, no OIDC.
 	// A Match block overrides the global AuthenticationMethods for these members;
@@ -1480,6 +1485,82 @@ Match User root
     AuthorizedKeysFile .ssh/authorized_keys
 `
 	return base
+}
+
+// breakGlassMarker starts the break-glass section of the drop-in.
+// dropinNeedsRender finds a section that has to go by it.
+const breakGlassMarker = "# Break-glass accounts (break_glass_users)"
+
+// renderBreakGlassBlocks renders the Match blocks for the break-glass accounts
+// (break_glass_users), "" when there are none. These accounts log in with
+// their local authorized_keys file: AuthorizedKeysCommand none keeps sshd from
+// accepting a key that the directory serves for the same name. With break_glass_sources the first block applies to those addresses
+// only, and a second block for the same accounts leaves every other address
+// without any key source. Pure transform.
+func renderBreakGlassBlocks(bg config.BreakGlass) string {
+	if len(bg.Users) == 0 {
+		return ""
+	}
+	users := strings.Join(bg.Users, ",")
+	const keyOnly = "    AuthenticationMethods publickey\n" +
+		"    AuthorizedKeysFile .ssh/authorized_keys\n" +
+		"    AuthorizedKeysCommand none\n"
+	head := "\n" + breakGlassMarker + ": local key only, never OIDC or the\n"
+	if len(bg.Sources) == 0 {
+		return head + "# directory.\n" +
+			"Match User " + users + "\n" + keyOnly
+	}
+	return head + "# directory. From an address outside break_glass_sources they have no key source.\n" +
+		"Match User " + users + " Address " + strings.Join(bg.Sources, ",") + "\n" + keyOnly +
+		"Match User " + users + "\n" +
+		"    AuthorizedKeysFile none\n" +
+		"    AuthorizedKeysCommand none\n"
+}
+
+// breakGlassDropinStale reports whether the break-glass section of a drop-in
+// is not the one bg asks for: the section has to be in the file verbatim, and
+// without break-glass accounts the file must have none.
+func breakGlassDropinStale(dropin string, bg config.BreakGlass) bool {
+	if section := renderBreakGlassBlocks(bg); section != "" {
+		return !strings.Contains(dropin, section)
+	}
+	return strings.Contains(dropin, breakGlassMarker)
+}
+
+// breakGlassBlockUsers returns the accounts that the break-glass section of a
+// drop-in names in its Match User lines, nil when the drop-in has no section.
+// The section ends at its first empty line.
+func breakGlassBlockUsers(dropin string) []string {
+	_, section, found := strings.Cut(dropin, "\n"+breakGlassMarker)
+	if !found {
+		return nil
+	}
+	var users []string
+	for _, line := range strings.Split(section, "\n")[1:] {
+		if line == "" {
+			break
+		}
+		f := strings.Fields(line)
+		if len(f) < 3 || f[0] != "Match" || f[1] != "User" {
+			continue
+		}
+		for _, u := range strings.Split(f[2], ",") {
+			if !slices.Contains(users, u) {
+				users = append(users, u)
+			}
+		}
+	}
+	return users
+}
+
+// breakGlassBlockUsersOnDisk is breakGlassBlockUsers for the drop-in on disk;
+// a drop-in that cannot be read names nobody.
+func breakGlassBlockUsersOnDisk() []string {
+	data, err := os.ReadFile(sshdDropinPath)
+	if err != nil {
+		return nil
+	}
+	return breakGlassBlockUsers(string(data))
 }
 
 // setupWarnings collects findings of a --setup-ldap run that need the
@@ -1511,8 +1592,8 @@ var (
 // regardless of the directory command. The file is validated with `sshd -t` and
 // reverted on failure; it takes effect at the next sshd restart (performed by
 // `--enable`), avoiding a lockout window.
-func writeSshdDropin(sssAuthKeysPath string, serviceGroups []string, rootLogin string) error {
-	content := renderSshdDropin(sssAuthKeysPath, serviceGroups, rootLogin)
+func writeSshdDropin(sssAuthKeysPath string, serviceGroups []string, rootLogin string, bg config.BreakGlass) error {
+	content := renderSshdDropin(sssAuthKeysPath, serviceGroups, rootLogin, bg)
 	if err := writeValidated(sshdDropinPath, []byte(content), 0644, "sshd -t", " before restarting sshd", sshdTest); err != nil {
 		return err
 	}

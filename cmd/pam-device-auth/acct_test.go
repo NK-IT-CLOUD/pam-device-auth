@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
 	"github.com/NK-IT-CLOUD/pam-device-auth/internal/logger"
 )
 
@@ -93,10 +94,19 @@ func TestParseBusctlClients(t *testing.T) {
 // runPamAcctWithBrokenLog runs runPamAcct for user with a logger that cannot be
 // opened, a reader that fails the test if called and a captured syslog; it
 // returns the exit code, everything written to stderr and the syslog messages.
-func runPamAcctWithBrokenLog(t *testing.T, user string) (code int, stderr string, syslogged []string) {
+func runPamAcctWithBrokenLog(t *testing.T, user string, bg ...config.BreakGlass) (code int, stderr string, syslogged []string) {
 	t.Helper()
-	origLogger, origRead, origSyslog := newAcctLogger, readClients, syslogAuthErr
-	t.Cleanup(func() { newAcctLogger, readClients, syslogAuthErr = origLogger, origRead, origSyslog })
+	origLogger, origRead, origSyslog, origLoad := newAcctLogger, readClients, syslogAuthErr, loadBreakGlass
+	t.Cleanup(func() {
+		newAcctLogger, readClients, syslogAuthErr, loadBreakGlass = origLogger, origRead, origSyslog, origLoad
+	})
+	// Never the config of the host the tests run on.
+	loadBreakGlass = func(string) (config.BreakGlass, error) {
+		if len(bg) > 0 {
+			return bg[0], nil
+		}
+		return config.BreakGlass{}, nil
+	}
 	newAcctLogger = func(string, bool) (*logger.Logger, error) {
 		return nil, errors.New("failed to open log file: read-only file system")
 	}

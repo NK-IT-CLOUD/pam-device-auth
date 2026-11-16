@@ -361,3 +361,24 @@ func TestFlow_DottedUserGetsCache(t *testing.T) {
 		t.Errorf("the log reports a session cache problem:\n%s", logText(t, logPath))
 	}
 }
+
+// A break-glass account never signs in through the identity provider: its
+// name is denied before the directory is asked, whatever the directory says.
+func TestFlow_BreakGlassNameDenied(t *testing.T) {
+	idp := newFakeIdP(t)
+	f, out, logPath := newFlow(t, idp, "\n")
+	f.cfg.BreakGlassUsers = []string{flowUser}
+	asked := false
+	f.nss = func(string) (bool, error) { asked = true; return true, nil }
+
+	requireOutcome(t, f.run(flowUser, flowAddr), denyHard)
+
+	requireContains(t, "output", out.String(), "no directory identity", "FLUSH:Press Enter to disconnect... \n")
+	if asked {
+		t.Error("the directory was asked about a break-glass name")
+	}
+	if deviceRequests, _, _ := idp.hits(); deviceRequests != 0 {
+		t.Errorf("device requests = %d, want 0", deviceRequests)
+	}
+	requireContains(t, "log", logText(t, logPath), "is a break-glass account (break_glass_users)")
+}

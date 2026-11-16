@@ -35,7 +35,10 @@ has running processes.
   `sss_ssh_authorizedkeys`) **and** the OIDC device grant are both required.
   `service_account_groups` members get `publickey`-only (see above). Root is
   `publickey`-only for a different reason: break-glass access that never
-  depends on the directory or OIDC provider being reachable.
+  depends on the directory or OIDC provider being reachable. The local
+  accounts an admin names in `break_glass_users` are `publickey`-only for the
+  same reason, and sshd reads no key for them from the directory
+  (`AuthorizedKeysCommand none` in their `Match` block).
 - **OIDC token validation**: JWT signatures verified via JWKS; issuer
   cross-validated against discovery to prevent MITM; audience, expiry,
   not-before and issued-at claims checked on every token (`exp` and `iat` are
@@ -74,11 +77,15 @@ has running processes.
   timeout, malformed response) denies that login. Because the check runs for
   every directory user regardless of whether they have an allowlist
   configured, an SSSD/InfoPipe outage denies all directory-based logins, not
-  only those pinned to specific IPs. **Only root is exempt**: root's
-  account-phase check returns success before any SSSD/D-Bus access, so root
-  login never depends on SSSD availability. Non-root local accounts are not a
-  supported login tier and fail the check closed, so a local `/etc/passwd`
-  entry cannot bypass the IP policy of a same-named directory identity.
+  only those pinned to specific IPs. **Only root and the accounts in
+  `break_glass_users` are exempt**: root's account-phase check returns success
+  before any SSSD/D-Bus access, so root login never depends on SSSD
+  availability. A break-glass account is exempt only while it has an entry in
+  `/etc/passwd`, comes from `break_glass_sources` when that is set, and its
+  name does not resolve in the directory; when the directory knows the name,
+  the login is denied. Every other local account is no login tier and fails
+  the check closed, so a local `/etc/passwd` entry cannot bypass the IP policy
+  of a same-named directory identity.
   `pam-device-auth --check` reports IP-pin posture and InfoPipe health.
 - **KnownIPs capped at 20**: per-user IP list uses FIFO eviction to prevent
   unbounded cache growth.
@@ -179,6 +186,7 @@ The security guarantees above depend on correct deployment:
 | MITM on the directory | `--setup-ldap` writes no cleartext connection: LDAPS or StartTLS with `ldap_tls_reqcert = hard`, or a GSSAPI bind with SASL sealing. |
 | Brute-force IP accumulation | KnownIPs capped at 20 per user (FIFO); new IPs require full device auth; the directory `clients` allowlist restricts source IPs in the account phase. |
 | Login from an unapproved source IP | The directory `clients` allowlist is checked in the PAM account phase for every directory user (root exempt); non-matching source IPs are denied. |
+| Local account standing in for a directory identity | Only root and the accounts an admin lists in `break_glass_users` log in with a local key. For a listed name sshd accepts no key from the directory (`AuthorizedKeysCommand none`), the auth phase denies the name whatever the directory says, and the account phase denies it when the directory knows it. `--setup-ldap` never migrates such an account, and `--check` fails on the collision. |
 | sudoers left behind after removal | postrm deletes `/etc/sudoers.d/pam-device-auth` on both remove and purge, on deb and rpm. |
 | Access revocation | Remove directory access membership and its mapped OIDC role; new login is denied after the relevant SSSD/provider caches update. Existing sessions require separate termination. |
 | Log exfiltration | No tokens, passwords, or unsanitized user input in logs; log file `0640 root:adm`; `O_NOFOLLOW`. |
@@ -189,6 +197,11 @@ The security guarantees above depend on correct deployment:
 
 ### Out of scope
 
+- **A directory admin against a break-glass account**: whoever can create
+  accounts in the directory can create one with a break-glass name. The local
+  account's logins are then denied (fail closed) until one of the two is
+  renamed, and `--check` reports it. Root's own key (`root_login` `"key"`) and
+  the console do not depend on the directory.
 - **Compromised server (root)**: if an attacker has root, all local auth is bypassed. This is a PAM module, not a full endpoint security solution. Root SSH is key-only by design (break-glass).
 - **OIDC provider trust and availability**: the provider is a trusted authority.
   If it is compromised, an attacker may issue accepted tokens and roles. If it

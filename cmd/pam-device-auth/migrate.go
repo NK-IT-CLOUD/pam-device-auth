@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/NK-IT-CLOUD/pam-device-auth/internal/config"
 )
 
 // shadowedAccount is a local account whose name also resolves via SSSD with
@@ -188,11 +190,33 @@ func localEntryRemoved(migrated int, err error) bool {
 	return migrated > 0 || (err != nil && !errors.Is(err, errNotMigrated))
 }
 
+// splitBreakGlass separates the shadowing accounts that are listed in
+// break_glass_users (kept) from the ones the migration handles. A break-glass
+// account is the local account by intent: the migration would remove its
+// local entry and hand its home to the directory user of the same name.
+func splitBreakGlass(accounts []shadowedAccount, bg config.BreakGlass) (migrate, kept []shadowedAccount) {
+	for _, a := range accounts {
+		if bg.Has(a.Name) {
+			kept = append(kept, a)
+		} else {
+			migrate = append(migrate, a)
+		}
+	}
+	return migrate, kept
+}
+
+// breakGlassShadowWarning is the setup warning for a break-glass account whose
+// name also resolves in the directory.
+func breakGlassShadowWarning(a shadowedAccount) string {
+	return fmt.Sprintf("break-glass account %s also resolves in the directory (uid %d); it is not migrated, and its logins are denied until the local account or the directory user is renamed", a.Name, a.DirUID)
+}
+
 // migrateLocalShadowing migrates every shadowing local account that has no
 // running process; the others stay untouched and are reported as warnings. A
 // failed read or migration is an error; removed reports whether a local
-// entry was removed before it.
-func migrateLocalShadowing() (removed bool, err error) {
+// entry was removed before it. Accounts listed in bg (break_glass_users) are
+// never migrated; each one that shadows a directory user is a setup warning.
+func migrateLocalShadowing(bg config.BreakGlass) (removed bool, err error) {
 	passwd, err := os.ReadFile("/etc/passwd")
 	if err != nil {
 		return false, fmt.Errorf("read /etc/passwd: %w; local accounts that shadow directory users were NOT checked", err)
@@ -201,7 +225,10 @@ func migrateLocalShadowing() (removed bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("read /etc/group: %w; local accounts that shadow directory users were NOT checked", err)
 	}
-	accounts := findShadowedAccounts(passwd, group, sssPasswdLookup)
+	accounts, kept := splitBreakGlass(findShadowedAccounts(passwd, group, sssPasswdLookup), bg)
+	for _, a := range kept {
+		setupWarnf("%s", breakGlassShadowWarning(a))
+	}
 	if len(accounts) == 0 {
 		return false, nil
 	}
@@ -275,7 +302,9 @@ func migrationPreview(accounts []shadowedAccount, running map[string]int, homeEx
 // shadowingPreview is migrationPreview for this host: the local accounts from
 // /etc/passwd and /etc/group, the directory users via SSSD, the process counts
 // from procRoot and the homes that exist (checked like the migration does).
-func shadowingPreview(procRoot string) ([]string, error) {
+// Accounts listed in bg (break_glass_users) are left out, as the migration
+// leaves them out; --check reports them in its break-glass section.
+func shadowingPreview(procRoot string, bg config.BreakGlass) ([]string, error) {
 	passwd, err := os.ReadFile("/etc/passwd")
 	if err != nil {
 		return nil, err
@@ -284,7 +313,7 @@ func shadowingPreview(procRoot string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	accounts := findShadowedAccounts(passwd, group, sssPasswdLookup)
+	accounts, _ := splitBreakGlass(findShadowedAccounts(passwd, group, sssPasswdLookup), bg)
 	running := make(map[string]int, len(accounts))
 	homeExists := make(map[string]bool, len(accounts))
 	for _, a := range accounts {
