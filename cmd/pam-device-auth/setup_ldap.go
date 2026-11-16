@@ -1494,9 +1494,10 @@ const breakGlassMarker = "# Break-glass accounts (break_glass_users)"
 // renderBreakGlassBlocks renders the Match blocks for the break-glass accounts
 // (break_glass_users), "" when there are none. These accounts log in with
 // their local authorized_keys file: AuthorizedKeysCommand none keeps sshd from
-// accepting a key that the directory serves for the same name. With break_glass_sources the first block applies to those addresses
-// only, and a second block for the same accounts leaves every other address
-// without any key source. Pure transform.
+// accepting a key that the directory serves for the same name. With
+// break_glass_sources the first block applies to those addresses only, and a
+// second block for the same accounts leaves every other address without any
+// key source. Pure transform.
 func renderBreakGlassBlocks(bg config.BreakGlass) string {
 	if len(bg.Users) == 0 {
 		return ""

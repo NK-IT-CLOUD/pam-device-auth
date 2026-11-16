@@ -70,6 +70,10 @@ func TestBreakGlassVerdicts(t *testing.T) {
 		{"user CA configured", with(func(f *breakGlassFacts) {
 			f.Inside = []sshdPolicy{{Methods: "publickey", KeysFile: ".ssh/authorized_keys", KeysCommand: "none", UserCA: "/etc/ssh/user_ca.pub"}}
 		}), true, []string{"OK sshd: publickey only; certificates of the user CA /etc/ssh/user_ca.pub are accepted as well (TrustedUserCAKeys)"}},
+		// SSSD gave no answer: the account still counts as usable (the login
+		// allows in that case), but the line must not claim "not in the directory".
+		{"directory lookup failed", with(func(f *breakGlassFacts) { f.DirectoryErr = "signal: killed" }), true,
+			[]string{"WARN break-glass breakglass: the directory lookup failed (signal: killed); whether the name also exists in the directory was not checked"}},
 		{"name in the directory", with(func(f *breakGlassFacts) { f.InDirectory = true; f.Keys = 0 }), false, []string{"FAIL the name also resolves in the directory"}},
 		// A directory user listed by mistake: the name is then no login on this
 		// host at all, and the line has to say so.

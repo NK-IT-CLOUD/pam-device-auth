@@ -154,8 +154,10 @@ func TestSSSLookupTimesOut(t *testing.T) {
 // directory lookup with inDirectory.
 func stubBreakGlassHost(t *testing.T, inDirectory bool) {
 	t.Helper()
-	origPasswd, origSSS := passwdFile, breakGlassSSS
-	t.Cleanup(func() { passwdFile, breakGlassSSS = origPasswd, origSSS })
+	origPasswd, origSSS, origDropin := passwdFile, breakGlassSSS, sshdDropinPath
+	t.Cleanup(func() { passwdFile, breakGlassSSS, sshdDropinPath = origPasswd, origSSS, origDropin })
+	// Never the drop-in of the host the tests run on.
+	sshdDropinPath = filepath.Join(t.TempDir(), "10-pam-device-auth.conf")
 	passwdFile = filepath.Join(t.TempDir(), "passwd")
 	if err := os.WriteFile(passwdFile, []byte(bgPasswd), 0644); err != nil {
 		t.Fatal(err)

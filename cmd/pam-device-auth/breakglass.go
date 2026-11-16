@@ -40,10 +40,13 @@ type breakGlassFacts struct {
 	UID         int    // of the local entry
 	Home        string // of the local entry
 	InDirectory bool   // the name resolves through SSSD
-	Keys        int    // keys ssh-keygen accepts in <Home>/.ssh/authorized_keys
-	KeyProblem  string // why sshd will not read the key file, "" when it will
-	Aging       string // finding from /etc/shadow, "" for none
-	Expired     bool   // Aging stops the login today
+	// DirectoryErr says why the directory lookup gave no answer ("" when it
+	// did): InDirectory is then unknown, not false.
+	DirectoryErr string
+	Keys         int    // keys ssh-keygen accepts in <Home>/.ssh/authorized_keys
+	KeyProblem   string // why sshd will not read the key file, "" when it will
+	Aging        string // finding from /etc/shadow, "" for none
+	Expired      bool   // Aging stops the login today
 	// Inside holds sshd's policy for every break_glass_sources entry, or the
 	// policy without an address when no sources are set. Outside is the policy
 	// without an address when sources are set (any other address), nil otherwise.
@@ -96,6 +99,11 @@ func breakGlassVerdicts(user string, f breakGlassFacts) (lines []checkLine, usab
 	}
 	if f.Aging != "" {
 		warn("%s", f.Aging)
+	}
+	// The login allows in this case (breakGlassVerdict); the check only must
+	// not report a name as "not in the directory" that nobody answered for.
+	if f.DirectoryErr != "" {
+		warn("the directory lookup failed (%s); whether the name also exists in the directory was not checked", f.DirectoryErr)
 	}
 	var sources []string
 	policyApplied := true
@@ -303,15 +311,19 @@ func sourceProbeAddr(source string) string {
 // gatherBreakGlassFacts collects the facts about one break-glass account from
 // this host: the local entry, the directory, the key file, /etc/shadow and
 // sshd's effective policy for every source and for any other address. A
-// directory lookup that fails counts as "not in the directory", as it does at
-// login (breakGlassVerdict).
+// directory lookup that fails is kept as DirectoryErr: the login allows in that
+// case (breakGlassVerdict), and --check says that the name was not checked.
 func gatherBreakGlassFacts(user string, sources []string) breakGlassFacts {
 	var f breakGlassFacts
 	gid := 0
 	if passwd, err := os.ReadFile(passwdFile); err == nil {
 		f.UID, gid, f.Home, f.Local = passwdEntry(passwd, user)
 	}
-	f.InDirectory, _ = sssLookup(user, breakGlassLookupTimeout)
+	found, err := sssLookup(user, breakGlassLookupTimeout)
+	f.InDirectory = found
+	if err != nil {
+		f.DirectoryErr = err.Error()
+	}
 	if f.Local {
 		f.Keys, f.KeyProblem = keyFileFacts(f.Home, f.UID, gid)
 		if shadow, err := os.ReadFile("/etc/shadow"); err == nil {

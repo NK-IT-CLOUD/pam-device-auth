@@ -43,7 +43,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
     directory; deny (rename the local account or the directory user)`. A name
     that was taken out of the config while its block is still in the drop-in
     is denied as well (`… has a break-glass block in the sshd drop-in but is
-    not in break_glass_users; deny (run 'pam-device-auth --enable')`).
+    not in break_glass_users; deny (run 'pam-device-auth --enable')`). SSSD
+    2.9 and 2.10 (Ubuntu 24.04, Debian 13, Rocky Linux 9) remember for
+    `local_negative_timeout`, four hours by default, that a local name is not
+    in the directory: there a directory account created under the name of a
+    break-glass account in use is denied and reported after that time or
+    after a restart of sssd, on SSSD 2.12 and later within seconds.
   - Auth phase: a listed name gets no OIDC login, whatever the directory
     says about it. sshd asks these accounts for `publickey` only, so the
     phase is not reached; if it is, the login is denied like root's

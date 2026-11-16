@@ -295,5 +295,7 @@ running processes), as long as SSSD already resolves the AD users; see
 A local account listed in `break_glass_users` is never migrated, and its name
 must not exist in AD: while it does, the account's logins are denied and
 `--check` reports a blocker. AD compares names without regard to case, so an
-AD account `BreakGlass` collides with the local `breakglass`. See the
+AD account `BreakGlass` collides with the local `breakglass`. A host with
+SSSD 2.9 or 2.10 can take up to four hours to notice an AD account that was
+created after the local one was in use. See the
 [configuration reference](configuration-reference.md#a-directory-account-of-the-same-name).

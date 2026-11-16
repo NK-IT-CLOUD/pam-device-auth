@@ -418,6 +418,7 @@ with one verdict per account:
 | `[FAIL] break-glass <name>: the name also resolves in the directory; logins of this account are denied until the local account or the directory user is renamed` | See below. A blocker: `--enable` refuses to run. |
 | `[FAIL] break-glass <name>: the name is a directory user and has no entry in /etc/passwd; a listed name never logs in through the directory on this host. Take the name out of break_glass_users` | A directory user was listed. That user cannot log in to this host while the name is in the list. |
 | `[WARN] break-glass <name>: no entry in /etc/passwd; the package does not create the account` | The account is missing. |
+| `[WARN] break-glass <name>: the directory lookup failed (<error>); whether the name also exists in the directory was not checked` | SSSD gave no answer within 3 s. A login is allowed in that state. |
 | `[WARN] break-glass <name>: no valid key in <home>/.ssh/authorized_keys` | No file, or no line `ssh-keygen -l` accepts. |
 | `[WARN] break-glass <name>: sshd will not use <home>/.ssh/authorized_keys: <path> …` | The home, `.ssh` or the file `belongs to uid <n>, not to the account or root`, `is writable by group or others (mode <mode>)` or `cannot be entered by the account` (the file: `cannot be read by the account`; sshd opens it as the account, so a key file that only root can read does not count), or the file `is not a regular file`. |
 | `[WARN] break-glass <name>: the account expired on <date>; pam_unix denies the login (chage -E -1 <name>)` | Account expiry in `/etc/shadow`; a date ahead reads `the account expires on <date>; from then on …`. |
@@ -449,6 +450,17 @@ A break-glass name must not exist in the directory. If it does:
   account it prints `break-glass account <name> also resolves in the directory
   (uid <n>); it is not migrated, and its logins are denied until the local
   account or the directory user is renamed` and leaves the account as it is.
+
+How soon a host notices such an account depends on its SSSD. SSSD remembers
+that a local name is not in the directory, in every one of its services that
+was asked about the name. The SSSD of Ubuntu 24.04, Debian 13 and Rocky Linux
+9 (2.9 and 2.10) keeps that for `local_negative_timeout`, four hours by
+default: a directory account created under the name of a break-glass account
+that is already in use is denied and reported after that time, or after
+`systemctl restart sssd`. The SSSD of Ubuntu 26.04, Rocky Linux 10 and Fedora
+(2.12 and 2.13) sees it within seconds. Until the host notices, the name
+stays what it was, the local account, and sshd reads no key for it from the
+directory either way.
 
 Whoever can create accounts in the directory can therefore switch this
 emergency path off. `--check` shows it; root's own key (`root_login` `"key"`)
