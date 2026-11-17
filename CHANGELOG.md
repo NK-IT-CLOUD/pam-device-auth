@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-11-17
 
 ### Added
 - **Named local break-glass accounts.** Two new config keys, both empty by
