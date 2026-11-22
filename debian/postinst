@@ -201,9 +201,9 @@ esac
 
 mkdir -p /etc/ssh/sshd_config.d
 mkdir -p "${CONFIG_DIR}"
-# config.json and any migrated predecessor config hold secrets
-# (OIDC client_secret, LDAP bind_password). Keep the directory
-# root-only so stray/migrated files are never world-traversable.
+# config.json holds the LDAP bind_password, and a migrated predecessor
+# config may hold an OIDC client_secret. Keep the directory root-only so
+# stray/migrated files are never world-traversable.
 chown root:root "${CONFIG_DIR}"
 chmod 700 "${CONFIG_DIR}"
 

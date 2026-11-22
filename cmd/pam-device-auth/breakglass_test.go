@@ -80,6 +80,12 @@ func TestBreakGlassVerdicts(t *testing.T) {
 		{"directory user listed", breakGlassFacts{InDirectory: true}, false,
 			[]string{"FAIL break-glass breakglass: the name is a directory user and has no entry in /etc/passwd; a listed name never logs in through the directory on this host. Take the name out of break_glass_users"}},
 		{"no local account", breakGlassFacts{}, false, []string{"WARN no entry in /etc/passwd"}},
+		// No local entry and no answer from SSSD: the name may be a directory
+		// user listed by mistake, which would be a blocker. The check has to
+		// say that the directory was not asked.
+		{"no local account, directory lookup failed", breakGlassFacts{DirectoryErr: "signal: killed"}, false,
+			[]string{"WARN break-glass breakglass: no entry in /etc/passwd; the package does not create the account",
+				"WARN break-glass breakglass: the directory lookup failed (signal: killed); whether the name also exists in the directory was not checked"}},
 		{"no key", with(func(f *breakGlassFacts) { f.Keys = 0 }), false, []string{"WARN no valid key in /home/breakglass/.ssh/authorized_keys"}},
 		{"key file refused", with(func(f *breakGlassFacts) {
 			f.KeyProblem = "/home/breakglass is writable by group or others (mode -rwxrwxr-x)"

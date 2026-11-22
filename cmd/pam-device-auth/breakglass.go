@@ -76,13 +76,21 @@ func commandNone(v string) bool {
 // identity. Everything that only keeps the path from working is a warning.
 func breakGlassVerdicts(user string, f breakGlassFacts) (lines []checkLine, usable bool) {
 	prefix := "break-glass " + user + ": "
+	// SSSD gave no answer: the check must not report a name as "not in the
+	// directory" that nobody answered for.
+	unasked := checkLine{msg: prefix + fmt.Sprintf("the directory lookup failed (%s); whether the name also exists in the directory was not checked", f.DirectoryErr)}
 	switch {
 	case f.InDirectory && !f.Local:
 		return []checkLine{{fatal: true, msg: prefix + "the name is a directory user and has no entry in /etc/passwd; a listed name never logs in through the directory on this host. Take the name out of break_glass_users"}}, false
 	case f.InDirectory:
 		return []checkLine{{fatal: true, msg: prefix + "the name also resolves in the directory; logins of this account are denied until the local account or the directory user is renamed"}}, false
 	case !f.Local:
-		return []checkLine{{msg: prefix + "no entry in /etc/passwd; the package does not create the account"}}, false
+		lines = []checkLine{{msg: prefix + "no entry in /etc/passwd; the package does not create the account"}}
+		// The name may be a directory user listed by mistake, the blocker above.
+		if f.DirectoryErr != "" {
+			lines = append(lines, unasked)
+		}
+		return lines, false
 	}
 	warn := func(format string, a ...any) {
 		lines = append(lines, checkLine{msg: prefix + fmt.Sprintf(format, a...)})
@@ -100,10 +108,9 @@ func breakGlassVerdicts(user string, f breakGlassFacts) (lines []checkLine, usab
 	if f.Aging != "" {
 		warn("%s", f.Aging)
 	}
-	// The login allows in this case (breakGlassVerdict); the check only must
-	// not report a name as "not in the directory" that nobody answered for.
+	// The login allows in this case (breakGlassVerdict).
 	if f.DirectoryErr != "" {
-		warn("the directory lookup failed (%s); whether the name also exists in the directory was not checked", f.DirectoryErr)
+		lines = append(lines, unasked)
 	}
 	var sources []string
 	policyApplied := true

@@ -319,7 +319,7 @@ func qrNotRenderedMessage(url string) string {
 }
 
 // rememberDeviceLogin stores the refresh token and the client IP for the
-// cached login (tryCachedDirectory). Without a refresh token from the IdP there
+// cached login (authFlow.cached). Without a refresh token from the IdP there
 // is nothing to cache, and a session from an earlier login is removed: the
 // cached login must reflect the latest device login, for example after the IdP
 // stopped issuing refresh tokens for the client.

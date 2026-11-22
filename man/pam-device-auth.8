@@ -300,6 +300,11 @@ pam-device-auth: cannot set log file mode 0640: chmod
 (fail closed)
 .fi
 .RE
+.PP
+Any other argument is an error: the helper prints
+.B unknown argument
+and the usage to standard error and exits with status 64. Without a command
+the helper runs a login, which is what the PAM module starts.
 .SH CONFIGURATION
 Configuration file:
 .IR /etc/pam-device-auth/config.json .

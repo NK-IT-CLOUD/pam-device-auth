@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/syslog"
 	"net"
 	"net/http"
@@ -1261,8 +1262,55 @@ func discoveryTiming(first time.Duration, again func() (time.Duration, error)) (
 		first, second, discoveryTimingLimit)
 }
 
+// knownArguments are the arguments this tool accepts. Without one of the
+// commands among them the run is a login, which the PAM module starts with no
+// argument at all; --debug may join every run.
+var knownArguments = []string{
+	"--debug", "--version", "--help", "--check", "--setup-ldap", "--enable",
+	"--migrate-config", "--prepare-log", "--pam-acct",
+}
+
+// firstUnknownArgument returns the first argument that is not in
+// knownArguments; found is false when there is none.
+func firstUnknownArgument(args []string) (arg string, found bool) {
+	for _, a := range args {
+		if !slices.Contains(knownArguments, a) {
+			return a, true
+		}
+	}
+	return "", false
+}
+
+// exitUsage is the exit status for a command line this tool does not
+// understand (EX_USAGE of sysexits.h). It is none of the codes the PAM module
+// reads from a login (0, 1, 2) or from the account phase (0, 1, 3).
+const exitUsage = 64
+
+// printUsage writes the help text.
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: pam-device-auth [--debug] [--version] [--check] [--setup-ldap] [--enable] [--migrate-config] [--prepare-log] [--pam-acct] [--help]")
+	fmt.Fprintln(w, "  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "  --check       Pre-activation preflight: config, OIDC, directory/SSSD, sshd factors")
+	fmt.Fprintln(w, "  --setup-ldap  Configure the SSSD directory identity from config (NSS + sudo)")
+	fmt.Fprintln(w, "  --enable      Activate PAM authentication (runs --check first)")
+	fmt.Fprintln(w, "  --migrate-config  Set ldap.profile = \"lldap\" in a 0.6.x config that has none (run by the package on upgrade)")
+	fmt.Fprintln(w, "  --prepare-log  Create the log file or check it: a regular file, mode at most 0640 (run by the package on install and upgrade)")
+	fmt.Fprintln(w, "  --pam-acct    Run the PAM account-phase IP allowlist gate")
+	fmt.Fprintln(w, "  --debug       Run with debug logging")
+	fmt.Fprintln(w, "  --version     Show version")
+	fmt.Fprintln(w, "  --help        Show this help")
+}
+
 func main() {
 	setSystemPath()
+	// A typo must not run as a login: without a command the helper would go on
+	// to the login flow, deny for the missing PAM_USER and say nothing.
+	if arg, found := firstUnknownArgument(os.Args[1:]); found {
+		fmt.Fprintf(os.Stderr, "pam-device-auth: unknown argument %q\n", arg)
+		printUsage(os.Stderr)
+		os.Exit(exitUsage)
+	}
 	debug := hasFlag(os.Args[1:], "--debug")
 	for _, arg := range os.Args[1:] {
 		switch arg {
@@ -1270,17 +1318,7 @@ func main() {
 			fmt.Printf("pam-device-auth %s\n", VERSION)
 			os.Exit(0)
 		case "--help":
-			fmt.Println("Usage: pam-device-auth [--debug] [--version] [--check] [--setup-ldap] [--enable] [--migrate-config] [--prepare-log] [--pam-acct] [--help]")
-			fmt.Println("  SSH authentication via OIDC Device Authorization Grant (RFC 8628)")
-			fmt.Println("")
-			fmt.Println("  --check       Pre-activation preflight: config, OIDC, directory/SSSD, sshd factors")
-			fmt.Println("  --setup-ldap  Configure the SSSD directory identity from config (NSS + sudo)")
-			fmt.Println("  --enable      Activate PAM authentication (runs --check first)")
-			fmt.Println("  --migrate-config  Set ldap.profile = \"lldap\" in a 0.6.x config that has none (run by the package on upgrade)")
-			fmt.Println("  --prepare-log  Create the log file or check it: a regular file, mode at most 0640 (run by the package on install and upgrade)")
-			fmt.Println("  --pam-acct    Run the PAM account-phase IP allowlist gate")
-			fmt.Println("  --debug       Run with debug logging")
-			fmt.Println("  --version     Show version")
+			printUsage(os.Stdout)
 			os.Exit(0)
 		case "--check":
 			runCheck()

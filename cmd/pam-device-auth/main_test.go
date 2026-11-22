@@ -107,6 +107,49 @@ func TestHasFlag(t *testing.T) {
 	}
 }
 
+// The PAM module starts a login without an argument and the account phase
+// with --pam-acct. Everything else on the command line comes from a person: an
+// argument this tool does not know (a typo, a flag without its dashes) must
+// not run as a login.
+func TestUnknownArgument(t *testing.T) {
+	for _, args := range [][]string{
+		nil, {"--debug"}, {"--check"}, {"--check", "--debug"}, {"--pam-acct"}, {"--pam-acct", "--debug"},
+		{"--setup-ldap"}, {"--enable"}, {"--migrate-config"}, {"--prepare-log"}, {"--version"}, {"--help"},
+	} {
+		if got, found := firstUnknownArgument(args); found {
+			t.Errorf("firstUnknownArgument(%q) = %q, want none", args, got)
+		}
+	}
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--chek"}, "--chek"},
+		{[]string{"check"}, "check"},
+		{[]string{"-h"}, "-h"},
+		{[]string{""}, ""},
+		{[]string{"--check", "--verbose"}, "--verbose"},
+		{[]string{"--debug", "--Check"}, "--Check"},
+	} {
+		got, found := firstUnknownArgument(c.args)
+		if !found || got != c.want {
+			t.Errorf("firstUnknownArgument(%q) = %q, %v; want %q, true", c.args, got, found, c.want)
+		}
+	}
+}
+
+// The usage text names every flag the dispatch knows, so the list and the
+// help cannot drift apart.
+func TestUsageNamesEveryFlag(t *testing.T) {
+	var b strings.Builder
+	printUsage(&b)
+	for _, f := range knownArguments {
+		if !strings.Contains(b.String(), f) {
+			t.Errorf("usage does not name %s", f)
+		}
+	}
+}
+
 // stubSshd installs a fake `sshd` on PATH that answers `-T` (and `-T -C
 // user=...`) with the given effective-config lines, mimicking `sshd -T`
 // output well enough for sshdParam.

@@ -3,6 +3,30 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.9.0] - unreleased
+
+### Fixed
+- `--check` says that the directory was not asked also for a break-glass
+  name without an entry in `/etc/passwd`. When SSSD gave no answer it printed
+  only `no entry in /etc/passwd` for such a name; it now adds `the directory
+  lookup failed (<error>); whether the name also exists in the directory was
+  not checked`, because the name may be a directory user listed by mistake,
+  which `--check` reports as a blocker once SSSD answers. Login decisions are
+  unchanged: a listed name without a local entry is denied either way.
+- An argument the helper does not know is an error: `pam-device-auth --chek`,
+  `check` without its dashes or `-h` print `unknown argument "<arg>"` and the
+  usage to stderr and exit with status 64. Until now such a call ran as a
+  login without `PAM_USER`: as root it printed nothing, exited 1 and left
+  `PAM_USER not set` in the log; as another user it reported a denied login.
+  The PAM module starts the helper without an argument (login) or with
+  `--pam-acct`, so logins are unchanged. `--help` now lists itself.
+
+### Documentation
+- The log line `break_glass_users not read, no break-glass exemption` also
+  appears for an invalid entry in `break_glass_users` or `break_glass_sources`,
+  not only for a `config.json` that is not JSON; the configuration reference
+  and the troubleshooting entry say so.
+
 ## [0.8.0] - 2026-11-17
 
 ### Added

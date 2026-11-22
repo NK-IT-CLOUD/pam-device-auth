@@ -402,8 +402,11 @@ Log lines of the account phase (`/var/log/pam-device-auth.log`):
 
 The helper reads only `break_glass_users` and `break_glass_sources` for this
 decision. A mistake in another key, which stops every OIDC login, does not
-close the emergency path; a `config.json` that is not JSON does (the log then
-has `pam-acct: break_glass_users not read, no break-glass exemption: <error>`).
+close the emergency path; a `config.json` that is not JSON does, and so does an
+invalid entry in one of the two keys (the log then has
+`pam-acct: break_glass_users not read, no break-glass exemption: <error>`). An
+invalid entry also stops every OIDC login, like any other config error: run
+`--check` after a change of these keys, before you close your session.
 A log file that cannot be opened does not close it either: the decision is
 reported to syslog, as for root.
 
@@ -418,7 +421,7 @@ with one verdict per account:
 | `[FAIL] break-glass <name>: the name also resolves in the directory; logins of this account are denied until the local account or the directory user is renamed` | See below. A blocker: `--enable` refuses to run. |
 | `[FAIL] break-glass <name>: the name is a directory user and has no entry in /etc/passwd; a listed name never logs in through the directory on this host. Take the name out of break_glass_users` | A directory user was listed. That user cannot log in to this host while the name is in the list. |
 | `[WARN] break-glass <name>: no entry in /etc/passwd; the package does not create the account` | The account is missing. |
-| `[WARN] break-glass <name>: the directory lookup failed (<error>); whether the name also exists in the directory was not checked` | SSSD gave no answer within 3 s. A login is allowed in that state. |
+| `[WARN] break-glass <name>: the directory lookup failed (<error>); whether the name also exists in the directory was not checked` | SSSD gave no answer within 3 s. A login of a local account is allowed in that state. The line also follows `no entry in /etc/passwd`: the name may then be a directory user listed by mistake, which is the blocker above once SSSD answers. |
 | `[WARN] break-glass <name>: no valid key in <home>/.ssh/authorized_keys` | No file, or no line `ssh-keygen -l` accepts. |
 | `[WARN] break-glass <name>: sshd will not use <home>/.ssh/authorized_keys: <path> …` | The home, `.ssh` or the file `belongs to uid <n>, not to the account or root`, `is writable by group or others (mode <mode>)` or `cannot be entered by the account` (the file: `cannot be read by the account`; sshd opens it as the account, so a key file that only root can read does not count), or the file `is not a regular file`. |
 | `[WARN] break-glass <name>: the account expired on <date>; pam_unix denies the login (chage -E -1 <name>)` | Account expiry in `/etc/shadow`; a date ahead reads `the account expires on <date>; from then on …`. |

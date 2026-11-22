@@ -565,7 +565,8 @@ Then go by what the client sees:
   is still in the drop-in
   ([log lines](configuration-reference.md#break_glass_users)). A line
   `pam-acct: break_glass_users not read, no break-glass exemption: …` means
-  that `config.json` is not valid JSON; until it is fixed the account is
+  that `config.json` is not valid JSON or that `break_glass_users` or
+  `break_glass_sources` holds an invalid entry; until it is fixed the account is
   treated like any other local account and denied.
 - **A prompt to change the password, or `Your account has expired`**: this
   comes from `pam_unix`. `sudo chage -l <name>` shows the dates; `sudo chage

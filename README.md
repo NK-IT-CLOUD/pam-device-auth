@@ -266,7 +266,8 @@ deliberately not provisioned with an SSH key. The
 Commands: `--check`, `--setup-ldap`, `--enable`, `--migrate-config` (run by the
 package on upgrade), `--prepare-log` (run by the package on install and
 upgrade), `--pam-acct` (internal, used by the PAM account phase), `--debug`,
-`--version`, `--help`.
+`--version`, `--help`. Any other argument is an error (`unknown argument`,
+usage on stderr, exit status 64): a typo never runs as a login.
 
 Every step of `--setup-ldap` is checked. A failed step aborts the setup with a
 `FAIL:` line that names the command and its output, what the rollback of
