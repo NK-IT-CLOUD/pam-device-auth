@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.9.0] - unreleased
 
+### Changed
+- The sshd PAM stack for Debian and Ubuntu no longer sets `user_readenv=1` on
+  `pam_env`. With it sshd sessions read `~/.pam_environment`, which lets a
+  user set variables for the own session; Linux-PAM deprecates the option,
+  and Debian 13 and Ubuntu 26.04 no longer have it in their own sshd stack,
+  so `--enable` switched it back on there (and Debian 13 logged `deprecated
+  reading of user environment enabled` at every session). On Ubuntu 24.04,
+  whose own stack still sets it, sessions over SSH no longer read
+  `~/.pam_environment`. A host gets the new stack with the next
+  `pam-device-auth --enable`; a package upgrade leaves `/etc/pam.d/sshd` as
+  it is.
+
 ### Fixed
 - `--check` says that the directory was not asked also for a break-glass
   name without an entry in `/etc/passwd`. When SSSD gave no answer it printed
