@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.9.0] - unreleased
+## [0.9.0] - 2026-11-24
 
 ### Security
 - Active Directory (`ldap.profile` `"ad"`): a disabled or expired account can
