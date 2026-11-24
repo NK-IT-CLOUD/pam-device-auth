@@ -301,7 +301,10 @@ on LLDAP hosts as well; an invalid value in another key does not matter here.
   whether that list names it or not.
 - **How fast a change applies.** Within SSSD's cache time, up to 10 minutes,
   as for a change of group membership. `sudo sss_cache -E` on the host applies
-  it to the next login. Sessions that are already open stay open.
+  it to the next login. With several domain controllers the change must also
+  have replicated to the one the host asks (`ldap.uri`); until then that
+  controller answers with the old state. Sessions that are already open stay
+  open.
 - **What it does not look at.** An account that AD locked after wrong
   passwords (`lockoutTime`) is not refused: that lock concerns the password,
   which an SSH login here never uses.
