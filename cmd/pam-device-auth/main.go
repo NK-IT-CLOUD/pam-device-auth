@@ -352,6 +352,23 @@ func runPreflight(prof distro.Profile) (fails, warns int) {
 			}
 		}
 
+		// Account state: whom the account phase refuses as disabled or expired
+		// (Active Directory only, directoryIsAD), and whose state it cannot
+		// read.
+		if cfg.LDAP.Profile == config.LDAPProfileAD {
+			now := time.Now()
+			for _, g := range append([]string{cfg.LDAP.AccessGroup}, cfg.LDAP.ServiceAccountGroups...) {
+				if g == "" {
+					continue
+				}
+				if members, _, gerr := getentGroup(g); gerr == nil {
+					for _, l := range accountStateLines(g, members, readAccountState, now) {
+						chk(l.ok, l.fatal, l.msg, l.msg)
+					}
+				}
+			}
+		}
+
 		// Migration preview: what --setup-ldap would do with local accounts
 		// that shadow a directory user. A warning, never a blocker.
 		preview, perr := shadowingPreview("/proc", cfg.BreakGlass())
@@ -1296,7 +1313,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --enable      Activate PAM authentication (runs --check first)")
 	fmt.Fprintln(w, "  --migrate-config  Set ldap.profile = \"lldap\" in a 0.6.x config that has none (run by the package on upgrade)")
 	fmt.Fprintln(w, "  --prepare-log  Create the log file or check it: a regular file, mode at most 0640 (run by the package on install and upgrade)")
-	fmt.Fprintln(w, "  --pam-acct    Run the PAM account-phase IP allowlist gate")
+	fmt.Fprintln(w, "  --pam-acct    Run the PAM account phase: IP allowlist, and the account state with Active Directory")
 	fmt.Fprintln(w, "  --debug       Run with debug logging")
 	fmt.Fprintln(w, "  --version     Show version")
 	fmt.Fprintln(w, "  --help        Show this help")

@@ -9,7 +9,10 @@ configuration from the `ldap` block of `config.json` with `"profile": "ad"`;
 ## What the directory needs
 
 - **A read-only service account** for SSSD's lookups, or a keytab for it (see
-  [Transport and bind](#transport-and-bind)).
+  [Transport and bind](#transport-and-bind)). It must be able to read
+  `userAccountControl` and `accountExpires` of the users: without them every
+  directory login is refused (see
+  [Disabled and expired accounts](#disabled-and-expired-accounts)).
 - **An attribute for the SSH public key** (`attributes.ssh_key`). AD has no
   standard one. A multi-valued attribute such as `sshPublicKey` from an
   OpenSSH-LPK schema extension holds one key per value; a single-valued
@@ -264,14 +267,66 @@ With the keytab bind, the transport is `GSSAPI with SASL sealing` and the
 access group line ends in `SSSD↔LDAP path OK (GSSAPI)`: no CA certificate is
 involved.
 
+## Disabled and expired accounts
+
+Active Directory keeps a disabled or expired account in its groups and leaves
+its key attribute in place, and a login with an SSH key never binds to the
+directory. The group membership alone would let such an account in. The PAM
+account phase therefore reads the account state of every non-root user, for
+every kind of login (device flow, cached session, key-only service account),
+and denies when the account is disabled, when its expiry time has come, or
+when the state cannot be read:
+
+| State in AD | Line in `/var/log/pam-device-auth.log` |
+|---|---|
+| Disabled (`ACCOUNTDISABLE`, value 2 in `userAccountControl`) | `pam-acct: user=<name> is disabled in the directory (userAccountControl <value>); deny` |
+| `accountExpires` reached | `pam-acct: user=<name> expired in the directory on <time> (accountExpires); deny` |
+| State not readable | `pam-acct: user=<name> account state read failed, fail-closed deny: <reason>` |
+
+The client sees `Connection closed` after its key was accepted. The check
+runs on a host with `"profile": "ad"` in the `ldap` block of `config.json`.
+The account phase reads this one key of the block. When it cannot (the file
+is not valid JSON, the block has no profile or an unknown one), it denies
+every directory login with
+`pam-acct: user=<name> cannot read ldap.profile from the config, fail-closed deny: <reason>`,
+on LLDAP hosts as well; an invalid value in another key does not matter here.
+
+- **Where the state comes from.** SSSD stores `userAccountControl` and
+  `accountExpires` with the user as `adUserAccountControl` and
+  `adAccountExpires`. The account phase reads them through the SSSD InfoPipe,
+  like the allowlist. The bind account must be able to read the two
+  attributes of the users. `--setup-ldap` lists both in
+  `[ifp] user_attributes`; a host set up by a version before 0.9.0 needs no
+  new run, because SSSD 2.9 to 2.12 hand out every cached attribute to root
+  whether that list names it or not.
+- **How fast a change applies.** Within SSSD's cache time, up to 10 minutes,
+  as for a change of group membership. `sudo sss_cache -E` on the host applies
+  it to the next login. Sessions that are already open stay open.
+- **What it does not look at.** An account that AD locked after wrong
+  passwords (`lockoutTime`) is not refused: that lock concerns the password,
+  which an SSH login here never uses.
+- **root and break-glass accounts** are local and are not asked about.
+
+`--check` reads the state of the members of the access group and of every
+service group and reports it under "IP allowlist (account-phase gate)":
+
+| Line | Meaning |
+|---|---|
+| `[OK] group "<group>": account state read for <n> of <m> member(s), <k> refused at login: <name> is disabled in the directory (…); …` | Who is refused at login right now. No warning: a disabled account in a group is the directory's business. |
+| `[WARN] group "<group>": <n> member(s) with an UNREADABLE account state; the account phase fails closed and will DENY their login: <names> (<reason>)` | SSSD has no state for these members: the bind account cannot read the two attributes of them, or the InfoPipe call failed (the reason is in the brackets). |
+
 ## What `--setup-ldap` writes for AD
 
 The SSSD domain is named `nkit`, as with LLDAP. Compared with the LLDAP profile
 it uses `ldap_schema = ad`, `ldap_referrals = false` and
 `case_sensitive = false`, gates logins with SSSD's simple access provider
 (`access_provider = simple`, `simple_allow_groups` = `access_group` and every
-group in `service_account_groups`), and maps the attributes from
-`ldap.attributes`. `user_search_base` and `group_search_base` default to
+group in `service_account_groups`), maps the attributes from
+`ldap.attributes`, and lists the account state for the InfoPipe next to the
+allowlist (`[ifp] user_attributes` with `+clients`, `+adUserAccountControl`
+and `+adAccountExpires`; see
+[Disabled and expired accounts](#disabled-and-expired-accounts)).
+`user_search_base` and `group_search_base` default to
 `base_dn`. With `kerberos` it adds `krb5_use_enterprise_principal = true` and
 `ldap_force_upper_case_realm = true` (see
 [Kerberos for sudo and passwd](#kerberos-for-sudo-and-passwd)). The sudoers

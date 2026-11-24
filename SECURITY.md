@@ -189,6 +189,7 @@ The security guarantees above depend on correct deployment:
 | Local account standing in for a directory identity | Only root and the accounts an admin lists in `break_glass_users` log in with a local key. For a listed name sshd accepts no key from the directory (`AuthorizedKeysCommand none`), the auth phase denies the name whatever the directory says, and the account phase denies it when the directory knows it. `--setup-ldap` never migrates such an account, and `--check` fails on the collision. |
 | sudoers left behind after removal | postrm deletes `/etc/sudoers.d/pam-device-auth` on both remove and purge, on deb and rpm. |
 | Access revocation | Remove directory access membership and its mapped OIDC role; new login is denied after the relevant SSSD/provider caches update. Existing sessions require separate termination. |
+| Disabled or expired Active Directory account | AD keeps such an account in its groups and leaves its key in place, and a key login never binds to the directory. The PAM account phase reads `userAccountControl` and `accountExpires` through the SSSD InfoPipe for every non-root login and denies a disabled account, an expired one and one whose state it cannot read, within SSSD's cache time. |
 | Log exfiltration | No tokens, passwords, or unsanitized user input in logs; log file `0640 root:adm`; `O_NOFOLLOW`. |
 | Child process hang | Per-call monotonic deadline covering pipe reads + waitpid; the helper ends with the sshd process that started it. |
 | Shell injection via PAM | No shell in auth path: fork/exec with pipes, no popen(). |

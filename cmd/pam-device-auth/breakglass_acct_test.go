@@ -193,6 +193,7 @@ func TestRunPamAcctLoggerFailureBreakGlassDenied(t *testing.T) {
 // A config that cannot be read gives nobody the exemption, and the log says so.
 func TestRunPamAcctBreakGlassLoadError(t *testing.T) {
 	stubBreakGlassHost(t, false)
+	stubLDAPProfile(t, config.LDAPProfileLLDAP, nil)
 	origLogger, origRead, origLoad := newAcctLogger, readClients, loadBreakGlass
 	t.Cleanup(func() { newAcctLogger, readClients, loadBreakGlass = origLogger, origRead, origLoad })
 	logPath := filepath.Join(t.TempDir(), "pda.log")

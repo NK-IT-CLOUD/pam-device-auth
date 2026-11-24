@@ -275,7 +275,9 @@ Print usage and exit.
 .PP
 An additional
 .B \-\-pam\-acct
-mode exists for the PAM account phase to enforce the IP allowlist; it is
+mode exists for the PAM account phase to enforce the IP allowlist and, with
+Active Directory, to deny a disabled or expired account (and one whose state
+it cannot read); it is
 invoked internally by the PAM stack and not meant to be run by hand. It exits
 0 (allow), 1 (deny for this user) or 3 when it cannot open its log, the log
 path is no regular file, or the log has mode bits beyond 0640 that cannot be
@@ -496,7 +498,8 @@ login: signature, issuer, azp/aud, exp/nbf/iat, required role and the optional
 level; JWT algorithm/key-type binding, kid required, no none/HMAC. The per-user
 .I clients
 IP allowlist is enforced separately in the PAM account phase and fails
-closed on a directory/InfoPipe lookup error. Directory
+closed on a directory/InfoPipe lookup error. With Active Directory the account
+phase also denies a disabled or expired account. Directory
 revocation: removing a user from the access group denies new logins and sudo
 within the SSSD cache TTL. sudo re-authenticates against the directory password
 via pam_sss, except for members of

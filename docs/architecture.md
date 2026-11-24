@@ -242,6 +242,16 @@ directory-provided `clients` source-IP/CIDR allowlist:
    failure) for user <user> from IP <ip> — denying login (fail-closed)`, and
    denies the login; exit 0 allows, exit 1 is a clean per-user deny.
 
+For these users the helper also reads `ldap.profile` from `config.json`, as
+a third key and again without checking the rest of the file. A profile it
+cannot read (no valid JSON, an `ldap` block without profile, an unknown
+profile) denies the login. With `"ad"` it reads the account state before the
+allowlist, with a second InfoPipe call (`GetUserAttr sas <user> 2
+adUserAccountControl adAccountExpires`): a disabled account, one whose
+`accountExpires` has come, and one whose state cannot be read are denied
+(exit 1). The helper does not read `sssd.conf` for this. See
+[Disabled and expired accounts](active-directory-setup.md#disabled-and-expired-accounts).
+
 Fail-closed means an SSSD/InfoPipe outage denies every directory user, not
 only the ones with a `clients` allowlist set, until InfoPipe recovers. Users
 with no `clients` attribute at all are unrestricted (allow). `pam-device-auth

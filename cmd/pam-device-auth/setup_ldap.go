@@ -683,7 +683,14 @@ func renderSSSDConf(d ldapRenderData, caCertPath string) string {
 	kv("cache_credentials", "false")
 	kv("entry_cache_timeout", "600")
 	b.WriteString("\n[ifp]\n")
-	kv("user_attributes", "+clients")
+	if d.Profile == config.LDAPProfileAD {
+		// The account phase reads the account state through the InfoPipe
+		// and refuses a disabled or expired account; with the simple access
+		// provider SSSD looks at neither attribute.
+		kv("user_attributes", "+clients, +"+adAccountControlAttr+", +"+adAccountExpiresAttr)
+	} else {
+		kv("user_attributes", "+clients")
+	}
 	return b.String()
 }
 

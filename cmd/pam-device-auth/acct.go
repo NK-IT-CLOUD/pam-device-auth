@@ -58,6 +58,17 @@ func decideIPGate(requiresGate bool, clients []string, readErr error, rhost stri
 // The second shape is NOT an error — it means the directory user has no
 // "clients" attribute set, i.e. unrestricted. Returns (nil, nil) for it.
 func parseBusctlClients(jsonOut []byte) ([]string, error) {
+	attrs, err := parseBusctlAttrs(jsonOut)
+	if err != nil {
+		return nil, err
+	}
+	return attrs["clients"], nil
+}
+
+// parseBusctlAttrs parses the stdout of a busctl GetUserAttr call into the
+// values per attribute. An attribute the user does not have, or one the
+// InfoPipe does not hand out, is absent from the answer and from the map.
+func parseBusctlAttrs(jsonOut []byte) (map[string][]string, error) {
 	var resp struct {
 		Type string `json:"type"`
 		Data []map[string]struct {
@@ -71,14 +82,14 @@ func parseBusctlClients(jsonOut []byte) ([]string, error) {
 	if resp.Type != "a{sv}" || len(resp.Data) != 1 {
 		return nil, fmt.Errorf("unexpected busctl GetUserAttr response shape: type=%q data entries=%d", resp.Type, len(resp.Data))
 	}
-	attr, ok := resp.Data[0]["clients"]
-	if !ok {
-		return nil, nil
+	attrs := make(map[string][]string, len(resp.Data[0]))
+	for name, attr := range resp.Data[0] {
+		if attr.Type != "as" {
+			return nil, fmt.Errorf("unexpected %s attribute type %q", name, attr.Type)
+		}
+		attrs[name] = attr.Data
 	}
-	if attr.Type != "as" {
-		return nil, fmt.Errorf("unexpected clients attribute type %q", attr.Type)
-	}
-	return attr.Data, nil
+	return attrs, nil
 }
 
 // requiresIPGate keeps the break-glass boundary deliberately narrow: only
@@ -202,6 +213,11 @@ type acctInputs struct {
 	// block returns the accounts the break-glass section of the sshd drop-in
 	// names (breakGlassBlockUsersOnDisk); nil means no drop-in is looked at.
 	block func() []string
+	// ad reports whether the config declares an Active Directory
+	// (directoryIsAD); there state reads the account state of a directory
+	// user. A nil ad means no account state is looked at.
+	ad    func() (bool, error)
+	state func(user string) (adAccountState, error)
 }
 
 // busctlClientsArgs is the busctl command line that asks the SSSD InfoPipe for
@@ -209,12 +225,18 @@ type acctInputs struct {
 // command line, so "--" comes before the verb: everything after it, the user
 // name included, is data.
 func busctlClientsArgs(user string) []string {
-	return []string{"--json=short", "--", "call",
+	return busctlUserAttrArgs(user, "clients")
+}
+
+// busctlUserAttrArgs is the busctl command line that asks the SSSD InfoPipe
+// for attrs of user.
+func busctlUserAttrArgs(user string, attrs ...string) []string {
+	return append([]string{"--json=short", "--", "call",
 		"org.freedesktop.sssd.infopipe",
 		"/org/freedesktop/sssd/infopipe",
 		"org.freedesktop.sssd.infopipe",
-		"GetUserAttr", "sas", user, "1", "clients",
-	}
+		"GetUserAttr", "sas", user, strconv.Itoa(len(attrs)),
+	}, attrs...)
 }
 
 // busctlClients reads the "clients" IP allowlist attribute for a directory
@@ -315,6 +337,7 @@ func runPamAcct() int {
 	}
 	return pamAccount(log, user, rhost, acctInputs{
 		read: readClients, bg: bg, local: localAccount, sss: breakGlassSSS, block: breakGlassBlockUsersOnDisk,
+		ad: directoryIsAD, state: readAccountState,
 	})
 }
 
@@ -358,6 +381,28 @@ func pamAccount(log *logger.Logger, user, rhost string, in acctInputs) int {
 	if err := loginNameError(user); err != nil {
 		log.Error("pam-acct: refusing user name %q: %v; denying", user, err)
 		return 1
+	}
+
+	// Active Directory keeps a disabled or expired account in its groups and
+	// leaves its key in place, and a key login never binds to the directory:
+	// the account state is all that tells such an account from a valid one.
+	if in.ad != nil {
+		isAD, err := in.ad()
+		if err != nil {
+			log.Error("pam-acct: user=%s cannot read ldap.profile from the config, fail-closed deny: %v", user, err)
+			return 1
+		}
+		if isAD {
+			state, err := in.state(user)
+			if err != nil {
+				log.Error("pam-acct: user=%s account state read failed, fail-closed deny: %v", user, err)
+				return 1
+			}
+			if why := state.refusal(time.Now()); why != "" {
+				log.Warn("pam-acct: user=%s %s; deny", user, why)
+				return 1
+			}
+		}
 	}
 
 	clients, readErr := in.read(user)

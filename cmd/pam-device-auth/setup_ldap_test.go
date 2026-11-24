@@ -1529,7 +1529,8 @@ func TestRenderSSSDConf_ADDefaults(t *testing.T) {
 		"ldap_referrals = false\n", "case_sensitive = false\n", "ldap_user_name = sAMAccountName\n",
 		"ldap_user_ssh_public_key = sshPublicKey\n", "ldap_user_extra_attrs = clients:extensionAttribute1\n",
 		"ldap_id_mapping = true\n", "chpass_provider = none\n", "ldap_user_search_base = DC=example,DC=com\n",
-		"ldap_group_search_base = DC=example,DC=com\n", "ldap_tls_reqcert = hard\n", "user_attributes = +clients\n",
+		"ldap_group_search_base = DC=example,DC=com\n", "ldap_tls_reqcert = hard\n",
+		"user_attributes = +clients, +adUserAccountControl, +adAccountExpires\n",
 	} {
 		if !strings.Contains(got, line) {
 			t.Errorf("missing %q in:\n%s", line, got)

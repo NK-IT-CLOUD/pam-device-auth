@@ -5,7 +5,33 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.9.0] - unreleased
 
+### Security
+- Active Directory (`ldap.profile` `"ad"`): a disabled or expired account can
+  no longer log in. AD keeps such an account in its groups and leaves its SSH
+  key in place, a key login never binds to the directory, and the SSSD config
+  `--setup-ldap` writes gates by group only (`access_provider = simple`). A
+  disabled service account therefore kept its key-only login, and with it its
+  sudo rules. The PAM account phase now reads `userAccountControl` and
+  `accountExpires` of every non-root user through the SSSD InfoPipe and denies
+  the login when the account is disabled, when its expiry time has come, or
+  when the state cannot be read. The log names the reason, for example
+  `pam-acct: user=<name> is disabled in the directory (userAccountControl 514); deny`.
+  The change in AD applies within SSSD's cache time (up to 10 minutes), at
+  once after `sss_cache -E` on the host. `--check` reports per group whose
+  login is refused and whose state cannot be read. It takes effect with the
+  package upgrade, without a run of `--setup-ldap`. With the `lldap`
+  profile no account state is read. See
+  [Disabled and expired accounts](docs/active-directory-setup.md#disabled-and-expired-accounts).
+
 ### Changed
+- The account phase reads `ldap.profile` from `config.json` to know whether
+  the directory is an Active Directory. A `config.json` that is not valid
+  JSON, or whose `ldap` block has no profile or an unknown one, now denies
+  every directory login in the account phase, key-only service accounts
+  included (`pam-acct: user=<name> cannot read ldap.profile from the config,
+  fail-closed deny: …`). Until now such a config stopped the OIDC logins and
+  the break-glass accounts, and service accounts still got in. An invalid
+  value in another key changes nothing here, and root is not affected.
 - The sshd PAM stack for Debian and Ubuntu no longer sets `user_readenv=1` on
   `pam_env`. With it sshd sessions read `~/.pam_environment`, which lets a
   user set variables for the own session; Linux-PAM deprecates the option,

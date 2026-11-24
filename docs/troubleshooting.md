@@ -403,6 +403,34 @@ Fix by adding the connecting IP or CIDR to the user's `clients` attribute
 in LLDAP, then retry; there is no cache to clear here, each login reads
 InfoPipe fresh.
 
+### Active Directory user denied at the account phase (disabled, expired, state not read)
+
+With Active Directory the account phase reads the account state before the
+allowlist:
+
+```bash
+sudo grep -E "is disabled in the directory|expired in the directory|account state read failed" /var/log/pam-device-auth.log
+```
+
+- `is disabled in the directory (userAccountControl <value>)` and `expired in
+  the directory on <time> (accountExpires)`: the directory says so. After the
+  account was enabled again or its expiry changed, the login works once SSSD's
+  cache entry is renewed (up to 10 minutes), or right after
+  `sudo sss_cache -E`.
+- `account state read failed, fail-closed deny: the InfoPipe returned no
+  adUserAccountControl …`: SSSD has no value for this user, which means the
+  bind account cannot read `userAccountControl` and `accountExpires` of it.
+  `sudo pam-device-auth --check` lists every such member in a
+  `[WARN] … UNREADABLE account state` line. Any other reason after
+  `fail-closed deny:` is a failed InfoPipe call (see
+  [InfoPipe/SSSD outage](#infopipesssd-outage-denies-all-directory-users)).
+- `cannot read ldap.profile from the config, fail-closed deny: <reason>`:
+  `config.json` is not valid JSON, or its `ldap` block has no `profile` or an
+  unknown one. This denies every directory user, on LLDAP hosts as well;
+  `sudo pam-device-auth --check` names the place.
+
+See [Disabled and expired accounts](active-directory-setup.md#disabled-and-expired-accounts).
+
 ### Service account cannot log in (no `sshPublicKey`)
 
 Members of `service_account_groups` (`ldap` block in `config.json`) are a

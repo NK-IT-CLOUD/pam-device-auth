@@ -42,8 +42,9 @@ that are already open stay open.
    presses Enter in the terminal.
 5. pam-device-auth fetches the token and verifies it, the required role and,
    if configured, the authentication level.
-6. The PAM account phase checks the group membership and the optional source
-   IP allowlist.
+6. The PAM account phase checks the group membership, the optional source
+   IP allowlist and, with Active Directory, that the account is neither
+   disabled nor expired.
 7. The shell opens and the home directory is created if needed.
 
 Later logins from a known IP can use a cached refresh token, so the user does not
@@ -68,7 +69,7 @@ system journal.
 |---|---|---|
 | 1. SSH key | `sshd` with `sss_ssh_authorizedkeys` | The public key comes from the directory (`sshPublicKey`, or the attribute named in `ldap.attributes.ssh_key`). Local `authorized_keys` files are ignored for non-root users. |
 | 2. OIDC sign-in | `pam_device_auth.so` (keyboard-interactive) | The user resolves through SSSD. Browser approval through the Device Authorization Grant, or a silent refresh from a known source IP. Token signature, issuer, `azp`/`aud`, `exp`/`nbf`/`iat`, `kid`, username equal to the SSH user, the required role and, with `required_acr`, the authentication level (`acr`). |
-| 3. Account phase | `pam_device_auth.so`, which runs `pam-device-auth --pam-acct`, and `pam_sss` | The `clients` source-IP allowlist, which fails closed when it cannot be read. Membership in the access group or a service-account group. |
+| 3. Account phase | `pam_device_auth.so`, which runs `pam-device-auth --pam-acct`, and `pam_sss` | The `clients` source-IP allowlist, which fails closed when it cannot be read. With Active Directory, the account state: a disabled or expired account is denied. Membership in the access group or a service-account group. |
 
 Service accounts skip layer 2 only: they still need their directory key and pass
 layer 3. Root logs in with its local SSH key only. It skips layer 2, and the
@@ -386,7 +387,9 @@ authentication level (`required_acr`), algorithm, key-type and curve binding
   root and the break-glass accounts are exempt.
 - **Directory revocation.** Remove a user from the access group and from its
   mapped OIDC access role. New logins are denied after SSSD and identity-provider
-  caches expire. Existing sessions are not terminated.
+  caches expire. Existing sessions are not terminated. With Active Directory,
+  disabling the account or letting it expire denies its new logins as well,
+  including key-only service accounts.
 - **sudo.** Members of `ldap.admin_group` use the directory password through
   `pam_sss`. Members of `ldap.nopasswd_sudo_groups` get `NOPASSWD:ALL`. There are
   no local passwords or `/etc/shadow` entries to drift.
